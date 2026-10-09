@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 
+from conftest import _RecordingHandler
+
 from telegram_documentaries.logging_config import JsonFormatter, log_lifecycle
 
 
@@ -91,8 +93,7 @@ def test_formatter_does_not_explode_on_non_serialisable_extra_values() -> None:
 def test_log_lifecycle_logs_success_and_propagates_return_value() -> None:
     logger = logging.getLogger("lifecycle-green")
     records: list[logging.LogRecord] = []
-    handler = logging.Handler()
-    handler.emit = records.append  # type: ignore[method-assign]
+    handler = _RecordingHandler(records)
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
 
@@ -109,8 +110,7 @@ def test_log_lifecycle_logs_success_and_propagates_return_value() -> None:
 def test_log_lifecycle_logs_failure_and_reraises() -> None:
     logger = logging.getLogger("lifecycle-red")
     records: list[logging.LogRecord] = []
-    handler = logging.Handler()
-    handler.emit = records.append  # type: ignore[method-assign]
+    handler = _RecordingHandler(records)
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
 

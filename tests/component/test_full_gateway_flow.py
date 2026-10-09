@@ -8,10 +8,14 @@ test exercises the exact code path production uses — minus the socket.
 from __future__ import annotations
 
 import json
+import logging
 import urllib.parse
 from typing import Any
 
+import pytest
 from conftest import messageless_update, photo_update, text_update
+
+from telegram_documentaries.cli import main
 from telegram_documentaries.polling import run_polling
 from telegram_documentaries.transport import UrllibTransport
 
@@ -25,21 +29,26 @@ class FakeUrlOpen:
 
     def __init__(self, batches: list[list[dict[str, Any]]]) -> None:
         self.batches = list(batches)
+        self.methods: list[str] = []
         self.get_updates: list[dict[str, str]] = []
         self.send_messages: list[dict[str, str]] = []
 
     def __call__(self, request: Any, timeout: float) -> Any:
         url: str = request.full_url
-        body: dict[str, str] = urllib.parse.parse_qs(
+        method = url.rsplit("/", 1)[-1]
+        self.methods.append(method)
+        body: dict[str, list[str]] = urllib.parse.parse_qs(
             (request.data or b"").decode("utf-8")
         )
         flat = {key: values[0] for key, values in body.items()}
 
-        if url.endswith("/getUpdates"):
+        if method == "getUpdates":
             self.get_updates.append(flat)
             batch = self.batches.pop(0) if self.batches else []
             payload = {"ok": True, "result": batch}
-        elif url.endswith("/sendMessage"):
+        elif method == "getMe":
+            payload = {"ok": True, "result": {"id": 1, "username": "docs_bot"}}
+        elif method == "sendMessage":
             self.send_messages.append(flat)
             payload = {"ok": True, "result": {"message_id": 99}}
         else:  # pragma: no cover - guards against unexpected URLs
@@ -86,6 +95,33 @@ def test_gateway_echoes_every_message_and_acks_the_batch() -> None:
     assert final_offset == 103
 
 
+def test_startup_probe_calls_get_me_through_the_real_transport(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Same injectable urlopen seam as the poll loop: the startup probe is
+    # transport-testable without a live bot.
+    opener = FakeUrlOpen(batches=[[]])
+    transport = UrllibTransport("COMPONENT-TOKEN", urlopen=opener)
+
+    with caplog.at_level(logging.INFO, logger="telegram_documentaries.cli"):
+        exit_code = main(
+            ["--max-polls", "1"],
+            environ={"TELEGRAM_BOT_TOKEN": "COMPONENT-TOKEN"},
+            env_file=None,
+            transport_factory=lambda token: transport,
+        )
+
+    assert exit_code == 0
+    assert opener.methods[0] == "getMe"
+    starting = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "gateway_starting"
+    ]
+    assert starting
+    assert getattr(starting[0], "bot_username") == "docs_bot"
+
+
 def test_gateway_survives_telegram_reporting_a_failed_send() -> None:
     class FailingSendOpener(FakeUrlOpen):
         def __call__(self, request: Any, timeout: float) -> Any:
@@ -110,3 +146,31 @@ def test_gateway_survives_telegram_reporting_a_failed_send() -> None:
     # The failed send does not kill the loop, and the batch is still acked.
     assert final_offset == 8
     assert len(opener.get_updates) == 2
+
+
+def test_gateway_survives_a_non_normalised_transport_crash() -> None:
+    # A bug inside the transport itself raises something that is neither an
+    # HTTP/network error nor a TelegramApiError. The gateway must still live:
+    # the failing chat is skipped, everyone else in the batch gets a reply.
+    class CrashingSendOpener(FakeUrlOpen):
+        def __init__(self, batches: list[list[dict[str, Any]]]) -> None:
+            super().__init__(batches)
+            self.crashed = False
+
+        def __call__(self, request: Any, timeout: float) -> Any:
+            if request.full_url.endswith("/sendMessage") and not self.crashed:
+                self.crashed = True
+                raise RuntimeError("unexpected bug in the transport layer")
+            return super().__call__(request, timeout)
+
+    opener = CrashingSendOpener(
+        batches=[[text_update(9, chat_id=1), text_update(10, chat_id=2)], []]
+    )
+    transport = UrllibTransport("TOKEN", urlopen=opener)
+
+    final_offset = run_polling(transport, offset=0, max_polls=2)
+
+    assert final_offset == 11
+    assert opener.get_updates[1]["offset"] == "11"  # batch still acked
+    assert [msg["chat_id"] for msg in opener.send_messages] == ["2"]
+    assert opener.send_messages[0]["text"] == "hey mate!"

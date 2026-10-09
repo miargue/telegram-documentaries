@@ -7,11 +7,14 @@ or a socket (see ``tests/unit/test_transport.py`` and
 
 Failures never come back as bare exceptions from deep inside the stack: every
 problem is normalised into ``TelegramApiError`` with the failing method,
-description and (when available) HTTP/Telegram error codes.
+description and (when available) HTTP/Telegram error codes — including network
+failures, wire-protocol failures (``http.client.HTTPException`` subclasses such
+as ``IncompleteRead``) and Telegram's own ``ok: false`` payloads.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 from collections.abc import Callable, Mapping
@@ -99,6 +102,13 @@ class UrllibTransport:
         except OSError as exc:
             # Timeouts and reset connections surface as plain OSError.
             raise TelegramApiError(method, f"network error: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # Wire-level protocol failures (IncompleteRead from a dropped
+            # long-poll body, BadStatusLine from a garbled response, ...) are
+            # not OSError subclasses and must not escape unnormalised either.
+            raise TelegramApiError(
+                method, f"protocol error: {type(exc).__name__}: {exc}"
+            ) from exc
 
         return self._decode(method, raw)
 
@@ -128,13 +138,16 @@ class UrllibTransport:
         if getattr(exc, "fp", None) is not None:
             try:
                 raw = exc.read()
-            except OSError as read_exc:
+            except (OSError, http.client.HTTPException) as read_exc:
+                # Reading the error body can fail the same way the success
+                # path does (dropped connection); fall back to the status line
+                # rather than letting it escape this handler unnormalised.
                 LOGGER.warning(
                     "could not read HTTP error body",
                     extra={
                         "event": "http_error_body_unreadable",
                         "method": method,
-                        "error": str(read_exc),
+                        "error": f"{type(read_exc).__name__}: {read_exc}",
                     },
                 )
         description = None

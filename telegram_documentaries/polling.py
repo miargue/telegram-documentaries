@@ -1,10 +1,14 @@
 """Long-polling loop: ``getUpdates`` fetching with offset acknowledgement.
 
 Each processed batch advances the offset to one past the highest seen
-``update_id``, so Telegram never redelivers what was already handled —
-including malformed/poison updates, which are acked and skipped rather than
-replayed forever. Transport failures on ``getUpdates`` itself propagate
-loudly (transient-failure resilience is Phase 7, see ``SPECS/ROADMAP.md``).
+``update_id``, so Telegram never redelivers what was already handled. An
+update that fails validation but carries an integer ``update_id`` is acked
+past and skipped, so one poison payload cannot wedge the loop; an update
+whose ``update_id`` cannot be parsed as an int has no id to ack with, so it
+is skipped and **left unacked** (Telegram will redeliver it). The first poll
+starts at ``offset=-1`` to drop the backlog accumulated while the bot was
+down. Transport failures on ``getUpdates`` itself propagate loudly
+(transient-failure resilience is Phase 7, see ``SPECS/ROADMAP.md``).
 """
 
 from __future__ import annotations
@@ -36,6 +40,19 @@ def poll_once(
         "getUpdates",
         {"offset": offset, "timeout": LONG_POLL_TIMEOUT},
     )
+    if not isinstance(payload, dict):
+        # A transport bug must not escape as an AttributeError into the CLI,
+        # which only catches TelegramApiError/OSError.
+        log.error(
+            "getUpdates returned a non-object payload",
+            extra={
+                "event": "get_updates_invalid",
+                "offset": offset,
+                "payload_type": type(payload).__name__,
+            },
+        )
+        return max(offset, 0)
+
     raw_updates = payload.get("result", [])
     if not isinstance(raw_updates, list):
         log.error(
@@ -44,7 +61,9 @@ def poll_once(
         )
         raw_updates = []
 
-    next_offset = offset
+    # ``-1`` is only a first-poll sentinel ("forget the backlog"); every offset
+    # handed back to the caller must be a valid Telegram offset (>= 0).
+    next_offset = max(offset, 0)
     for raw in raw_updates:
         if not isinstance(raw, dict):
             log.error(
@@ -82,7 +101,7 @@ def poll_once(
 def run_polling(
     transport: Transport,
     *,
-    offset: int = 0,
+    offset: int = -1,
     max_polls: int | None = None,
     logger: logging.Logger | None = None,
 ) -> int:
@@ -90,6 +109,10 @@ def run_polling(
 
     ``max_polls=None`` means run until the process is stopped; tests and
     smoke runs pass a finite bound.
+
+    The first poll deliberately uses ``offset=-1`` (the default): Telegram
+    then forgets everything queued before the latest update, so a restart does
+    not re-answer a backlog of already-handled messages.
     """
     log = LOGGER if logger is None else logger
     polls = 0

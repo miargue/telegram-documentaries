@@ -24,7 +24,10 @@ def test_parse_env_file_ignores_blank_lines_comments_and_export_prefix() -> None
         "GEMINI_API_KEY = key-with-spaces \n"
     )
 
-    assert values == {"TELEGRAM_BOT_TOKEN": "abc123", "GEMINI_API_KEY": "key-with-spaces"}
+    assert values == {
+        "TELEGRAM_BOT_TOKEN": "abc123",
+        "GEMINI_API_KEY": "key-with-spaces",
+    }
 
 
 def test_parse_env_file_strips_matching_quotes() -> None:

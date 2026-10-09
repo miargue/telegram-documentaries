@@ -7,10 +7,11 @@ or any socket.
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import urllib.error
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -49,7 +50,9 @@ class RecordingUrlopen:
         return result
 
 
-def make_transport(responses: list[Any], **kwargs: Any) -> tuple[UrllibTransport, RecordingUrlopen]:
+def make_transport(
+    responses: list[Any], **kwargs: Any
+) -> tuple[UrllibTransport, RecordingUrlopen]:
     opener = RecordingUrlopen(responses)
     transport = UrllibTransport("TEST-TOKEN", urlopen=opener, **kwargs)
     return transport, opener
@@ -101,7 +104,7 @@ def test_call_raises_telegram_api_error_on_http_error_response() -> None:
         "https://api.telegram.org/botTEST-TOKEN/getUpdates",
         502,
         "Bad Gateway",
-        None,
+        cast(Any, None),
         io.BytesIO(b"<html>bad gateway</html>"),
     )
     transport, _ = make_transport([http_error])
@@ -124,6 +127,80 @@ def test_call_raises_telegram_api_error_on_network_failure() -> None:
     assert isinstance(exc_info.value.__cause__, urllib.error.URLError)
 
 
+def test_call_normalises_incomplete_read_from_a_dropped_connection() -> None:
+    # A long-poll connection dropped mid-body raises http.client.IncompleteRead
+    # out of response.read() — it must come back as TelegramApiError, not raw.
+    transport, _ = make_transport(
+        [http.client.IncompleteRead(b"half a response")]
+    )
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.call("getUpdates", {"offset": 0})
+
+    error = exc_info.value
+    assert error.method == "getUpdates"
+    assert isinstance(error.__cause__, http.client.IncompleteRead)
+
+
+def test_call_normalises_bad_status_line_from_a_garbled_response() -> None:
+    transport, _ = make_transport([http.client.BadStatusLine("\x00junk")])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.call("getUpdates", {"offset": 0})
+
+    error = exc_info.value
+    assert error.method == "getUpdates"
+    assert isinstance(error.__cause__, http.client.BadStatusLine)
+
+
+def test_call_normalises_any_http_client_exception() -> None:
+    # Category lock-in: every http.client.HTTPException subclass is normalised,
+    # not just the two that happen to have been reported.
+
+    class ProtocolFailure(http.client.HTTPException):
+        pass
+
+    transport, _ = make_transport([ProtocolFailure("protocol blew up")])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.call("sendMessage", {"chat_id": 1, "text": "x"})
+
+    error = exc_info.value
+    assert error.method == "sendMessage"
+    assert isinstance(error.__cause__, ProtocolFailure)
+
+
+def test_call_normalises_protocol_error_while_reading_the_error_body() -> None:
+    # Sibling of the reported bug: reading the HTTP *error* body can itself
+    # hit a dropped connection and raise out of the HTTPError handler.
+
+    class UnreadableBody:
+        def read(self, *_args: Any, **_kwargs: Any) -> bytes:
+            raise http.client.IncompleteRead(b"half a body")
+
+        def close(self) -> None:
+            return None
+
+    http_error = urllib.error.HTTPError(
+        "https://api.telegram.org/botTEST-TOKEN/getUpdates",
+        500,
+        "Server Error",
+        cast(Any, {}),
+        cast(Any, UnreadableBody()),
+    )
+    transport, _ = make_transport([http_error])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.call("getUpdates", {"offset": 0})
+
+    error = exc_info.value
+    assert error.method == "getUpdates"
+    assert error.status_code == 500
+    # The unreadable body falls back to the HTTP status description instead
+    # of letting IncompleteRead escape the HTTPError handler.
+    assert error.description == "HTTP 500 Server Error"
+
+
 def test_call_raises_telegram_api_error_on_invalid_json() -> None:
     transport, _ = make_transport([FakeResponse(b"not json at all")])
 
@@ -143,3 +220,12 @@ def test_call_raises_on_timeout_style_os_error() -> None:
 
     with pytest.raises(TelegramApiError):
         transport.call("getUpdates", {"offset": 0})
+
+
+def test_http_socket_timeout_outlasts_the_long_poll_hold() -> None:
+    # The socket must wait longer than the server-side long-poll window, or
+    # every quiet getUpdates would abort before Telegram has a chance to answer.
+    from telegram_documentaries.polling import LONG_POLL_TIMEOUT
+    from telegram_documentaries.transport import DEFAULT_TIMEOUT
+
+    assert DEFAULT_TIMEOUT >= LONG_POLL_TIMEOUT

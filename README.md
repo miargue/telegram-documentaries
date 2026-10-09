@@ -17,11 +17,21 @@ Bot API and echoes every incoming message. No Gemini/ADK pipeline yet.
 
 The gateway never exposes a URL. It repeatedly calls `getUpdates` with a
 server-side `timeout` of 10 seconds (Telegram holds the request open until a
-message arrives or the window expires — "long polling"), handles every
-update in the batch, then **acks the batch** by sending the next call with
-`offset = max(update_id) + 1`. Telegram therefore never redelivers what was
-already handled — including malformed updates, which are acked and skipped
-so a single poison payload cannot wedge the loop.
+message arrives or the window expires — "long polling") and handles every
+update in the batch.
+
+The **first** poll uses `offset = -1`, which tells Telegram to forget
+everything queued while the bot was down — a restart therefore does not
+re-answer the backlog, it only reacts to messages that arrive after boot.
+Every later poll **acks the batch** by sending the next call with
+`offset = max(update_id) + 1`, so Telegram does not redeliver what was
+already handled.
+
+Acking is per-update: an update that fails validation but carries an
+**integer** `update_id` is acked past and skipped, so a single poison payload
+cannot wedge the loop. Updates whose `update_id` cannot be parsed as an int
+are skipped and **never acked** (there is no id to ack with), so Telegram
+will redeliver them on the next poll until they can be handled.
 
 All external input is parsed at the edge into Pydantic models
 (`telegram_documentaries/models.py`); the rest of the code never touches raw
@@ -40,9 +50,8 @@ pip install -r requirements-dev.txt   # runtime + test/lint/type deps
 
 Runtime-only install: `pip install -r requirements.txt`.
 
-> `pydantic` is the runtime dependency used by Phase 1. `requests` is pinned
-> for later phases but is not used by the gateway (transport is stdlib
-> `urllib`).
+> `pydantic` is the only Phase 1 runtime dependency. The HTTP transport is
+> stdlib `urllib`, so no HTTP client library is pinned.
 
 ## Configure
 
@@ -68,18 +77,25 @@ Options:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--max-polls N` | run forever | Stop after N `getUpdates` polls (useful for smoke runs) |
+| `--max-polls N` | run forever | Stop after N `getUpdates` polls. `N` must be `>= 1` (useful for smoke runs) |
 | `--log-level LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
 
-Exit codes: `0` clean stop, `1` runtime/transport failure, `2`
-configuration problem (e.g. missing token).
+On startup the gateway calls `getMe` once and logs the bot's username in the
+`gateway_starting` event. A bad or revoked token therefore fails immediately
+with a `get_me_failed` error and exit code `1`, instead of surfacing only on
+the first `getUpdates`.
+
+Exit codes: `0` clean stop, `1` runtime/transport failure (including a failed
+startup `getMe` probe), `2` configuration problem or invalid command-line
+argument (e.g. missing token, `--max-polls 0`), `130` deliberate Ctrl-C stop.
 
 Logs are structured: one JSON object per line on stderr, with `ts`, `level`,
 `logger`, `message` plus event fields such as `event`, `chat_id`,
-`update_id`:
+`update_id`. When a line is logged with `exc_info=True`, the formatted
+traceback is carried in an `exc` field:
 
 ```json
-{"ts": "2026-10-06T10:13:04.445Z", "level": "ERROR", "logger": "telegram_documentaries.cli", "message": "configuration error", "event": "config_error", "error": "TELEGRAM_BOT_TOKEN is not set; ..."}
+{"ts": "2026-10-06T10:13:04.445Z", "level": "ERROR", "logger": "telegram_documentaries.cli", "message": "configuration error", "event": "config_error", "error": "TELEGRAM_BOT_TOKEN is not set; ...", "exc": "Traceback (most recent call last):\n  ...\nConfigError: TELEGRAM_BOT_TOKEN is not set; ..."}
 ```
 
 ## Test
@@ -103,7 +119,9 @@ scripts/hooks                # compileall + smoke import + ruff + mypy
 1. `python -m compileall -q telegram_documentaries tests`
 2. `python -c "import telegram_documentaries"`
 3. `python -m ruff check .` (includes the no-bare-`except` rule, E722)
-4. `python -m mypy telegram_documentaries`
+4. `python -m mypy telegram_documentaries tests`
+
+Both ruff and mypy read their configuration from `pyproject.toml`.
 
 ## Project layout
 
@@ -124,6 +142,7 @@ tests/
 scripts/
   test                # run the test suite
   hooks               # pre-commit checks
+pyproject.toml         # ruff + mypy configuration
 SPECS/                # MISSION.md, TECH.md, ROADMAP.md (the contract)
 ```
 

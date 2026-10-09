@@ -12,7 +12,7 @@ import logging
 
 from telegram_documentaries.logging_config import log_lifecycle
 from telegram_documentaries.models import Update
-from telegram_documentaries.transport import TelegramApiError, Transport
+from telegram_documentaries.transport import Transport
 
 ECHO_REPLY = "hey mate!"
 
@@ -44,14 +44,16 @@ def handle_update(
     chat_id = message.chat.id
     try:
         transport.call("sendMessage", {"chat_id": chat_id, "text": ECHO_REPLY})
-    except TelegramApiError as exc:
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
         log.error(
             "echo reply failed",
             extra={
                 "event": "reply_failed",
                 "update_id": update.update_id,
                 "chat_id": chat_id,
-                "error": exc.description,
+                "error": f"{type(exc).__name__}: {exc}",
             },
             exc_info=True,
         )

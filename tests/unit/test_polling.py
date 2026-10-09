@@ -3,10 +3,41 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from typing import Any
 
-from conftest import FakeTransport, messageless_update, text_update
+from conftest import FakeTransport, _RecordingHandler, messageless_update, text_update
+
 from telegram_documentaries.polling import LONG_POLL_TIMEOUT, poll_once, run_polling
 from telegram_documentaries.transport import TelegramApiError
+
+
+class _NonDictTransport:
+    """Transport double that violates its contract by returning a list."""
+
+    def call(
+        self, method: str, params: Mapping[str, Any] | None = None
+    ) -> Any:
+        return ["not", "a", "dict"]
+
+
+def test_non_object_get_updates_payload_is_logged_and_never_crashes() -> None:
+    # Regression: ``payload.get(...)`` used to raise AttributeError (which the
+    # CLI did not catch) when the transport handed back a non-object.
+    records: list[logging.LogRecord] = []
+    logger = logging.getLogger("polling.non_dict")
+    handler = _RecordingHandler(records)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        offset = poll_once(_NonDictTransport(), offset=0, logger=logger)
+    finally:
+        logger.removeHandler(handler)
+
+    assert offset == 0
+    failures = [r for r in records if r.levelno >= logging.ERROR]
+    assert failures, "a malformed transport payload must be logged loudly"
+    assert any(getattr(r, "event", None) == "get_updates_invalid" for r in failures)
 
 
 def test_get_updates_is_long_polling_with_offset_param() -> None:
@@ -46,7 +77,9 @@ def test_empty_batch_keeps_the_current_offset() -> None:
 
 
 def test_offset_never_goes_backwards_when_updates_arrive_unordered() -> None:
-    transport = FakeTransport(batches=[[text_update(3, chat_id=1), text_update(8, chat_id=1)]])
+    transport = FakeTransport(
+        batches=[[text_update(3, chat_id=1), text_update(8, chat_id=1)]]
+    )
 
     assert poll_once(transport, offset=6) == 9
 
@@ -106,8 +139,7 @@ def test_send_failure_is_logged_and_the_loop_keeps_acking() -> None:
     )
     records: list[logging.LogRecord] = []
     logger = logging.getLogger("polling.failure")
-    handler = logging.Handler()
-    handler.emit = records.append  # type: ignore[method-assign]
+    handler = _RecordingHandler(records)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     try:
@@ -131,6 +163,27 @@ def test_get_updates_transport_failure_propagates_loudly() -> None:
         pass
     else:  # pragma: no cover - fail loudly is the contract
         raise AssertionError("poll_once swallowed a getUpdates failure")
+
+
+def test_run_polling_starts_at_offset_minus_one_to_drop_the_backlog() -> None:
+    # On startup we must discard updates that piled up while the bot was down,
+    # otherwise every restart re-answers the backlog. Telegram treats the first
+    # getUpdates with offset=-1 as "forget everything before the latest update".
+    transport = FakeTransport(batches=[[]])
+
+    run_polling(transport, max_polls=1)
+
+    assert transport.calls_for("getUpdates")[0]["offset"] == -1
+
+
+def test_run_polling_returns_to_a_valid_offset_after_the_backlog_drop() -> None:
+    # -1 is only the first-poll sentinel: if the batch is empty the next poll
+    # must use a normal offset, never keep asking for the latest update.
+    transport = FakeTransport(batches=[[], []])
+
+    run_polling(transport, max_polls=2)
+
+    assert [fetch["offset"] for fetch in transport.calls_for("getUpdates")] == [-1, 0]
 
 
 def test_run_polling_stops_after_max_polls_and_carries_offset() -> None:

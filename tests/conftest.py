@@ -7,7 +7,24 @@ API would, so they can be fed through the real parsing boundary.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping
 from typing import Any
+
+
+class _RecordingHandler(logging.Handler):
+    """Test handler that records every emitted record.
+
+    Overriding ``emit`` (rather than monkey-patching the instance method) keeps
+    the handler type-correct, so tests need no ``# type: ignore``.
+    """
+
+    def __init__(self, records: list[logging.LogRecord]) -> None:
+        super().__init__()
+        self.records = records
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
 
 
 def text_update(
@@ -78,16 +95,22 @@ class FakeTransport:
 
     def __init__(
         self,
-        batches: list[list[dict[str, Any]]] | None = None,
+        batches: list[list[Any]] | None = None,
         *,
-        fail_on: dict[str, Exception] | None = None,
+        fail_on: dict[str, BaseException] | None = None,
+        me: dict[str, Any] | None = None,
     ) -> None:
-        self.batches: list[list[dict[str, Any]]] = list(batches or [])
+        self.batches: list[list[Any]] = list(batches or [])
         self.fail_on = dict(fail_on or {})
+        self.me: dict[str, Any] = (
+            {"id": 1, "username": "testy_bot", "first_name": "Testy"}
+            if me is None
+            else me
+        )
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def call(
-        self, method: str, params: dict[str, Any] | None = None
+        self, method: str, params: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
         recorded = dict(params or {})
         self.calls.append((method, recorded))
@@ -96,6 +119,8 @@ class FakeTransport:
         if method == "getUpdates":
             batch = self.batches.pop(0) if self.batches else []
             return {"ok": True, "result": batch}
+        if method == "getMe":
+            return {"ok": True, "result": self.me}
         return {"ok": True, "result": {"message_id": 1, "chat": {"id": 0}}}
 
     def calls_for(self, method: str) -> list[dict[str, Any]]:

@@ -13,7 +13,7 @@ python -c "import telegram_documentaries  # noqa: F401"
 echo "[hooks] ruff (lint)"
 python -m ruff check .
 
-echo "[hooks] mypy (type check)"
-python -m mypy telegram_documentaries
+echo "[hooks] mypy (type check: package + tests)"
+python -m mypy telegram_documentaries tests
 
 echo "[hooks] all checks passed"
