@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run the full test suite. Exits non-zero on any failure.
+# Usage: scripts/test [extra pytest args...]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+python -m pytest tests/ "$@"

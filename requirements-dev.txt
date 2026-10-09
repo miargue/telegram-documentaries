@@ -1,0 +1,5 @@
+# Development dependencies (pinned) — install with: pip install -r requirements-dev.txt
+-r requirements.txt
+pytest==9.1.1
+ruff==0.14.4
+mypy==1.18.2
