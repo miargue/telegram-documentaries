@@ -8,13 +8,18 @@ agent and every review is judged against it.
 - **Language:** Python 3.
 - **Transport:** Telegram Bot API over **long polling** (`getUpdates`). No
   webhooks, no public URL.
-- **Framework:** **No vendor agent framework as of Phase 2.** Each pipeline
+- **Framework:** **No vendor agent framework as of Phase 3.** Each pipeline
   stage is a discrete module behind a narrow typed port. The Bouncer exposes a
-  typed `VisionGate` port whose Phase 2 adapter is a direct **Gemini REST**
-  caller (`generateContent` with a JSON `responseSchema`) over stdlib
+  typed `VisionGate` port and the Interviewer a typed `InterviewLLM` port
+  (`next_question` / `summarize`); both Phase 3 adapters are direct **Gemini
+  REST** callers (`generateContent` with a JSON `responseSchema`) over stdlib
   `urllib` with an injectable `urlopen` seam — the same no-third-party-HTTP
-  pattern as the Phase 1 transport. **Google Agent Development Kit (ADK) is
-  deferred**; if a later phase adopts it, it will wrap these same ports.
+  pattern as the Phase 1 transport. The shared REST plumbing (endpoint build,
+  POST, failure normalisation, candidate extraction, schema validation and the
+  **single** API-key redaction implementation) lives once in
+  `gemini.py` (`GeminiJsonClient`), reused by `vision.py` and `interviewer.py`.
+  **Google Agent Development Kit (ADK) is deferred**; if a later phase adopts
+  it, it will wrap these same ports.
 - **Models:**
   - The Bouncer — vision gate — **Gemini 3.1 Flash Lite**.
   - The Interviewer — sequential Q&A + orchestrator — **Gemini 3.1 Flash Lite**.
@@ -31,9 +36,13 @@ agent and every review is judged against it.
 - **Hub-and-spoke (module level):** the Interviewer is the **orchestrator**.
   Each pipeline stage is a discrete module (Bouncer, Interviewer, Converter,
   Scripter) plus the non-agent TTS renderer. Stage boundaries are **typed
-  ports**, not vendor SDKs: e.g. the Bouncer is `VisionGate.classify(image) ->
-  HumanVerdict`, so the Gemini REST adapter (Phase 2) can later be swapped for
-  an ADK agent without touching the routing code.
+  ports**, not vendor SDKs: the Bouncer is `VisionGate.classify(image) ->
+  HumanVerdict` and the Interviewer is `InterviewLLM.next_question(...) ->
+  str` / `summarize(...) -> Dossier`, so the Gemini REST adapters can later be
+  swapped for ADK agents without touching the routing code. The Interviewer
+  owns its own turn-taking (the phase machine, the exactly-5 cap and the
+  one-question-per-message rule); `InterviewLLM` merely supplies one validated
+  question or the final dossier at a time.
 - **Explicit state machine:** one well-defined phase per pipeline stage, with
   explicit transitions and a single shared state driver. Phase is stored in the
   session state, never inferred implicitly.
@@ -62,10 +71,16 @@ agent and every review is judged against it.
 
 ## Session state
 
-- Versioned, per-`chat_id` schema with an explicit phase field.
+- Versioned, per-`chat_id` schema with an explicit phase field. **Version 2**
+  (Phase 3) adds the interview log (`list[QaPair]`, question-then-answer in
+  order), the outstanding `pending_question` and the synthesised `Dossier`.
+  In-memory only — the version bump is the schema contract, not a migration.
+- Phases: `awaiting_photo` → `gate_passed` → `interviewing` → `done`. A
+  `gate_passed` chat only survives a degraded interview start and is retried on
+  the next update.
 - One shared state driver (single module owns read/write/reset).
-- Reset semantics: `/start` and `/restart` clear state and temp media without
-  restarting the process.
+- Reset semantics: `/start` and `/restart` clear state, the interview log, the
+  pending question, the dossier and temp media without restarting the process.
 
 ## Testing
 

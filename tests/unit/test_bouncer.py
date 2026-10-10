@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from conftest import (
     FakeGate,
+    FakeLLM,
     FakeTransport,
     _RecordingHandler,
     document_update,
@@ -29,9 +30,10 @@ from telegram_documentaries.bouncer import (
     SUCCESS_REPLY,
     handle_update,
 )
+from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
 from telegram_documentaries.logging_config import SKIPPED
 from telegram_documentaries.models import Update
-from telegram_documentaries.session import Phase, SessionStore
+from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict, VisionError
 
@@ -90,6 +92,7 @@ def test_start_resets_the_session_and_prompts_for_a_photo() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -113,6 +116,7 @@ def test_restart_behaves_like_start() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -130,6 +134,7 @@ def test_start_with_a_bot_mention_is_recognised() -> None:
         transport,
         session=store,
         gate=FakeGate(),
+        llm=FakeLLM(),
     )
 
     assert transport.calls_for("sendMessage")[0]["text"] == PROMPT_PHOTO
@@ -145,6 +150,7 @@ def test_plain_text_re_prompts_without_calling_the_gate() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -164,6 +170,7 @@ def test_other_content_re_prompts_without_calling_the_gate(kind: str) -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -173,7 +180,6 @@ def test_other_content_re_prompts_without_calling_the_gate(kind: str) -> None:
 
 def test_photo_without_a_human_is_rejected_and_resets_the_session() -> None:
     store = SessionStore()
-    store.record_pass(chat_id=6, photo=b"stale")
     gate = FakeGate([HumanVerdict(is_human=False, reason="a dog")])
     transport = _photo_transport()
 
@@ -182,6 +188,7 @@ def test_photo_without_a_human_is_rejected_and_resets_the_session() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -195,20 +202,103 @@ def test_photo_of_a_human_passes_and_retains_the_image() -> None:
     store = SessionStore()
     gate = FakeGate([HumanVerdict(is_human=True, reason="a face")])
     transport = _photo_transport()
+    llm = FakeLLM()
 
     sent = handle_update(
         _update(photo_update(7, chat_id=7)),
         transport,
         session=store,
         gate=gate,
+        llm=llm,
     )
 
     assert sent is True
-    assert transport.calls_for("sendMessage")[0]["text"] == SUCCESS_REPLY
+    # The handoff is automatic: the success line is immediately followed by
+    # exactly one question (Q1), and the chat lands in ``interviewing``.
+    assert [call["text"] for call in transport.calls_for("sendMessage")] == [
+        SUCCESS_REPLY,
+        "Q1",
+    ]
+    assert llm.next_calls == [[]]
     assert gate.calls == 1
     assert gate.images == [b"PORTRAIT-BYTES"]
-    assert store.get(7).phase is Phase.gate_passed
+    assert store.get(7).phase is Phase.interviewing
     assert store.get(7).photo == b"PORTRAIT-BYTES"
+
+
+def test_text_during_the_interview_is_delegated_to_the_interviewer() -> None:
+    # Once a chat is interviewing, the Bouncer must hand every update to the
+    # interviewer (the interviewer owns turn-taking) and never re-gate content.
+    store = SessionStore()
+    store.record_pass(chat_id=81, photo=b"PORTRAIT")
+    store.start_interview(81, question="Q1")
+    gate = FakeGate()
+    transport = FakeTransport()
+    llm = FakeLLM(questions=["Q1", "Q2", "Q3", "Q4", "Q5"])
+
+    sent = handle_update(
+        _update(text_update(81, chat_id=81, text="a1")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+    )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage")[-1]["text"] == "Q2"
+    assert store.get(81).interview == [QaPair(question="Q1", answer="a1")]
+    assert gate.calls == 0
+
+
+def test_text_after_completion_is_delegated_to_the_interviewer() -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=82, photo=b"PORTRAIT")
+    store.start_interview(82, question="Q1")
+    for number in range(1, 6):
+        store.record_interview_answer(82, f"Q{number}", f"a{number}")
+    store.appoint_dossier(
+        82, Dossier(summary="S", suggested_animal="Capybara")
+    )
+    gate = FakeGate()
+    transport = FakeTransport()
+
+    sent = handle_update(
+        _update(text_update(82, chat_id=82, text="hello again")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=FakeLLM(),
+    )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage")[-1]["text"] == (
+        OBSERVATION_COMPLETE_REPLY
+    )
+    assert gate.calls == 0
+
+
+def test_start_mid_interview_resets_the_whole_session() -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=83, photo=b"PORTRAIT")
+    store.start_interview(83, question="Q1")
+    store.record_interview_answer(83, "Q1", "a1")
+    transport = FakeTransport()
+
+    sent = handle_update(
+        _update(text_update(83, chat_id=83, text="/start")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+    )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage")[0]["text"] == PROMPT_PHOTO
+    state = store.get(83)
+    assert state.phase is Phase.awaiting_photo
+    assert state.photo is None
+    assert state.interview == []
+    assert state.dossier is None
 
 
 def test_photo_with_a_caption_is_still_treated_as_a_photo() -> None:
@@ -221,6 +311,7 @@ def test_photo_with_a_caption_is_still_treated_as_a_photo() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -238,19 +329,22 @@ def test_album_first_photo_is_gated_and_its_siblings_are_ignored() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
     second = handle_update(
         _update(photo_update(21, chat_id=20, media_group_id="album-a")),
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert first is True
     assert second is SKIPPED
     assert gate.calls == 1
     assert [call["text"] for call in transport.calls_for("sendMessage")] == [
-        SUCCESS_REPLY
+        SUCCESS_REPLY,
+        "Q1",
     ]
 
 
@@ -264,18 +358,90 @@ def test_album_follow_up_after_a_rejection_is_still_ignored() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
     sent = handle_update(
         _update(photo_update(23, chat_id=22, media_group_id="album-b")),
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is SKIPPED
     assert gate.calls == 1
     assert [call["text"] for call in transport.calls_for("sendMessage")] == [
         REJECTION_REPLY
+    ]
+
+
+def test_album_sent_while_interviewing_gets_exactly_one_reply() -> None:
+    # A photo album sent mid-interview must hit the Interviewer once, not once
+    # per member (which would send one identical re-ask per photo): the media
+    # group id is remembered for *any* photo message, not only the gate path.
+    store = SessionStore()
+    store.record_pass(chat_id=90, photo=b"PORTRAIT")
+    store.start_interview(90, question="Q1")
+    gate = FakeGate()
+    transport = FakeTransport()
+    llm = FakeLLM(questions=["Q1", "Q2", "Q3", "Q4", "Q5"])
+
+    first = handle_update(
+        _update(photo_update(90, chat_id=90, media_group_id="album-mid")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+    )
+    second = handle_update(
+        _update(photo_update(91, chat_id=90, media_group_id="album-mid")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+    )
+
+    assert first is True
+    assert second is SKIPPED
+    assert gate.calls == 0
+    # One photo → one re-ask of the pending question; the sibling is dropped.
+    assert [call["text"] for call in transport.calls_for("sendMessage")] == [
+        "Q1"
+    ]
+
+
+def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=91, photo=b"PORTRAIT")
+    store.start_interview(91, question="Q1")
+    for number in range(1, 6):
+        store.record_interview_answer(91, f"Q{number}", f"a{number}")
+    store.appoint_dossier(
+        91, Dossier(summary="S", suggested_animal="Capybara")
+    )
+    gate = FakeGate()
+    transport = FakeTransport()
+    llm = FakeLLM()
+
+    first = handle_update(
+        _update(photo_update(92, chat_id=91, media_group_id="album-done")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+    )
+    second = handle_update(
+        _update(photo_update(93, chat_id=91, media_group_id="album-done")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+    )
+
+    assert first is True
+    assert second is SKIPPED
+    assert [call["text"] for call in transport.calls_for("sendMessage")] == [
+        OBSERVATION_COMPLETE_REPLY
     ]
 
 
@@ -313,7 +479,9 @@ def test_album_is_gated_once_whichever_member_arrives_first(
     ]
 
     results = [
-        handle_update(update, transport, session=store, gate=gate)
+        handle_update(
+            update, transport, session=store, gate=gate, llm=FakeLLM()
+        )
         for update in uploads
     ]
 
@@ -324,8 +492,13 @@ def test_album_is_gated_once_whichever_member_arrives_first(
 
 
 def test_distinct_albums_are_each_gated() -> None:
+    # A rejection returns the chat to ``awaiting_photo``, so a second, distinct
+    # album in the same chat is gated again: the dedupe keys on the media-group
+    # id, not merely "the first album this chat ever sent".
     store = SessionStore()
-    gate = FakeGate()
+    gate = FakeGate(
+        [HumanVerdict(is_human=False), HumanVerdict(is_human=False)]
+    )
     transport = _photo_transport()
 
     for update_id, group in ((32, "album-d"), (33, "album-e")):
@@ -334,14 +507,20 @@ def test_distinct_albums_are_each_gated() -> None:
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
         )
 
     assert gate.calls == 2
+    assert store.get(33).phase is Phase.awaiting_photo
 
 
 def test_photos_without_a_media_group_are_always_gated() -> None:
+    # No media-group id means no dedupe: every such photo is gated, even after
+    # a rejection in the same chat.
     store = SessionStore()
-    gate = FakeGate()
+    gate = FakeGate(
+        [HumanVerdict(is_human=False), HumanVerdict(is_human=False)]
+    )
     transport = _photo_transport()
 
     for update_id in (34, 35):
@@ -350,9 +529,11 @@ def test_photos_without_a_media_group_are_always_gated() -> None:
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
         )
 
     assert gate.calls == 2
+    assert store.get(34).phase is Phase.awaiting_photo
 
 
 def test_start_clears_the_album_dedupe() -> None:
@@ -365,24 +546,28 @@ def test_start_clears_the_album_dedupe() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
     handle_update(
         _update(photo_update(41, chat_id=40, media_group_id="album-f")),
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
     handle_update(
         _update(text_update(42, chat_id=40, text="/start")),
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
     sent = handle_update(
         _update(photo_update(43, chat_id=40, media_group_id="album-f")),
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -400,6 +585,7 @@ def test_album_skip_is_logged() -> None:
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
             logger=logger,
         )
         handle_update(
@@ -407,6 +593,7 @@ def test_album_skip_is_logged() -> None:
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
             logger=logger,
         )
 
@@ -435,6 +622,7 @@ def test_multi_size_photo_is_gated_once_with_the_largest_resolution() -> None:
         transport,
         session=SessionStore(),
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert gate.calls == 1
@@ -451,6 +639,7 @@ def test_empty_photo_list_re_prompts_without_gating() -> None:
         transport,
         session=SessionStore(),
         gate=gate,
+        llm=FakeLLM(),
     )
 
     assert transport.calls_for("sendMessage")[0]["text"] == PROMPT_PHOTO
@@ -465,6 +654,7 @@ def test_messageless_update_is_skipped() -> None:
         transport,
         session=SessionStore(),
         gate=FakeGate(),
+        llm=FakeLLM(),
     )
 
     assert sent is SKIPPED
@@ -480,6 +670,7 @@ def test_messageless_update_logs_a_skip_lifecycle_not_a_degraded_warning() -> No
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            llm=FakeLLM(),
         )
 
     assert sent is SKIPPED
@@ -499,12 +690,14 @@ def test_album_follow_up_logs_a_skip_lifecycle_not_a_degraded_warning() -> None:
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
         )
         sent = handle_update(
             _update(photo_update(72, chat_id=71, media_group_id="album-z")),
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
         )
 
     assert sent is SKIPPED
@@ -529,6 +722,7 @@ def test_vision_error_becomes_an_apology_and_leaves_the_session_usable() -> None
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
             logger=logger,
         )
 
@@ -539,15 +733,17 @@ def test_vision_error_becomes_an_apology_and_leaves_the_session_usable() -> None
     assert any("vision_failed" in _events([r]) for r in failures)
     assert any(r.exc_info is not None for r in failures)
 
-    # The session is still usable for a later, healthy photo.
+    # The session is still usable for a later, healthy photo: it passes the
+    # gate and the automatic handoff moves it straight into ``interviewing``.
     handle_update(
         _update(photo_update(13, chat_id=12)),
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
         logger=logger,
     )
-    assert store.get(12).phase is Phase.gate_passed
+    assert store.get(12).phase is Phase.interviewing
 
 
 def test_photo_fetch_failure_becomes_an_apology() -> None:
@@ -563,6 +759,7 @@ def test_photo_fetch_failure_becomes_an_apology() -> None:
             transport,
             session=store,
             gate=gate,
+            llm=FakeLLM(),
             logger=logger,
         )
 
@@ -584,6 +781,7 @@ def test_download_failure_becomes_an_apology() -> None:
         transport,
         session=SessionStore(),
         gate=FakeGate(),
+        llm=FakeLLM(),
     )
 
     assert sent is True
@@ -602,6 +800,7 @@ def test_hostile_file_path_is_rejected_without_downloading_or_gating() -> None:
             transport,
             session=SessionStore(),
             gate=gate,
+            llm=FakeLLM(),
             logger=logger,
         )
 
@@ -623,6 +822,7 @@ def test_empty_downloaded_image_is_treated_as_a_gate_failure() -> None:
             transport,
             session=SessionStore(),
             gate=gate,
+            llm=FakeLLM(),
             logger=logger,
         )
 
@@ -643,6 +843,7 @@ def test_send_failure_is_logged_loudly_and_returns_false() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            llm=FakeLLM(),
             logger=logger,
         )
 
@@ -666,6 +867,7 @@ def test_send_failure_marks_the_lifecycle_degraded_not_success() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            llm=FakeLLM(),
         )
 
     assert sent is False
@@ -685,6 +887,7 @@ def test_unexpected_send_exception_is_swallowed_and_logged() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            llm=FakeLLM(),
             logger=logger,
         )
 
@@ -701,6 +904,7 @@ def test_process_control_exceptions_are_not_swallowed() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            llm=FakeLLM(),
         )
 
 
@@ -714,6 +918,7 @@ def test_sessions_never_leak_between_chats() -> None:
         transport,
         session=store,
         gate=gate,
+        llm=FakeLLM(),
     )
 
     other = store.get(21)

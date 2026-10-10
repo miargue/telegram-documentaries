@@ -14,7 +14,7 @@ import urllib.parse
 from typing import Any
 
 import pytest
-from conftest import FakeGate, messageless_update, text_update
+from conftest import FakeGate, FakeLLM, messageless_update, text_update
 
 from telegram_documentaries.bouncer import PROMPT_PHOTO
 from telegram_documentaries.cli import main
@@ -79,6 +79,7 @@ def _run(transport: UrllibTransport, *, max_polls: int) -> int:
         offset=0,
         session=SessionStore(),
         gate=FakeGate(),
+        llm=FakeLLM(),
         max_polls=max_polls,
     )
 

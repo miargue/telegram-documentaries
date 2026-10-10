@@ -33,13 +33,27 @@ Google ADK (deferred — see `SPECS/TECH.md`).
 
 ## 3. The Interviewer
 
-- Sequential stateful Q&A: 5–7 questions, one at a time, state keyed by
-  `chat_id`.
+- Sequential stateful Q&A: **exactly 5** questions, one at a time, state keyed
+  by `chat_id`. (Reconciled from "5–7" to the user-locked exactly-5 decision of
+  2026-10-10 — see `SPECS/2026-10-10-interviewer/requirements.md` decision 3.)
 - Builds a behavioural dossier; outputs a suggested animal.
 
 **Acceptance:** full questionnaire completes in order with a dossier summary
 and animal suggestion; answers out of order do not corrupt the session.
 *Serves: the interview experience and dossier for Converter + Scripter.*
+
+**Status: complete (verified 2026-10-10, branch
+`feature/2026-10-10-interviewer`).** Delivered: typed `InterviewLLM` port +
+`GeminiInterviewer` Gemini REST adapter over a shared `GeminiJsonClient`
+(extracted from `vision.py`; single API-key redaction); the Interviewer owns
+its turn-taking (exactly-5 cap, one question per message, stored pending
+question); `SessionState` v2 carries the interview log, pending question and
+`Dossier`; automatic handoff after the Bouncer pass (success line then Q1);
+optional `GEMINI_INTERVIEW_MODEL`. `scripts/test` (367 passed) and
+`scripts/hooks` green; no test touches the network. Full evidence in
+`SPECS/2026-10-10-interviewer/validation.md`. Framework note: the shipped
+integration is a typed port over stdlib `urllib` sharing one Gemini JSON
+client, **not** Google ADK (still deferred — see `SPECS/TECH.md`).
 
 ## 4. The Converter
 

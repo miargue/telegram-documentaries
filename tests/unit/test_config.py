@@ -11,6 +11,7 @@ import pytest
 from telegram_documentaries.config import (
     ConfigError,
     get_api_key,
+    get_interview_model,
     get_token,
     get_vision_model,
     parse_env_file,
@@ -190,6 +191,70 @@ def test_default_vision_model_lives_in_a_neutral_module() -> None:
         == defaults.DEFAULT_VISION_MODEL
     )
     assert vision.DEFAULT_VISION_MODEL is defaults.DEFAULT_VISION_MODEL
+
+
+def test_get_interview_model_defaults_to_gemini_flash_lite() -> None:
+    assert (
+        get_interview_model(environ={}, env_file=None)
+        == "gemini-3.1-flash-lite"
+    )
+
+
+def test_get_interview_model_env_override_wins(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_INTERVIEW_MODEL=from-file\n", encoding="utf-8")
+
+    model = get_interview_model(
+        environ={"GEMINI_INTERVIEW_MODEL": "from-env"}, env_file=env_file
+    )
+
+    assert model == "from-env"
+
+
+def test_get_interview_model_falls_back_to_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_INTERVIEW_MODEL=file-model\n", encoding="utf-8")
+
+    assert get_interview_model(environ={}, env_file=env_file) == "file-model"
+
+
+def test_get_interview_model_blank_override_falls_back_to_default() -> None:
+    model = get_interview_model(
+        environ={"GEMINI_INTERVIEW_MODEL": "   "}, env_file=None
+    )
+
+    assert model == "gemini-3.1-flash-lite"
+
+
+def test_default_interview_model_lives_in_a_neutral_module() -> None:
+    from telegram_documentaries import defaults
+
+    assert (
+        get_interview_model(environ={}, env_file=None)
+        == defaults.DEFAULT_INTERVIEW_MODEL
+    )
+
+
+def test_importing_config_does_not_pull_in_the_interview_adapter() -> None:
+    # Same N3 guarantee as the vision adapter: resolving the interview model
+    # must not drag the Gemini interviewer (and its urllib machinery) into
+    # every config-only caller.
+    code = (
+        "import sys\n"
+        "import telegram_documentaries.config\n"
+        "assert 'telegram_documentaries.interviewer' not in sys.modules, "
+        "'config must not import the interviewer adapter'\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_importing_config_does_not_pull_in_the_vision_adapter() -> None:

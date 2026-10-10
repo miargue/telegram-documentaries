@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeGate, FakeTransport, photo_update, text_update
+from conftest import FakeGate, FakeLLM, FakeTransport, photo_update, text_update
 
 from telegram_documentaries.bouncer import PROMPT_PHOTO, SUCCESS_REPLY
 from telegram_documentaries.cli import main, positive_int
+from telegram_documentaries.interviewer import InterviewLLM
 from telegram_documentaries.logging_config import JsonFormatter
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict, VisionGate
@@ -134,11 +135,87 @@ def test_main_threads_the_gate_into_the_poll_loop(tmp_path: Path) -> None:
         env_file=tmp_path / "absent.env",
         transport_factory=lambda token: transport,
         gate_factory=lambda api_key, model: gate,
+        interview_factory=lambda api_key, model: FakeLLM(),
     )
 
     assert exit_code == 0
     assert gate.calls == 1
-    assert transport.calls_for("sendMessage")[0]["text"] == SUCCESS_REPLY
+    assert [message["text"] for message in transport.calls_for("sendMessage")] == [
+        SUCCESS_REPLY,
+        "Q1",
+    ]
+
+
+def test_main_builds_the_interviewer_from_the_api_key_and_default_model(
+    tmp_path: Path,
+) -> None:
+    built: list[tuple[str, str]] = []
+
+    def interview_factory(api_key: str, model: str) -> InterviewLLM:
+        built.append((api_key, model))
+        return FakeLLM()
+
+    exit_code = main(
+        ["--max-polls", "1"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        interview_factory=interview_factory,
+    )
+
+    assert exit_code == 0
+    assert built == [(API_KEY, "gemini-3.1-flash-lite")]
+
+
+def test_main_uses_the_interview_model_override(tmp_path: Path) -> None:
+    built: list[tuple[str, str]] = []
+
+    def interview_factory(api_key: str, model: str) -> InterviewLLM:
+        built.append((api_key, model))
+        return FakeLLM()
+
+    main(
+        ["--max-polls", "1"],
+        environ={
+            "TELEGRAM_BOT_TOKEN": "token",
+            "GEMINI_API_KEY": API_KEY,
+            "GEMINI_INTERVIEW_MODEL": "gemini-interview-custom",
+        },
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        interview_factory=interview_factory,
+    )
+
+    assert built == [(API_KEY, "gemini-interview-custom")]
+
+
+def test_main_threads_the_interviewer_into_the_poll_loop(tmp_path: Path) -> None:
+    # A portrait passing the gate must reach *this* interviewer: the success
+    # line is immediately followed by question 1 from the injected adapter.
+    transport = FakeTransport(
+        batches=[[photo_update(1, chat_id=5)], []],
+        files={"abc123": ("photos/a.jpg", b"portrait")},
+    )
+    gate = FakeGate([HumanVerdict(is_human=True)])
+    llm = FakeLLM()
+
+    exit_code = main(
+        ["--max-polls", "2"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: transport,
+        gate_factory=lambda api_key, model: gate,
+        interview_factory=lambda api_key, model: llm,
+    )
+
+    assert exit_code == 0
+    assert [message["text"] for message in transport.calls_for("sendMessage")] == [
+        SUCCESS_REPLY,
+        "Q1",
+    ]
+    assert llm.next_calls == [[]]
 
 
 def test_main_runs_the_bouncer_loop_with_the_configured_token(tmp_path: Path) -> None:
