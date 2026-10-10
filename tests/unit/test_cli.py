@@ -1,4 +1,10 @@
-"""Behaviour of the CLI entrypoint (`python -m telegram_documentaries`)."""
+"""Behaviour of the CLI entrypoint (`python -m telegram_documentaries`).
+
+Phase 2 wiring: the CLI must resolve both secrets (``TELEGRAM_BOT_TOKEN`` and
+``GEMINI_API_KEY``), build one ``SessionStore`` and one ``VisionGate``, and
+thread them into the poll loop. No test contacts Telegram or Gemini — the
+transport and the gate factory are injected fakes.
+"""
 
 from __future__ import annotations
 
@@ -8,33 +14,140 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeTransport, text_update
+from conftest import FakeGate, FakeTransport, photo_update, text_update
 
+from telegram_documentaries.bouncer import PROMPT_PHOTO, SUCCESS_REPLY
 from telegram_documentaries.cli import main, positive_int
 from telegram_documentaries.logging_config import JsonFormatter
+from telegram_documentaries.transport import TelegramApiError
+from telegram_documentaries.vision import HumanVerdict, VisionGate
+
+API_KEY = "test-gemini-key"
+
+
+def _refuse_transport(token: str) -> Any:
+    raise AssertionError(f"transport must not be built: {token}")
+
+
+def _refuse_gate(api_key: str, model: str) -> VisionGate:
+    raise AssertionError(f"gate must not be built: {api_key} / {model}")
 
 
 def test_main_returns_config_error_when_token_missing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def refuse_transport(token: str) -> Any:
-        raise AssertionError(f"transport must not be built without a token: {token}")
-
     with caplog.at_level(logging.ERROR, logger="telegram_documentaries.cli"):
         exit_code = main(
             ["--max-polls", "1"],
-            environ={},
+            environ={"GEMINI_API_KEY": API_KEY},
             env_file=tmp_path / "absent.env",
-            transport_factory=refuse_transport,
+            transport_factory=_refuse_transport,
+            gate_factory=_refuse_gate,
         )
 
     assert exit_code == 2
     assert any(record.levelno >= logging.ERROR for record in caplog.records)
+    assert any(
+        getattr(record, "event", None) == "config_error"
+        for record in caplog.records
+    )
 
 
-def test_main_runs_the_echo_loop_with_the_configured_token(tmp_path: Path) -> None:
+def test_main_returns_config_error_when_api_key_missing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Missing GEMINI_API_KEY must fail fast at startup (exit 2), before the
+    # transport is even constructed — the gate can never run keyless.
+    with caplog.at_level(logging.ERROR, logger="telegram_documentaries.cli"):
+        exit_code = main(
+            ["--max-polls", "1"],
+            environ={"TELEGRAM_BOT_TOKEN": "token"},
+            env_file=tmp_path / "absent.env",
+            transport_factory=_refuse_transport,
+            gate_factory=_refuse_gate,
+        )
+
+    assert exit_code == 2
+    assert any(
+        getattr(record, "event", None) == "config_error"
+        for record in caplog.records
+    )
+
+
+def test_main_builds_the_gate_from_the_api_key_and_default_model(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(batches=[[text_update(1, chat_id=5)], []])
+    built: list[tuple[str, str]] = []
+    gate = FakeGate()
+
+    def gate_factory(api_key: str, model: str) -> VisionGate:
+        built.append((api_key, model))
+        return gate
+
+    exit_code = main(
+        ["--max-polls", "2"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: transport,
+        gate_factory=gate_factory,
+    )
+
+    assert exit_code == 0
+    assert built == [(API_KEY, "gemini-3.1-flash-lite")]
+
+
+def test_main_uses_the_vision_model_override(tmp_path: Path) -> None:
+    built: list[tuple[str, str]] = []
+
+    def gate_factory(api_key: str, model: str) -> VisionGate:
+        built.append((api_key, model))
+        return FakeGate()
+
+    main(
+        ["--max-polls", "1"],
+        environ={
+            "TELEGRAM_BOT_TOKEN": "token",
+            "GEMINI_API_KEY": API_KEY,
+            "GEMINI_VISION_MODEL": "gemini-custom",
+        },
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=gate_factory,
+    )
+
+    assert built == [(API_KEY, "gemini-custom")]
+
+
+def test_main_threads_the_gate_into_the_poll_loop(tmp_path: Path) -> None:
+    # A photo that the injected gate accepts proves the gate built at startup
+    # is the one the handler actually calls.
+    transport = FakeTransport(
+        batches=[[photo_update(1, chat_id=5)], []],
+        files={"abc123": ("photos/a.jpg", b"portrait")},
+    )
+    gate = FakeGate([HumanVerdict(is_human=True)])
+
+    exit_code = main(
+        ["--max-polls", "2"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: transport,
+        gate_factory=lambda api_key, model: gate,
+    )
+
+    assert exit_code == 0
+    assert gate.calls == 1
+    assert transport.calls_for("sendMessage")[0]["text"] == SUCCESS_REPLY
+
+
+def test_main_runs_the_bouncer_loop_with_the_configured_token(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
-    env_file.write_text("TELEGRAM_BOT_TOKEN=env-file-token\n", encoding="utf-8")
+    env_file.write_text(
+        "TELEGRAM_BOT_TOKEN=env-file-token\n"
+        f"GEMINI_API_KEY={API_KEY}\n",
+        encoding="utf-8",
+    )
     transport = FakeTransport(batches=[[text_update(1, chat_id=5)], []])
     seen_tokens: list[str] = []
 
@@ -47,12 +160,13 @@ def test_main_runs_the_echo_loop_with_the_configured_token(tmp_path: Path) -> No
         environ={},
         env_file=env_file,
         transport_factory=factory,
+        gate_factory=lambda api_key, model: FakeGate(),
     )
 
     assert exit_code == 0
     assert seen_tokens == ["env-file-token"]
     replies = transport.calls_for("sendMessage")
-    assert [reply["text"] for reply in replies] == ["hey mate!"]
+    assert [reply["text"] for reply in replies] == [PROMPT_PHOTO]
     assert len(transport.calls_for("getUpdates")) == 2
 
 
@@ -66,9 +180,10 @@ def test_main_reads_token_from_environment_first(tmp_path: Path) -> None:
 
     exit_code = main(
         ["--max-polls", "1"],
-        environ={"TELEGRAM_BOT_TOKEN": "env-token"},
+        environ={"TELEGRAM_BOT_TOKEN": "env-token", "GEMINI_API_KEY": API_KEY},
         env_file=tmp_path / "absent.env",
         transport_factory=factory,
+        gate_factory=lambda api_key, model: FakeGate(),
     )
 
     assert exit_code == 0
@@ -78,9 +193,10 @@ def test_main_reads_token_from_environment_first(tmp_path: Path) -> None:
 def test_main_installs_structured_logging(tmp_path: Path) -> None:
     main(
         ["--max-polls", "1"],
-        environ={"TELEGRAM_BOT_TOKEN": "t"},
+        environ={"TELEGRAM_BOT_TOKEN": "t", "GEMINI_API_KEY": API_KEY},
         env_file=tmp_path / "absent.env",
         transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
     )
 
     root = logging.getLogger()
@@ -131,9 +247,10 @@ def test_main_turns_keyboard_interrupt_into_a_clean_structured_stop(
     with caplog.at_level(logging.INFO, logger="telegram_documentaries.cli"):
         exit_code = main(
             ["--max-polls", "1"],
-            environ={"TELEGRAM_BOT_TOKEN": "t"},
+            environ={"TELEGRAM_BOT_TOKEN": "t", "GEMINI_API_KEY": API_KEY},
             env_file=tmp_path / "absent.env",
             transport_factory=lambda token: transport,
+            gate_factory=lambda api_key, model: FakeGate(),
         )
 
     assert exit_code == 130  # 128 + SIGINT, documented in the README
@@ -159,9 +276,10 @@ def test_main_probes_get_me_first_and_logs_the_bot_username(
     with caplog.at_level(logging.INFO, logger="telegram_documentaries.cli"):
         exit_code = main(
             ["--max-polls", "1"],
-            environ={"TELEGRAM_BOT_TOKEN": "t"},
+            environ={"TELEGRAM_BOT_TOKEN": "t", "GEMINI_API_KEY": API_KEY},
             env_file=tmp_path / "absent.env",
             transport_factory=lambda token: transport,
+            gate_factory=lambda api_key, model: FakeGate(),
         )
 
     assert exit_code == 0
@@ -178,8 +296,6 @@ def test_main_probes_get_me_first_and_logs_the_bot_username(
 def test_main_exits_non_zero_when_the_get_me_probe_fails(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from telegram_documentaries.transport import TelegramApiError
-
     transport = FakeTransport(
         fail_on={"getMe": TelegramApiError("getMe", "Unauthorized")}
     )
@@ -187,9 +303,10 @@ def test_main_exits_non_zero_when_the_get_me_probe_fails(
     with caplog.at_level(logging.ERROR, logger="telegram_documentaries.cli"):
         exit_code = main(
             ["--max-polls", "1"],
-            environ={"TELEGRAM_BOT_TOKEN": "bad-token"},
+            environ={"TELEGRAM_BOT_TOKEN": "bad-token", "GEMINI_API_KEY": API_KEY},
             env_file=tmp_path / "absent.env",
             transport_factory=lambda token: transport,
+            gate_factory=lambda api_key, model: FakeGate(),
         )
 
     assert exit_code == 1
@@ -209,9 +326,10 @@ def test_main_turns_keyboard_interrupt_during_the_probe_into_a_clean_stop(
     with caplog.at_level(logging.INFO, logger="telegram_documentaries.cli"):
         exit_code = main(
             ["--max-polls", "1"],
-            environ={"TELEGRAM_BOT_TOKEN": "t"},
+            environ={"TELEGRAM_BOT_TOKEN": "t", "GEMINI_API_KEY": API_KEY},
             env_file=tmp_path / "absent.env",
             transport_factory=lambda token: transport,
+            gate_factory=lambda api_key, model: FakeGate(),
         )
 
     assert exit_code == 130
@@ -226,8 +344,6 @@ def test_main_turns_keyboard_interrupt_during_the_probe_into_a_clean_stop(
 def test_main_logs_get_updates_failure_and_exits_non_zero(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from telegram_documentaries.transport import TelegramApiError
-
     transport = FakeTransport(
         fail_on={"getUpdates": TelegramApiError("getUpdates", "network down")}
     )
@@ -235,9 +351,10 @@ def test_main_logs_get_updates_failure_and_exits_non_zero(
     with caplog.at_level(logging.ERROR, logger="telegram_documentaries.cli"):
         exit_code = main(
             ["--max-polls", "1"],
-            environ={"TELEGRAM_BOT_TOKEN": "t"},
+            environ={"TELEGRAM_BOT_TOKEN": "t", "GEMINI_API_KEY": API_KEY},
             env_file=tmp_path / "absent.env",
             transport_factory=lambda token: transport,
+            gate_factory=lambda api_key, model: FakeGate(),
         )
 
     assert exit_code == 1

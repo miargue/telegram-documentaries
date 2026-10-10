@@ -7,7 +7,7 @@ import logging
 
 from conftest import _RecordingHandler
 
-from telegram_documentaries.logging_config import JsonFormatter, log_lifecycle
+from telegram_documentaries.logging_config import SKIPPED, JsonFormatter, log_lifecycle
 
 
 def make_record(
@@ -105,6 +105,68 @@ def test_log_lifecycle_logs_success_and_propagates_return_value() -> None:
     events = [getattr(record, "event", None) for record in records]
     assert "do_thing" in events
     assert all(getattr(r, "event", None) == "do_thing" for r in records)
+
+
+def test_log_lifecycle_logs_degraded_when_the_callable_returns_false() -> None:
+    logger = logging.getLogger("lifecycle-degraded")
+    records: list[logging.LogRecord] = []
+    handler = _RecordingHandler(records)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    @log_lifecycle(logger, "do_thing")
+    def do_thing() -> bool:
+        return False
+
+    assert do_thing() is False
+    stages = [getattr(record, "stage", None) for record in records]
+    assert "success" not in stages
+    degraded = [r for r in records if getattr(r, "stage", None) == "degraded"]
+    assert degraded, "a False result must be logged as degraded"
+    assert degraded[0].levelno == logging.WARNING
+    assert getattr(degraded[0], "event") == "do_thing"
+
+
+def test_log_lifecycle_logs_the_skipped_sentinel_at_info_not_degraded() -> None:
+    # A deliberate, benign no-op is not a degraded outcome: it must be logged
+    # as ``skipped`` at INFO so it never produces a false operational warning.
+    logger = logging.getLogger("lifecycle-skipped")
+    records: list[logging.LogRecord] = []
+    handler = _RecordingHandler(records)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    @log_lifecycle(logger, "handle_update")
+    def handle_update() -> object:
+        return SKIPPED
+
+    assert handle_update() is SKIPPED
+    stages = [getattr(record, "stage", None) for record in records]
+    assert "skipped" in stages
+    assert "degraded" not in stages
+    assert "success" not in stages
+    skipped = [r for r in records if getattr(r, "stage", None) == "skipped"]
+    assert skipped[0].levelno == logging.INFO
+    assert getattr(skipped[0], "event") == "handle_update"
+
+
+def test_log_lifecycle_treats_zero_as_success_not_degraded() -> None:
+    # ``run_polling`` returns an int offset, which is legitimately 0 on the
+    # first empty poll; only the boolean ``False`` signals a degraded result.
+    logger = logging.getLogger("lifecycle-zero")
+    records: list[logging.LogRecord] = []
+    handler = _RecordingHandler(records)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+
+    @log_lifecycle(logger, "run_polling")
+    def run_polling() -> int:
+        return 0
+
+    assert run_polling() == 0
+    stages = [getattr(record, "stage", None) for record in records]
+    assert "success" in stages
+    assert "degraded" not in stages
 
 
 def test_log_lifecycle_logs_failure_and_reraises() -> None:

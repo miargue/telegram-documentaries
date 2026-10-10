@@ -1,8 +1,9 @@
-"""Component: the whole Phase 1 gateway over one faked seam (``urlopen``).
+"""Component: the whole gateway over one faked seam (``urlopen``).
 
-Honest label: no real I/O. The transport, parsing, echo rule and offset
-acking all run for real; only the HTTP layer is a scripted double, so the
-test exercises the exact code path production uses — minus the socket.
+Honest label: no real I/O. The transport, parsing, Bouncer routing and offset
+acking all run for real; only the HTTP layer is a scripted double, so the test
+exercises the exact code path production uses — minus the socket. The vision
+gate is a ``FakeGate`` (no Gemini).
 """
 
 from __future__ import annotations
@@ -13,10 +14,12 @@ import urllib.parse
 from typing import Any
 
 import pytest
-from conftest import messageless_update, photo_update, text_update
+from conftest import FakeGate, messageless_update, text_update
 
+from telegram_documentaries.bouncer import PROMPT_PHOTO
 from telegram_documentaries.cli import main
 from telegram_documentaries.polling import run_polling
+from telegram_documentaries.session import SessionStore
 from telegram_documentaries.transport import UrllibTransport
 
 
@@ -70,12 +73,22 @@ class _Response:
         return self.body
 
 
-def test_gateway_echoes_every_message_and_acks_the_batch() -> None:
+def _run(transport: UrllibTransport, *, max_polls: int) -> int:
+    return run_polling(
+        transport,
+        offset=0,
+        session=SessionStore(),
+        gate=FakeGate(),
+        max_polls=max_polls,
+    )
+
+
+def test_gateway_handles_every_message_and_acks_the_batch() -> None:
     opener = FakeUrlOpen(
         batches=[
             [
                 text_update(100, chat_id=7, text="hello"),
-                photo_update(101, chat_id=8),
+                text_update(101, chat_id=8, text="hi"),
                 messageless_update(102),
             ],
             [],
@@ -83,11 +96,11 @@ def test_gateway_echoes_every_message_and_acks_the_batch() -> None:
     )
     transport = UrllibTransport("COMPONENT-TOKEN", urlopen=opener)
 
-    final_offset = run_polling(transport, offset=0, max_polls=2)
+    final_offset = _run(transport, max_polls=2)
 
-    # Exactly one 'hey mate!' per incoming message, to the right chats.
+    # Exactly one photo prompt per incoming message, to the right chats.
     assert [msg["chat_id"] for msg in opener.send_messages] == ["7", "8"]
-    assert {msg["text"] for msg in opener.send_messages} == {"hey mate!"}
+    assert {msg["text"] for msg in opener.send_messages} == {PROMPT_PHOTO}
 
     # Token goes in the URL; first fetch starts at 0, second acks the batch.
     assert opener.get_updates[0]["offset"] == "0"
@@ -106,9 +119,13 @@ def test_startup_probe_calls_get_me_through_the_real_transport(
     with caplog.at_level(logging.INFO, logger="telegram_documentaries.cli"):
         exit_code = main(
             ["--max-polls", "1"],
-            environ={"TELEGRAM_BOT_TOKEN": "COMPONENT-TOKEN"},
+            environ={
+                "TELEGRAM_BOT_TOKEN": "COMPONENT-TOKEN",
+                "GEMINI_API_KEY": "component-key",
+            },
             env_file=None,
             transport_factory=lambda token: transport,
+            gate_factory=lambda api_key, model: FakeGate(),
         )
 
     assert exit_code == 0
@@ -141,7 +158,7 @@ def test_gateway_survives_telegram_reporting_a_failed_send() -> None:
     opener = FailingSendOpener(batches=[[text_update(7, chat_id=1)], []])
     transport = UrllibTransport("TOKEN", urlopen=opener)
 
-    final_offset = run_polling(transport, offset=0, max_polls=2)
+    final_offset = _run(transport, max_polls=2)
 
     # The failed send does not kill the loop, and the batch is still acked.
     assert final_offset == 8
@@ -168,9 +185,9 @@ def test_gateway_survives_a_non_normalised_transport_crash() -> None:
     )
     transport = UrllibTransport("TOKEN", urlopen=opener)
 
-    final_offset = run_polling(transport, offset=0, max_polls=2)
+    final_offset = _run(transport, max_polls=2)
 
     assert final_offset == 11
     assert opener.get_updates[1]["offset"] == "11"  # batch still acked
     assert [msg["chat_id"] for msg in opener.send_messages] == ["2"]
-    assert opener.send_messages[0]["text"] == "hey mate!"
+    assert opener.send_messages[0]["text"] == PROMPT_PHOTO

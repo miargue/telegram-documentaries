@@ -1,7 +1,9 @@
-"""CLI entrypoint: wire config → transport → long-polling loop.
+"""CLI entrypoint: wire config → transport → session/gate → long-polling loop.
 
-Kept thin on purpose: argument parsing, structured logging setup, token
-resolution, and normalising top-level failures into exit codes.
+Kept thin on purpose: argument parsing, structured logging setup, secret
+resolution, and normalising top-level failures into exit codes. The process
+owns exactly one ``SessionStore`` and one ``VisionGate``, built here and
+threaded into the poll loop.
 
 Exit codes: ``0`` clean stop, ``1`` runtime/API failure (including a failed
 startup ``getMe`` probe), ``2`` configuration problem or invalid command-line
@@ -17,18 +19,33 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import NoReturn
 
-from telegram_documentaries.config import DEFAULT_ENV_FILE, ConfigError, get_token
+from telegram_documentaries.config import (
+    DEFAULT_ENV_FILE,
+    ConfigError,
+    get_api_key,
+    get_token,
+    get_vision_model,
+)
 from telegram_documentaries.logging_config import configure_logging
 from telegram_documentaries.polling import run_polling
+from telegram_documentaries.session import SessionStore
 from telegram_documentaries.transport import (
     TelegramApiError,
     Transport,
     UrllibTransport,
 )
+from telegram_documentaries.vision import GeminiVisionGate, VisionGate
 
 LOGGER = logging.getLogger(__name__)
 
 TransportFactory = Callable[[str], Transport]
+# Builds the vision gate from the resolved API key and model id.
+GateFactory = Callable[[str, str], VisionGate]
+
+
+def _build_gate(api_key: str, model: str) -> VisionGate:
+    """Default gate factory: a Gemini REST adapter for the resolved secrets."""
+    return GeminiVisionGate(api_key, model=model)
 
 
 def _probe_bot_username(transport: Transport) -> str | None:
@@ -88,8 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _CliParser(
         prog="telegram_documentaries",
         description=(
-            "Phase 1 gateway: long-poll Telegram getUpdates and reply to "
-            "every incoming message with 'hey mate!'."
+            "Phase 2 gateway: long-poll Telegram getUpdates and gate incoming "
+            "portraits with the Gemini vision Bouncer."
         ),
     )
     parser.add_argument(
@@ -114,6 +131,7 @@ def main(
     environ: dict[str, str] | None = None,
     env_file: Path | None = DEFAULT_ENV_FILE,
     transport_factory: TransportFactory = UrllibTransport,
+    gate_factory: GateFactory = _build_gate,
 ) -> int:
     """Run the gateway; return a process exit code instead of raising."""
     # Configure a sane level first so even an argparse usage error is emitted
@@ -124,6 +142,7 @@ def main(
 
     try:
         token = get_token(environ=environ, env_file=env_file)
+        api_key = get_api_key(environ=environ, env_file=env_file)
     except ConfigError as exc:
         LOGGER.error(
             "configuration error",
@@ -145,6 +164,11 @@ def main(
         )
         return 1
 
+    session = SessionStore()
+    gate = gate_factory(
+        api_key, get_vision_model(environ=environ, env_file=env_file)
+    )
+
     LOGGER.info(
         "gateway starting",
         extra={
@@ -155,7 +179,12 @@ def main(
         },
     )
     try:
-        final_offset = run_polling(transport, max_polls=args.max_polls)
+        final_offset = run_polling(
+            transport,
+            session=session,
+            gate=gate,
+            max_polls=args.max_polls,
+        )
     except KeyboardInterrupt:
         return _stopped_for_keyboard_interrupt()
     except (TelegramApiError, OSError) as exc:

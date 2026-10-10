@@ -40,12 +40,43 @@ class User(_TelegramModel):
     username: str | None = None
 
 
+class PhotoSize(_TelegramModel):
+    """One resolution of a compressed photo.
+
+    Telegram sends an array of these for a single image (smallest first);
+    ``file_size`` is optional metadata. Missing dimensions are a parse error so
+    the boundary never hands a malformed size downstream.
+    """
+
+    file_id: str
+    file_unique_id: str
+    width: int
+    height: int
+    file_size: int | None = None
+
+
+class FileRef(_TelegramModel):
+    """The ``getFile`` result: where the actual bytes live on Telegram's CDN.
+
+    ``file_path`` is optional in the API but required before a download URL can
+    be built; the media layer treats a missing or unsafe path as a hard error.
+    """
+
+    file_id: str
+    file_unique_id: str | None = None
+    file_size: int | None = None
+    file_path: str | None = None
+
+
 class Message(_TelegramModel):
     """An incoming message of any content type.
 
     ``text`` is ``None`` for non-text messages (photos, stickers, ...);
-    ``date`` and chat metadata default so a slightly-minimal payload can still
-    be addressed and acked instead of crashing the loop.
+    ``photo`` carries the compressed-photo resolutions when present.
+    ``media_group_id`` is set when Telegram groups several photos sent together
+    as one album (it is a string in the Bot API). ``date`` and chat metadata
+    default so a slightly-minimal payload can still be addressed and acked
+    instead of crashing the loop.
     """
 
     message_id: int
@@ -54,6 +85,8 @@ class Message(_TelegramModel):
     from_: User | None = Field(default=None, alias="from")
     text: str | None = None
     caption: str | None = None
+    photo: list[PhotoSize] | None = None
+    media_group_id: str | None = None
 
 
 class Update(_TelegramModel):

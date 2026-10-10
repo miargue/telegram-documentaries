@@ -22,6 +22,15 @@ tests pass. *Serves: whole pipeline groundwork.*
 a reset; a human appears with text-only input handled gracefully. *Serves: gate
 before any interview work.*
 
+**Status: complete (verified 2026-10-10, branch `feature/2026-10-09-bouncer`).**
+Delivered: typed `VisionGate` port + Gemini REST adapter; `session.py` state
+driver; `media.py` photo intake; `bouncer.py` routing (replaces `echo.py`);
+`GEMINI_API_KEY` / optional `GEMINI_VISION_MODEL` config; graceful degradation.
+`scripts/test` (244 passed) and `scripts/hooks` green; no test touches the
+network. Full evidence in `SPECS/2026-10-09-bouncer/validation.md`. Framework
+note: the shipped integration is a typed port over stdlib `urllib`, **not**
+Google ADK (deferred — see `SPECS/TECH.md`).
+
 ## 3. The Interviewer
 
 - Sequential stateful Q&A: 5–7 questions, one at a time, state keyed by

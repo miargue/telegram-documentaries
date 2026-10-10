@@ -1,4 +1,9 @@
-"""Behaviour of the long-poll loop: getUpdates fetching and offset acking."""
+"""Behaviour of the long-poll loop: getUpdates fetching and offset acking.
+
+``session`` and ``gate`` are injected thread-through dependencies: the loop
+must pass the same instances to every ``handle_update`` call so one process
+shares one session store and one gate.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +11,19 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from conftest import FakeTransport, _RecordingHandler, messageless_update, text_update
+from conftest import (
+    FakeGate,
+    FakeTransport,
+    _RecordingHandler,
+    messageless_update,
+    photo_update,
+    text_update,
+)
 
 from telegram_documentaries.polling import LONG_POLL_TIMEOUT, poll_once, run_polling
+from telegram_documentaries.session import Phase, SessionStore
 from telegram_documentaries.transport import TelegramApiError
+from telegram_documentaries.vision import HumanVerdict
 
 
 class _NonDictTransport:
@@ -19,6 +33,14 @@ class _NonDictTransport:
         self, method: str, params: Mapping[str, Any] | None = None
     ) -> Any:
         return ["not", "a", "dict"]
+
+    def download(self, file_path: str) -> bytes:
+        return b""
+
+
+def _store() -> SessionStore:
+    """A throwaway session store, keeping each call isolated."""
+    return SessionStore()
 
 
 def test_non_object_get_updates_payload_is_logged_and_never_crashes() -> None:
@@ -30,7 +52,13 @@ def test_non_object_get_updates_payload_is_logged_and_never_crashes() -> None:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     try:
-        offset = poll_once(_NonDictTransport(), offset=0, logger=logger)
+        offset = poll_once(
+            _NonDictTransport(),
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            logger=logger,
+        )
     finally:
         logger.removeHandler(handler)
 
@@ -43,7 +71,7 @@ def test_non_object_get_updates_payload_is_logged_and_never_crashes() -> None:
 def test_get_updates_is_long_polling_with_offset_param() -> None:
     transport = FakeTransport(batches=[[]])
 
-    poll_once(transport, offset=0)
+    poll_once(transport, offset=0, session=_store(), gate=FakeGate())
 
     params = transport.calls_for("getUpdates")[0]
     assert params["timeout"] == LONG_POLL_TIMEOUT
@@ -54,10 +82,12 @@ def test_get_updates_is_long_polling_with_offset_param() -> None:
 def test_offset_ack_advances_to_one_past_the_processed_update() -> None:
     transport = FakeTransport(batches=[[text_update(10, chat_id=1)], []])
 
-    next_offset = poll_once(transport, offset=0)
+    next_offset = poll_once(
+        transport, offset=0, session=_store(), gate=FakeGate()
+    )
     assert next_offset == 11
 
-    poll_once(transport, offset=next_offset)
+    poll_once(transport, offset=next_offset, session=_store(), gate=FakeGate())
     second_fetch = transport.calls_for("getUpdates")[1]
     assert second_fetch["offset"] == 11
 
@@ -67,13 +97,13 @@ def test_offset_advances_past_the_highest_update_in_a_batch() -> None:
         batches=[[text_update(7, chat_id=1), text_update(9, chat_id=2)]]
     )
 
-    assert poll_once(transport, offset=0) == 10
+    assert poll_once(transport, offset=0, session=_store(), gate=FakeGate()) == 10
 
 
 def test_empty_batch_keeps_the_current_offset() -> None:
     transport = FakeTransport(batches=[[]])
 
-    assert poll_once(transport, offset=5) == 5
+    assert poll_once(transport, offset=5, session=_store(), gate=FakeGate()) == 5
 
 
 def test_offset_never_goes_backwards_when_updates_arrive_unordered() -> None:
@@ -81,7 +111,7 @@ def test_offset_never_goes_backwards_when_updates_arrive_unordered() -> None:
         batches=[[text_update(3, chat_id=1), text_update(8, chat_id=1)]]
     )
 
-    assert poll_once(transport, offset=6) == 9
+    assert poll_once(transport, offset=6, session=_store(), gate=FakeGate()) == 9
 
 
 def test_malformed_update_is_acked_and_skipped_without_crashing() -> None:
@@ -94,7 +124,9 @@ def test_malformed_update_is_acked_and_skipped_without_crashing() -> None:
         ]
     )
 
-    next_offset = poll_once(transport, offset=0)
+    next_offset = poll_once(
+        transport, offset=0, session=_store(), gate=FakeGate()
+    )
 
     assert next_offset == 16  # the good update is acked...
     assert len(transport.calls_for("sendMessage")) == 1  # ...and handled
@@ -106,7 +138,9 @@ def test_poison_update_is_acked_so_it_cannot_loop_forever() -> None:
     poison = {"update_id": 21, "message": {"message_id": 1}}  # message has no chat
     transport = FakeTransport(batches=[[poison, text_update(22, chat_id=4)]])
 
-    next_offset = poll_once(transport, offset=0)
+    next_offset = poll_once(
+        transport, offset=0, session=_store(), gate=FakeGate()
+    )
 
     assert next_offset == 23
     replies = transport.calls_for("sendMessage")
@@ -117,7 +151,9 @@ def test_poison_update_is_acked_so_it_cannot_loop_forever() -> None:
 def test_non_dict_entry_in_batch_is_ignored_without_crash() -> None:
     transport = FakeTransport(batches=[["garbage", text_update(30, chat_id=9)]])
 
-    next_offset = poll_once(transport, offset=0)
+    next_offset = poll_once(
+        transport, offset=0, session=_store(), gate=FakeGate()
+    )
 
     assert next_offset == 31
     assert len(transport.calls_for("sendMessage")) == 1
@@ -126,7 +162,9 @@ def test_non_dict_entry_in_batch_is_ignored_without_crash() -> None:
 def test_messageless_update_is_acked_without_a_reply() -> None:
     transport = FakeTransport(batches=[[messageless_update(35)]])
 
-    next_offset = poll_once(transport, offset=0)
+    next_offset = poll_once(
+        transport, offset=0, session=_store(), gate=FakeGate()
+    )
 
     assert next_offset == 36  # acknowledged...
     assert transport.calls_for("sendMessage") == []  # ...but not answered
@@ -143,7 +181,13 @@ def test_send_failure_is_logged_and_the_loop_keeps_acking() -> None:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     try:
-        next_offset = poll_once(transport, offset=0, logger=logger)
+        next_offset = poll_once(
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            logger=logger,
+        )
     finally:
         logger.removeHandler(handler)
 
@@ -158,11 +202,28 @@ def test_get_updates_transport_failure_propagates_loudly() -> None:
     )
 
     try:
-        poll_once(transport, offset=0)
+        poll_once(transport, offset=0, session=_store(), gate=FakeGate())
     except TelegramApiError:
         pass
     else:  # pragma: no cover - fail loudly is the contract
         raise AssertionError("poll_once swallowed a getUpdates failure")
+
+
+def test_poll_once_threads_the_injected_session_and_gate_to_the_handler() -> None:
+    # A photo passing the gate mutates *this* store: proof the loop uses the
+    # injected store rather than silently building its own.
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=True)])
+    transport = FakeTransport(
+        batches=[[photo_update(45, chat_id=45)]],
+        files={"abc123": ("photos/p.jpg", b"portrait")},
+    )
+
+    poll_once(transport, offset=0, session=store, gate=gate)
+
+    state = store.get(45)
+    assert state.phase is Phase.gate_passed
+    assert state.photo == b"portrait"
 
 
 def test_run_polling_starts_at_offset_minus_one_to_drop_the_backlog() -> None:
@@ -171,7 +232,7 @@ def test_run_polling_starts_at_offset_minus_one_to_drop_the_backlog() -> None:
     # getUpdates with offset=-1 as "forget everything before the latest update".
     transport = FakeTransport(batches=[[]])
 
-    run_polling(transport, max_polls=1)
+    run_polling(transport, session=_store(), gate=FakeGate(), max_polls=1)
 
     assert transport.calls_for("getUpdates")[0]["offset"] == -1
 
@@ -181,7 +242,7 @@ def test_run_polling_returns_to_a_valid_offset_after_the_backlog_drop() -> None:
     # must use a normal offset, never keep asking for the latest update.
     transport = FakeTransport(batches=[[], []])
 
-    run_polling(transport, max_polls=2)
+    run_polling(transport, session=_store(), gate=FakeGate(), max_polls=2)
 
     assert [fetch["offset"] for fetch in transport.calls_for("getUpdates")] == [-1, 0]
 
@@ -189,7 +250,9 @@ def test_run_polling_returns_to_a_valid_offset_after_the_backlog_drop() -> None:
 def test_run_polling_stops_after_max_polls_and_carries_offset() -> None:
     transport = FakeTransport(batches=[[text_update(50, chat_id=1)], []])
 
-    final_offset = run_polling(transport, offset=0, max_polls=2)
+    final_offset = run_polling(
+        transport, offset=0, session=_store(), gate=FakeGate(), max_polls=2
+    )
 
     assert final_offset == 51
     fetches = transport.calls_for("getUpdates")
@@ -200,7 +263,9 @@ def test_run_polling_stops_after_max_polls_and_carries_offset() -> None:
 def test_run_polling_from_a_given_offset() -> None:
     transport = FakeTransport(batches=[[text_update(60, chat_id=1)]])
 
-    final_offset = run_polling(transport, offset=60, max_polls=1)
+    final_offset = run_polling(
+        transport, offset=60, session=_store(), gate=FakeGate(), max_polls=1
+    )
 
     assert final_offset == 61
     assert transport.calls_for("getUpdates")[0]["offset"] == 60

@@ -22,6 +22,30 @@ from typing import ParamSpec, TypeVar
 P = ParamSpec("P")
 R = TypeVar("R")
 
+
+class Skipped:
+    """Sentinel for a deliberate, benign no-op from a decorated callable.
+
+    Deliberately returned (instead of ``False``) when a callable intentionally
+    does nothing — e.g. a Telegram update with no message, or an album
+    follow-up already handled. ``log_lifecycle`` logs it at INFO as ``skipped``
+    rather than WARNING as ``degraded``, so an expected no-op never raises a
+    false operational warning. It is falsy so existing truthiness checks keep
+    treating it as "nothing happened".
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "SKIPPED"
+
+
+# The single shared instance; compare with ``is``.
+SKIPPED = Skipped()
+
 # Attributes every LogRecord already carries; anything else came from `extra=`.
 _STANDARD_RECORD_ATTRS = frozenset(
     {
@@ -104,10 +128,17 @@ def configure_logging(level: str | int = "INFO") -> None:
 def log_lifecycle(
     logger: logging.Logger, event: str
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Decorator: log ``event`` start/success/failure with structured fields.
+    """Decorator: log ``event`` start/success/skipped/degraded/failure.
 
     Failures are logged loudly with the traceback and **always re-raised** —
-    the decorator never swallows anything.
+    the decorator never swallows anything. A callable that returns the boolean
+    ``False`` handled its request in a degraded way (e.g. a reply could not be
+    sent), so it is logged at WARNING as ``degraded`` rather than ``success``;
+    that keeps a swallowed ``False`` from being obscured by a happy-path line.
+    A callable that returns :data:`SKIPPED` deliberately did nothing (a benign
+    skip), so it is logged at INFO as ``skipped`` instead. Only the exact
+    boolean ``False`` counts as degraded — a falsy ``0`` (an offset or a
+    count) is a normal success.
     """
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
@@ -126,6 +157,18 @@ def log_lifecycle(
                     exc_info=True,
                 )
                 raise
+            if result is SKIPPED:
+                logger.info(
+                    "lifecycle skipped",
+                    extra={"event": event, "stage": "skipped"},
+                )
+                return result
+            if result is False:
+                logger.warning(
+                    "lifecycle degraded",
+                    extra={"event": event, "stage": "degraded"},
+                )
+                return result
             logger.info(
                 "lifecycle ok",
                 extra={"event": event, "stage": "success"},
