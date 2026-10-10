@@ -1,10 +1,11 @@
 """Behaviour of the InterviewLLM port and its Gemini REST adapter.
 
 ``urlopen`` is injected, so every case runs without a live API or a socket and
-the tests can assert on the outgoing request body: the researcher persona, the
-Q&A transcript as alternating user/model parts, and the JSON schema. Every
-failure must come back as a :class:`InterviewError` whose message is redacted
-of the API key — the same guarantee the vision adapter provides.
+the tests can assert on the outgoing request body: the researcher persona in
+``systemInstruction``, the labelled Q&A transcript as a single ``user``
+content, and the JSON schema. Every failure must come back as an
+:class:`InterviewError` whose message is redacted of the API key — the same
+guarantee the vision adapter provides.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from telegram_documentaries.interviewer import (
     APOLOGY_REPLY,
     ASK_PROMPT,
     DOSSIER_SCHEMA,
-    MAX_QUESTION_LENGTH,
+    EMPTY_TRANSCRIPT_NOTE,
     OBSERVATION_COMPLETE_REPLY,
     QUESTION_SCHEMA,
     SYNTHESIZE_PROMPT,
@@ -48,7 +49,11 @@ from telegram_documentaries.interviewer import (
 from telegram_documentaries.logging_config import SKIPPED
 from telegram_documentaries.models import Update
 from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
-from telegram_documentaries.transport import TelegramApiError
+from telegram_documentaries.transport import (
+    MAX_MESSAGE_LENGTH,
+    TelegramApiError,
+    message_length,
+)
 
 SECRET_KEY = "SECRET-GEMINI-KEY-CANARY"
 
@@ -158,33 +163,31 @@ def test_next_question_carries_the_persona_as_system_instruction() -> None:
     assert body["systemInstruction"] == {"parts": [{"text": ASK_PROMPT}]}
 
 
-def test_next_question_contents_alternate_and_end_with_one_user_turn() -> None:
+def test_next_question_embeds_the_labelled_transcript_in_one_user_turn() -> None:
     interviewer, opener = make_interviewer([FakeResponse(question_body())])
 
     interviewer.next_question(two_pairs())
 
     body = json.loads(opener.requests[0][1] or b"{}")
     contents = body["contents"]
-    roles = [content["role"] for content in contents]
-    # Strict alternation, ending in exactly one ``user`` turn: Google rejects
-    # anything else with 400 INVALID_ARGUMENT.
-    assert roles == ["user", "model", "user", "model", "user"]
-    assert all(previous != current for previous, current in zip(roles, roles[1:]))
-    assert roles[-1] == "user"
-    assert roles.count("user") == roles.count("model") + 1
-    # The transcript rides along as alternating user (question) / model
-    # (answer) parts, in the order the user saw them.
-    assert contents[0] == {"role": "user", "parts": [{"text": "Where does it sleep?"}]}
-    assert contents[1] == {"role": "model", "parts": [{"text": "In a hammock"}]}
-    assert contents[2] == {"role": "user", "parts": [{"text": "What does it eat?"}]}
-    assert contents[3] == {"role": "model", "parts": [{"text": "Salted crackers"}]}
-    # The final user part demands exactly one question, at the right position.
-    final = contents[4]
-    assert final["role"] == "user"
-    final_text = final["parts"][0]["text"]
-    assert f"question 3 of {DEFAULT_QUESTION_COUNT}" in final_text
-    # The persona is *not* in the turns.
-    assert all("investigative" not in c["parts"][0]["text"] for c in contents)
+    # Exactly one ``user`` content: the transcript is embedded as a labelled
+    # block, never as alternating user/model turns (the role inversion bug).
+    assert len(contents) == 1
+    assert contents[0]["role"] == "user"
+    prompt = contents[0]["parts"][0]["text"]
+    # Interviewer questions and subject answers are clearly labelled, in order.
+    assert "Q1: Where does it sleep?" in prompt
+    assert "A1: In a hammock" in prompt
+    assert "Q2: What does it eat?" in prompt
+    assert "A2: Salted crackers" in prompt
+    assert prompt.index("Q1:") < prompt.index("A1:") < prompt.index("Q2:")
+    # The block ends with the ask instruction.
+    assert prompt.endswith(
+        f"Ask question 3 of {DEFAULT_QUESTION_COUNT} - exactly one question."
+    )
+    # The persona lives only in ``systemInstruction``, never in the prompt.
+    assert "investigative" not in prompt
+    assert body["systemInstruction"] == {"parts": [{"text": ASK_PROMPT}]}
 
     # A schema, not a regex, constrains the model output.
     generation = body["generationConfig"]
@@ -199,11 +202,15 @@ def test_next_question_with_an_empty_transcript_asks_question_one() -> None:
 
     body = json.loads(opener.requests[0][1] or b"{}")
     contents = body["contents"]
-    # Empty transcript → a *single* user content holding the ask instruction.
+    # Empty transcript → a *single* user content: an explicit "not started"
+    # marker followed by the ask instruction.
     assert len(contents) == 1
     assert contents[0]["role"] == "user"
-    final_text = contents[0]["parts"][0]["text"]
-    assert f"question 1 of {DEFAULT_QUESTION_COUNT}" in final_text
+    prompt = contents[0]["parts"][0]["text"]
+    assert EMPTY_TRANSCRIPT_NOTE in prompt
+    assert prompt.endswith(
+        f"Ask question 1 of {DEFAULT_QUESTION_COUNT} - exactly one question."
+    )
     assert body["systemInstruction"] == {"parts": [{"text": ASK_PROMPT}]}
 
 
@@ -235,11 +242,23 @@ def test_next_question_rejects_a_whitespace_only_question() -> None:
 
 
 def test_next_question_rejects_a_question_over_the_telegram_limit() -> None:
-    # Telegram rejects sendMessage over 4096 characters, so an over-long model
-    # question would loop apologise-and-re-ask forever.
+    # Telegram rejects sendMessage over 4096 UTF-16 code units, so an over-long
+    # model question would loop apologise-and-re-ask forever.
     interviewer, _ = make_interviewer(
-        [FakeResponse(question_body("x" * (MAX_QUESTION_LENGTH + 1)))]
+        [FakeResponse(question_body("x" * (MAX_MESSAGE_LENGTH + 1)))]
     )
+
+    with pytest.raises(InterviewError):
+        interviewer.next_question([])
+
+
+def test_next_question_rejects_a_short_string_that_exceeds_the_utf16_limit() -> None:
+    # 2049 emoji is only 2049 Python characters — well under a ``len()`` check —
+    # but 4098 UTF-16 code units, which Telegram rejects. The guard must count
+    # code units, not characters.
+    over = "😀" * (MAX_MESSAGE_LENGTH // 2 + 1)
+    assert len(over) <= MAX_MESSAGE_LENGTH
+    interviewer, _ = make_interviewer([FakeResponse(question_body(over))])
 
     with pytest.raises(InterviewError):
         interviewer.next_question([])
@@ -248,10 +267,17 @@ def test_next_question_rejects_a_question_over_the_telegram_limit() -> None:
 def test_next_question_accepts_a_question_at_the_telegram_limit() -> None:
     # Boundary: exactly the limit is still deliverable, so it must be accepted.
     interviewer, _ = make_interviewer(
-        [FakeResponse(question_body("x" * MAX_QUESTION_LENGTH))]
+        [FakeResponse(question_body("x" * MAX_MESSAGE_LENGTH))]
     )
 
-    assert len(interviewer.next_question([])) == MAX_QUESTION_LENGTH
+    assert message_length(interviewer.next_question([])) == MAX_MESSAGE_LENGTH
+
+
+def test_next_question_accepts_an_astral_question_at_the_utf16_limit() -> None:
+    at_limit = "😀" * (MAX_MESSAGE_LENGTH // 2)
+    interviewer, _ = make_interviewer([FakeResponse(question_body(at_limit))])
+
+    assert interviewer.next_question([]) == at_limit
 
 
 # --------------------------------------------------------------------- summarize
@@ -293,22 +319,19 @@ def test_summarize_sends_the_persona_categories_and_schema(
     body = json.loads(opener.requests[0][1] or b"{}")
     assert body["systemInstruction"] == {"parts": [{"text": SYNTHESIZE_PROMPT}]}
     contents = body["contents"]
-    # Strict alternation, ending in exactly one ``user`` synthesis turn: the
-    # production 5-pair transcript must produce a 5-pair / 11-content body.
-    roles = [content["role"] for content in contents]
-    assert roles == ["user", "model"] * pair_count + ["user"]
-    assert all(previous != current for previous, current in zip(roles, roles[1:]))
-    assert roles[-1] == "user"
-    assert len(contents) == 2 * pair_count + 1
-    for index, pair in enumerate(transcript):
-        assert contents[2 * index] == {
-            "role": "user",
-            "parts": [{"text": pair.question}],
-        }
-        assert contents[2 * index + 1] == {
-            "role": "model",
-            "parts": [{"text": pair.answer}],
-        }
+    # Exactly one ``user`` content holding the labelled transcript — no
+    # user/model alternation, for any transcript length.
+    assert len(contents) == 1
+    assert contents[0]["role"] == "user"
+    prompt = contents[0]["parts"][0]["text"]
+    for index, pair in enumerate(transcript, start=1):
+        assert f"Q{index}: {pair.question}" in prompt
+        assert f"A{index}: {pair.answer}" in prompt
+    # The persona is only in ``systemInstruction``, never in the prompt.
+    assert "investigative" not in prompt
+    assert prompt.endswith(
+        "Now build the behavioural dossier as the requested JSON."
+    )
 
     generation = body["generationConfig"]
     assert generation["responseMimeType"] == "application/json"
@@ -324,6 +347,11 @@ def test_summarize_with_an_empty_transcript_ends_with_one_user_turn() -> None:
     contents = body["contents"]
     assert len(contents) == 1
     assert contents[0]["role"] == "user"
+    prompt = contents[0]["parts"][0]["text"]
+    assert EMPTY_TRANSCRIPT_NOTE in prompt
+    assert prompt.endswith(
+        "Now build the behavioural dossier as the requested JSON."
+    )
     assert body["systemInstruction"] == {"parts": [{"text": SYNTHESIZE_PROMPT}]}
 
 
@@ -797,6 +825,42 @@ def test_five_answers_complete_the_interview_and_store_the_dossier() -> None:
     ]
 
 
+def test_oversized_dossier_report_is_truncated_and_the_interview_completes() -> None:
+    # Regression: a model summary past Telegram's 4096-unit limit used to make
+    # the report send fail forever, leaving the 5th answer uncommitted and the
+    # interview permanently wedged at four pairs. The send chokepoint now
+    # bounds the text, so the report lands and the session completes.
+    dossier = Dossier(
+        summary="s" * (MAX_MESSAGE_LENGTH * 3),
+        suggested_animal="Cat",
+        animal_reason="r" * (MAX_MESSAGE_LENGTH * 2),
+    )
+    store = _passed_store()
+    llm = FakeLLM(questions=["Q1", "Q2", "Q3", "Q4", "Q5"], dossiers=[dossier])
+    transport = FakeTransport()
+    _start_via_update(transport, store, llm)
+    for index in range(1, 6):
+        sent = handle_update(
+            _update(text_update(680 + index, chat_id=1, text=f"a{index}")),
+            transport,
+            session=store,
+            llm=llm,
+        )
+        assert sent is True
+
+    assert all(
+        message_length(call["text"]) <= MAX_MESSAGE_LENGTH
+        for call in transport.calls_for("sendMessage")
+    )
+    state = store.get(1)
+    assert state.phase is Phase.done
+    assert state.dossier == dossier
+    assert state.interview == [
+        QaPair(question=f"Q{number}", answer=f"a{number}")
+        for number in range(1, 6)
+    ]
+
+
 def test_a_sixth_answer_after_completion_is_a_light_no_op() -> None:
     # The transcript can never exceed five pairs: once done, every further
     # message is the light observation-complete reply and touches nothing.
@@ -1131,6 +1195,9 @@ def test_dossier_send_failure_is_retried_on_the_next_message() -> None:
     )
 
     assert sent is False
+    # The user is never left in silence: a failed report is followed by a
+    # best-effort apology, and the session stays retryable.
+    assert transport.calls_for("sendMessage")[-1]["text"] == APOLOGY_REPLY
     assert store.get(1).phase is Phase.interviewing
     assert len(store.get(1).interview) == 4
 

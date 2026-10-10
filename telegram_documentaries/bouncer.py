@@ -33,7 +33,7 @@ from telegram_documentaries.logging_config import SKIPPED, Skipped, log_lifecycl
 from telegram_documentaries.media import fetch_photo, largest_photo
 from telegram_documentaries.models import Message, Update
 from telegram_documentaries.session import Phase, SessionStore
-from telegram_documentaries.transport import Transport
+from telegram_documentaries.transport import Transport, truncate_message
 from telegram_documentaries.vision import VisionGate
 
 LOGGER = logging.getLogger(__name__)
@@ -328,9 +328,17 @@ def _send(
     update: Update,
     log: logging.Logger,
 ) -> bool:
-    """Send one message; degrade a failure to ``False`` with a loud log."""
+    """Send one message; degrade a failure to ``False`` with a loud log.
+
+    Every outbound message is defensively bounded to Telegram's limit at this
+    chokepoint (mechanism-level guard for the over-long outbound-text bug
+    class): the reply is truncated before it can be rejected by ``sendMessage``.
+    """
     try:
-        transport.call("sendMessage", {"chat_id": chat_id, "text": text})
+        transport.call(
+            "sendMessage",
+            {"chat_id": chat_id, "text": truncate_message(text)},
+        )
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:

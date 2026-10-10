@@ -15,7 +15,13 @@ from typing import Any, cast
 
 import pytest
 
-from telegram_documentaries.transport import TelegramApiError, UrllibTransport
+from telegram_documentaries.transport import (
+    MAX_MESSAGE_LENGTH,
+    TelegramApiError,
+    UrllibTransport,
+    message_length,
+    truncate_message,
+)
 
 
 class FakeResponse:
@@ -308,3 +314,69 @@ def test_download_normalises_a_protocol_failure() -> None:
     assert error.__cause__ is None
     assert error.__suppress_context__ is True
     assert "IncompleteRead" in str(error)
+
+
+# ---------------------------------------------------- outbound message length
+#
+# Telegram rejects ``sendMessage`` text longer than 4096 *UTF-16 code units*
+# (not Python characters), and the chokepoints rely on these helpers to bound
+# every outbound message. The helpers are the mechanism-level guard for the
+# whole "over-long outbound text" bug class.
+
+
+def test_message_length_counts_ascii_characters_as_one_unit() -> None:
+    assert message_length("hello") == 5
+
+
+def test_message_length_counts_an_astral_emoji_as_two_utf16_units() -> None:
+    # Telegram counts UTF-16 code units, so a single astral emoji is two units
+    # even though Python sees one character.
+    assert message_length("😀") == 2
+    assert message_length("a😀") == 3
+
+
+def test_truncate_message_leaves_a_message_within_the_limit_untouched() -> None:
+    text = "x" * MAX_MESSAGE_LENGTH
+
+    assert truncate_message(text) == text
+
+
+def test_truncate_message_trims_ascii_to_the_limit() -> None:
+    text = "x" * (MAX_MESSAGE_LENGTH + 100)
+
+    truncated = truncate_message(text)
+
+    assert message_length(truncated) == MAX_MESSAGE_LENGTH
+    assert truncated == "x" * MAX_MESSAGE_LENGTH
+
+
+def test_truncate_message_never_splits_a_surrogate_pair() -> None:
+    # 4095 ASCII + one astral emoji = 4097 code units: the cut lands *inside*
+    # the emoji's surrogate pair, and the orphaned high surrogate must go.
+    text = "a" * (MAX_MESSAGE_LENGTH - 1) + "😀"
+
+    truncated = truncate_message(text)
+
+    assert message_length(truncated) <= MAX_MESSAGE_LENGTH
+    assert truncated == "a" * (MAX_MESSAGE_LENGTH - 1)
+    # A lone surrogate would make this re-encode raise.
+    assert message_length(truncated.encode("utf-16-le").decode("utf-16-le")) == (
+        MAX_MESSAGE_LENGTH - 1
+    )
+
+
+def test_truncate_message_trims_an_all_emoji_message_to_whole_units() -> None:
+    text = "😀" * (MAX_MESSAGE_LENGTH // 2 + 1)  # 4098 code units
+
+    truncated = truncate_message(text)
+
+    assert message_length(truncated) == MAX_MESSAGE_LENGTH
+    assert truncated == "😀" * (MAX_MESSAGE_LENGTH // 2)
+
+
+def test_truncate_message_accepts_a_custom_limit() -> None:
+    assert truncate_message("abcdef", limit=3) == "abc"
+
+
+def test_truncate_message_with_a_zero_limit_returns_empty() -> None:
+    assert truncate_message("anything", limit=0) == ""

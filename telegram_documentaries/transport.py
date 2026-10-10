@@ -34,6 +34,43 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_BASE_URL = "https://api.telegram.org"
 DEFAULT_TIMEOUT = 30.0
 
+# ------------------------------------------------------------- outbound length
+#
+# Telegram rejects ``sendMessage`` text longer than 4096 *UTF-16 code units*
+# (two units per astral character, one per BMP character — not Python
+# ``len()``). Every outbound-message chokepoint bounds text through these
+# helpers, so the whole "over-long outbound text" bug class is guarded at the
+# mechanism level rather than patched per call site.
+
+MAX_MESSAGE_LENGTH = 4096
+
+
+def message_length(text: str) -> int:
+    """Count Telegram message characters as UTF-16 code units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def truncate_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> str:
+    """Trim ``text`` to at most ``limit`` UTF-16 code units, whole pairs only.
+
+    Text already at or under the limit is returned unchanged. The cut never
+    splits a surrogate pair: slicing ``limit * 2`` UTF-16-le bytes always lands
+    on a code-unit boundary, and any lone surrogate left at the end is dropped,
+    so the result always re-encodes cleanly. A zero or negative limit yields
+    the empty string.
+    """
+    if limit <= 0:
+        return ""
+    encoded = text.encode("utf-16-le")
+    if len(encoded) <= limit * 2:
+        return text
+    cut = encoded[: limit * 2]
+    truncated = cut.decode("utf-16-le", errors="surrogatepass")
+    if truncated and 0xD800 <= ord(truncated[-1]) <= 0xDFFF:
+        truncated = truncated[:-1]
+    return truncated
+
+
 # Injectable seam for tests: same call signature as urllib.request.urlopen.
 UrlopenFn = Callable[..., Any]
 

@@ -36,7 +36,12 @@ from telegram_documentaries.gemini import (
 from telegram_documentaries.logging_config import SKIPPED, Skipped, log_lifecycle
 from telegram_documentaries.models import Update
 from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
-from telegram_documentaries.transport import Transport
+from telegram_documentaries.transport import (
+    MAX_MESSAGE_LENGTH,
+    Transport,
+    message_length,
+    truncate_message,
+)
 
 
 class InterviewError(Exception):
@@ -78,10 +83,12 @@ SYNTHESIZE_PROMPT = (
     "with a short justification. Reply only with the requested JSON."
 )
 
-# Telegram rejects ``sendMessage`` text longer than 4096 characters, so a model
-# question at or below this length is the only one that can actually be
-# delivered; anything longer is treated as an unusable model output.
-MAX_QUESTION_LENGTH = 4096
+# Shown in place of a transcript when the interview has not started yet: one
+# labelled ``user`` content still leads with the ask/dossier instruction alone,
+# but Gemini is told explicitly there is nothing to build on.
+EMPTY_TRANSCRIPT_NOTE = (
+    "No interview has taken place yet - the subject has answered nothing."
+)
 
 QUESTION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -100,14 +107,17 @@ DOSSIER_SCHEMA: dict[str, Any] = {
         "summary": {
             "type": "string",
             "description": "Behavioural summary synthesised from the interview.",
+            "maxLength": 2000,
         },
         "suggested_animal": {
             "type": "string",
             "description": "The animal the subject most resembles.",
+            "maxLength": 100,
         },
         "animal_reason": {
             "type": "string",
             "description": "Short justification for the suggested animal.",
+            "maxLength": 500,
         },
     },
     "required": ["summary", "suggested_animal"],
@@ -149,8 +159,8 @@ class GeminiInterviewer:
         """Ask for the next question, given the conversation so far.
 
         The returned text must be deliverable by Telegram: a non-empty string
-        (after stripping) of at most :data:`MAX_QUESTION_LENGTH` characters.
-        Anything else is an unusable model output and raises
+        (after stripping) of at most :data:`MAX_MESSAGE_LENGTH` UTF-16 code
+        units. Anything else is an unusable model output and raises
         :class:`InterviewError`, so the caller's existing degrade/retry path
         takes a fresh draw instead of looping on an unsendable question.
         """
@@ -161,7 +171,7 @@ class GeminiInterviewer:
         except GeminiError as exc:
             raise InterviewError(str(exc)) from None
         question = payload["question"]
-        if not question.strip() or len(question) > MAX_QUESTION_LENGTH:
+        if not question.strip() or message_length(question) > MAX_MESSAGE_LENGTH:
             raise InterviewError(
                 "model returned an unusable question"
             ) from None
@@ -179,17 +189,6 @@ class GeminiInterviewer:
 
     # ------------------------------------------------------------- request body
 
-    @staticmethod
-    def _transcript_parts(
-        transcript: list[QaPair],
-    ) -> list[dict[str, Any]]:
-        """Render the transcript as alternating user/model parts."""
-        parts: list[dict[str, Any]] = []
-        for pair in transcript:
-            parts.append({"role": "user", "parts": [{"text": pair.question}]})
-            parts.append({"role": "model", "parts": [{"text": pair.answer}]})
-        return parts
-
     def _request_body(
         self,
         system_prompt: str,
@@ -199,20 +198,30 @@ class GeminiInterviewer:
     ) -> dict[str, Any]:
         """Build a ``generateContent`` body Google will accept.
 
-        The persona lives in the top-level ``systemInstruction`` field, never
-        as a ``user`` turn: the ``contents`` list must strictly alternate
-        ``user``/``model`` and end with exactly one ``user`` turn (Gemini
-        rejects anything else with 400 INVALID_ARGUMENT). With an empty
-        transcript that leaves a single ``user`` content holding the
-        instruction.
+        The whole transcript rides as a *single* labelled ``user`` content —
+        ``Q1: <question>`` / ``A1: <answer>`` lines in order, or
+        :data:`EMPTY_TRANSCRIPT_NOTE` when the interview has not started —
+        followed by the instruction. The persona lives only in the top-level
+        ``systemInstruction`` field, never in a turn, so the model's context is
+        one ``user`` content per call and Gemini's consecutive-user-turn rule
+        can never be tripped.
         """
-        contents = [
-            *self._transcript_parts(transcript),
-            {"role": "user", "parts": [{"text": instruction}]},
-        ]
+        if transcript:
+            lines = [
+                line
+                for index, pair in enumerate(transcript, start=1)
+                for line in (
+                    f"Q{index}: {pair.question}",
+                    f"A{index}: {pair.answer}",
+                )
+            ]
+            transcript_block = "\n".join(lines)
+        else:
+            transcript_block = EMPTY_TRANSCRIPT_NOTE
+        prompt = f"{transcript_block}\n\n{instruction}"
         return {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": contents,
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "responseSchema": schema,
@@ -274,9 +283,18 @@ OBSERVATION_COMPLETE_REPLY = (
 def _send(
     transport: Transport, chat_id: int, text: str, log: logging.Logger
 ) -> bool:
-    """Send one message; degrade a failure to ``False`` with a loud log."""
+    """Send one message; degrade a failure to ``False`` with a loud log.
+
+    Every outbound message is defensively bounded to Telegram's limit at this
+    chokepoint (mechanism-level guard for the over-long outbound-text bug
+    class): whatever text the caller produces — a re-ask, a question or a
+    dossier report — is truncated before it can be rejected by ``sendMessage``.
+    """
     try:
-        transport.call("sendMessage", {"chat_id": chat_id, "text": text})
+        transport.call(
+            "sendMessage",
+            {"chat_id": chat_id, "text": truncate_message(text)},
+        )
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
@@ -420,7 +438,9 @@ def _synthesize_and_report(
     The dossier message is sent *before* anything is stored: only once the
     user has actually seen the report is the final answer committed and the
     phase advanced to ``done``. A failed report leaves an ``interviewing``
-    chat with a full (4-pair) log whose next message retries synthesis.
+    chat with a full (4-pair) log whose next message retries synthesis — and
+    the user is never left in silence, because the failure is followed by a
+    best-effort apology.
     """
     try:
         dossier = llm.summarize(transcript)
@@ -440,6 +460,9 @@ def _synthesize_and_report(
         return _send(transport, chat_id, APOLOGY_REPLY, log)
 
     if not _send(transport, chat_id, _dossier_report(dossier), log):
+        # The report never landed; apologise on a best-effort basis (a failure
+        # here must not mask the already-degraded outcome) and stay retryable.
+        _send(transport, chat_id, APOLOGY_REPLY, log)
         return False
 
     final_pair = transcript[-1]
