@@ -99,3 +99,26 @@ silently stringify.
 3. Text-only input while a photo is expected is handled gracefully (re-prompt),
    with no crash and no lost session.
 4. `scripts/test` and `scripts/hooks` are green.
+
+## Delivered (deviations recorded at verification 2026-10-10)
+
+The shipped implementation matches this spec; the following are recorded
+deviations from the *plan* (see `plan.md` and `validation.md` §Deviations):
+
+- **Album dedupe across updates.** Telegram delivers an album as one update
+  per photo sharing a `media_group_id`, so Decision 3 is implemented by
+  gating the **first** member and remembering the id on the session
+  (`SessionState.last_media_group_id` / `SessionStore.remember_media_group`);
+  follow-ups return `SKIPPED` and are logged `bouncer_album_skipped`. `/start`
+  clears the dedupe.
+- **`defaults.py`** — new dependency-free module owning
+  `DEFAULT_VISION_MODEL`, imported by both `config.py` and `vision.py` (the
+  plan had the constant live in `vision.py`).
+- **`SKIPPED` lifecycle sentinel** — `logging_config.py` gained a
+  `Skipped` sentinel so messageless updates and album follow-ups log as
+  `skipped` (INFO), not a false `degraded` (WARNING).
+- **`InvalidFilePath` subclasses `TelegramApiError`** so media path rejections
+  degrade through the Bouncer's single failure catch.
+- **ADK drift resolved** — Decision 1's drift is now reconciled in
+  `SPECS/TECH.md` (typed `VisionGate` port + Gemini REST via stdlib `urllib` in
+  Phase 2; Google ADK deferred).

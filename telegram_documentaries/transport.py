@@ -10,6 +10,12 @@ problem is normalised into ``TelegramApiError`` with the failing method,
 description and (when available) HTTP/Telegram error codes — including network
 failures, wire-protocol failures (``http.client.HTTPException`` subclasses such
 as ``IncompleteRead``) and Telegram's own ``ok: false`` payloads.
+
+Secret guarantee: no raised ``TelegramApiError`` — neither its message nor a
+chained cause/context — ever contains the bot token. The token lives in the
+request URL (``/bot<token>/...``), so every normalising branch redacts the
+description through :meth:`UrllibTransport._redact` and raises with ``from
+None`` to suppress the raw, token-bearing cause from a formatted traceback.
 """
 
 from __future__ import annotations
@@ -33,7 +39,11 @@ UrlopenFn = Callable[..., Any]
 
 
 class TelegramApiError(Exception):
-    """A failed call to the Telegram Bot API (network, HTTP or ``ok: false``)."""
+    """A failed call to the Telegram Bot API (network, HTTP or ``ok: false``).
+
+    Guarantee: the message and any chained cause never contain the bot token
+    (see :class:`UrllibTransport`).
+    """
 
     def __init__(
         self,
@@ -56,6 +66,8 @@ class Transport(Protocol):
     def call(
         self, method: str, params: Mapping[str, Any] | None = None
     ) -> dict[str, Any]: ...
+
+    def download(self, file_path: str) -> bytes: ...
 
 
 class UrllibTransport:
@@ -90,35 +102,92 @@ class UrllibTransport:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
+        raw = self._read(method, request)
+        return self._decode(method, raw)
+
+    def download(self, file_path: str) -> bytes:
+        """GET raw file bytes from ``<base>/file/bot<token>/<file_path>``.
+
+        ``file_path`` must already be validated as a safe relative path by the
+        caller (``media.fetch_photo``) — this method does not build it from
+        untrusted input itself.
+
+        Like :meth:`call`, a failure never leaks the bot token: the description
+        is redacted and the raw cause is suppressed.
+        """
+        url = f"{self._base_url}/file/bot{self._token}/{file_path}"
+        request = urllib_request.Request(url, method="GET")
+        return self._read("download", request)
+
+    def _read(self, method: str, request: urllib_request.Request) -> bytes:
+        """Run a request and normalise every failure into ``TelegramApiError``.
+
+        Every branch redacts the description and raises ``from None``: the raw
+        exception can embed the token-bearing URL (e.g. a real path-validation
+        ``http.client.InvalidURL``), and ``from None`` keeps it out of any
+        formatted traceback. The original exception type is kept in the message
+        for debugging.
+        """
         try:
             with self._urlopen(request, timeout=self._timeout) as response:
-                raw = response.read()
+                return response.read()
         except urllib_error.HTTPError as exc:
-            raise self._http_error(method, exc) from exc
+            raise self._http_error(method, exc) from None
         except urllib_error.URLError as exc:
             raise TelegramApiError(
-                method, f"network error: {exc.reason}"
-            ) from exc
+                method,
+                self._redact(
+                    f"network error: {type(exc).__name__}: {exc.reason}"
+                ),
+            ) from None
         except OSError as exc:
             # Timeouts and reset connections surface as plain OSError.
-            raise TelegramApiError(method, f"network error: {exc}") from exc
+            raise TelegramApiError(
+                method,
+                self._redact(f"network error: {type(exc).__name__}: {exc}"),
+            ) from None
         except http.client.HTTPException as exc:
             # Wire-level protocol failures (IncompleteRead from a dropped
             # long-poll body, BadStatusLine from a garbled response, ...) are
             # not OSError subclasses and must not escape unnormalised either.
             raise TelegramApiError(
-                method, f"protocol error: {type(exc).__name__}: {exc}"
-            ) from exc
+                method,
+                self._redact(
+                    f"protocol error: {type(exc).__name__}: {exc}"
+                ),
+            ) from None
+        except Exception as exc:
+            # Last-resort normalisation: e.g. a malformed URL raises a plain
+            # ValueError whose message embeds the token-bearing URL. Redact it
+            # and suppress the cause so the raw value cannot leak through the
+            # formatted traceback.
+            raise TelegramApiError(
+                method,
+                self._redact(f"unexpected error: {type(exc).__name__}: {exc}"),
+            ) from None
 
-        return self._decode(method, raw)
+    def _redact(self, text: str) -> str:
+        if not self._token:
+            return text
+        redacted = text.replace(self._token, "***")
+        # A control character *inside* the token makes urlopen's InvalidURL
+        # repr-escape the selector, so the raw secret no longer appears
+        # verbatim; strip its escaped form too.
+        escaped = self._token.encode("unicode_escape").decode("ascii")
+        if escaped != self._token:
+            redacted = redacted.replace(escaped, "***")
+        return redacted
 
     def _decode(self, method: str, raw: bytes) -> dict[str, Any]:
         try:
             payload = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             raise TelegramApiError(
-                method, f"response is not valid JSON: {raw[:200]!r}"
-            ) from exc
+                method,
+                self._redact(
+                    f"response is not valid JSON: {raw[:200]!r}"
+                ),
+            ) from None
         if not isinstance(payload, dict):
             raise TelegramApiError(
                 method,
@@ -128,12 +197,21 @@ class UrllibTransport:
             description = payload.get("description")
             raise TelegramApiError(
                 method,
-                str(description) if description else "request reported ok=false",
+                self._redact(
+                    str(description)
+                    if description
+                    else "request reported ok=false"
+                ),
                 error_code=_as_int(payload.get("error_code")),
             )
         return payload
 
     def _http_error(self, method: str, exc: urllib_error.HTTPError) -> TelegramApiError:
+        """Normalise an ``HTTPError``; the description never leaks the token.
+
+        Either the decoded Telegram ``description`` or the HTTP status line can
+        embed the token-bearing URL, so the final description is redacted.
+        """
         raw = b""
         if getattr(exc, "fp", None) is not None:
             try:
@@ -147,7 +225,9 @@ class UrllibTransport:
                     extra={
                         "event": "http_error_body_unreadable",
                         "method": method,
-                        "error": f"{type(read_exc).__name__}: {read_exc}",
+                        "error": self._redact(
+                            f"{type(read_exc).__name__}: {read_exc}"
+                        ),
                     },
                 )
         description = None
@@ -163,7 +243,7 @@ class UrllibTransport:
             description = f"HTTP {exc.code} {exc.reason}"
         return TelegramApiError(
             method,
-            str(description),
+            self._redact(str(description)),
             error_code=error_code,
             status_code=exc.code,
         )

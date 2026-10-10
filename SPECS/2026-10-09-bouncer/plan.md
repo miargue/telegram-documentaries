@@ -146,3 +146,27 @@ Docs (validated at verification):
 - Walk `validation.md`.
 
 Finish: `scripts/test` + `scripts/hooks` green; commit; push; open PR to `main`.
+
+## Verification notes (2026-10-10)
+
+All six groups shipped on `feature/2026-10-09-bouncer`; `scripts/test` =
+244 passed, `scripts/hooks` green, no test touches the network (full suite
+re-run with sockets blocked passes).
+
+Deviations from this plan, recorded at verification:
+
+- **Album handling (group 4, "gate called with the first photo").** Telegram
+  delivers an album as one update per member sharing a `media_group_id`. The
+  implementation gates the first member and records the id on the session
+  (`remember_media_group`); later members return `SKIPPED`
+  (`bouncer_album_skipped`). `SessionState` therefore also carries
+  `last_media_group_id`.
+- **`defaults.py`** — `DEFAULT_VISION_MODEL` (planned in `vision.py`) lives in
+  a new dependency-free module shared with `config.py`.
+- **`SKIPPED` sentinel (groups 4/6)** — `handle_update` returns
+  `bool | Skipped`; `logging_config.log_lifecycle` logs `skipped` at INFO.
+- **`InvalidFilePath`** subclasses `TelegramApiError` (group 2).
+- **No live smoke run** — validation.md §5 remains open (no credentials); all
+  behaviour is covered by fakes.
+- Group 6's doc work (README/TECH/ROADMAP) is done at verification as
+  specified; MISSION.md needed no change.

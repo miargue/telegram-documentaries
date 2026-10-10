@@ -8,7 +8,13 @@ agent and every review is judged against it.
 - **Language:** Python 3.
 - **Transport:** Telegram Bot API over **long polling** (`getUpdates`). No
   webhooks, no public URL.
-- **Framework:** Google **Agent Development Kit (ADK)**, hub-and-spoke layout.
+- **Framework:** **No vendor agent framework as of Phase 2.** Each pipeline
+  stage is a discrete module behind a narrow typed port. The Bouncer exposes a
+  typed `VisionGate` port whose Phase 2 adapter is a direct **Gemini REST**
+  caller (`generateContent` with a JSON `responseSchema`) over stdlib
+  `urllib` with an injectable `urlopen` seam — the same no-third-party-HTTP
+  pattern as the Phase 1 transport. **Google Agent Development Kit (ADK) is
+  deferred**; if a later phase adopts it, it will wrap these same ports.
 - **Models:**
   - The Bouncer — vision gate — **Gemini 3.1 Flash Lite**.
   - The Interviewer — sequential Q&A + orchestrator — **Gemini 3.1 Flash Lite**.
@@ -22,9 +28,12 @@ agent and every review is judged against it.
 
 ## Architecture
 
-- **ADK hub-and-spoke:** the Interviewer is the **orchestrator**. Each pipeline
-  stage is a discrete agent/module (Bouncer, Interviewer, Converter, Scripter)
-  plus the non-agent TTS renderer.
+- **Hub-and-spoke (module level):** the Interviewer is the **orchestrator**.
+  Each pipeline stage is a discrete module (Bouncer, Interviewer, Converter,
+  Scripter) plus the non-agent TTS renderer. Stage boundaries are **typed
+  ports**, not vendor SDKs: e.g. the Bouncer is `VisionGate.classify(image) ->
+  HumanVerdict`, so the Gemini REST adapter (Phase 2) can later be swapped for
+  an ADK agent without touching the routing code.
 - **Explicit state machine:** one well-defined phase per pipeline stage, with
   explicit transitions and a single shared state driver. Phase is stored in the
   session state, never inferred implicitly.

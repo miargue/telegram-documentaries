@@ -1,4 +1,4 @@
-"""``python -m telegram_documentaries`` → the Phase 1 gateway."""
+"""``python -m telegram_documentaries`` → the gateway entrypoint."""
 
 from __future__ import annotations
 

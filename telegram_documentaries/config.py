@@ -12,9 +12,13 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from telegram_documentaries.defaults import DEFAULT_VISION_MODEL
+
 DEFAULT_ENV_FILE = Path(".env")
 
 _TOKEN_KEY = "TELEGRAM_BOT_TOKEN"
+_API_KEY = "GEMINI_API_KEY"
+_VISION_MODEL_KEY = "GEMINI_VISION_MODEL"
 
 
 class ConfigError(Exception):
@@ -87,3 +91,48 @@ def get_token(
         f"{_TOKEN_KEY} is not set; put it in {env_file or '.env'} "
         "(see .env.example) or export it in the environment"
     )
+
+
+def get_api_key(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> str:
+    """Resolve ``GEMINI_API_KEY``.
+
+    Same precedence as the bot token: the process environment wins over the
+    ``.env`` file, and a missing/blank key is a hard ``ConfigError`` — the
+    vision gate must never run without a key.
+    """
+    env = os.environ if environ is None else environ
+    key = env.get(_API_KEY, "").strip()
+    if key:
+        return key
+
+    key = load_env_file(env_file).get(_API_KEY, "").strip()
+    if key:
+        return key
+
+    raise ConfigError(
+        f"{_API_KEY} is not set; put it in {env_file or '.env'} "
+        "(see .env.example) or export it in the environment"
+    )
+
+
+def get_vision_model(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> str:
+    """Resolve the Gemini vision model, defaulting to Flash Lite.
+
+    An optional ``GEMINI_VISION_MODEL`` override follows the same env-beats-file
+    precedence; a blank override falls back to the default.
+    """
+    env = os.environ if environ is None else environ
+    model = env.get(_VISION_MODEL_KEY, "").strip()
+    if model:
+        return model
+
+    model = load_env_file(env_file).get(_VISION_MODEL_KEY, "").strip()
+    return model or DEFAULT_VISION_MODEL

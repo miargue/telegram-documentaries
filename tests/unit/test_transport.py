@@ -41,9 +41,11 @@ class RecordingUrlopen:
     def __init__(self, responses: list[Any]) -> None:
         self.responses = list(responses)
         self.requests: list[tuple[str, bytes | None, float]] = []
+        self.methods: list[str] = []
 
     def __call__(self, request: Any, timeout: float) -> FakeResponse:
         self.requests.append((request.full_url, request.data, timeout))
+        self.methods.append(request.get_method())
         result = self.responses.pop(0)
         if isinstance(result, BaseException):
             raise result
@@ -124,7 +126,12 @@ def test_call_raises_telegram_api_error_on_network_failure() -> None:
     with pytest.raises(TelegramApiError) as exc_info:
         transport.call("getUpdates", {"offset": 0})
 
-    assert isinstance(exc_info.value.__cause__, urllib.error.URLError)
+    error = exc_info.value
+    # The raw cause is suppressed (``from None``) so it can never surface in a
+    # formatted traceback; the original type is kept in the message instead.
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert "URLError" in str(error)
 
 
 def test_call_normalises_incomplete_read_from_a_dropped_connection() -> None:
@@ -139,7 +146,9 @@ def test_call_normalises_incomplete_read_from_a_dropped_connection() -> None:
 
     error = exc_info.value
     assert error.method == "getUpdates"
-    assert isinstance(error.__cause__, http.client.IncompleteRead)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert "IncompleteRead" in str(error)
 
 
 def test_call_normalises_bad_status_line_from_a_garbled_response() -> None:
@@ -150,7 +159,9 @@ def test_call_normalises_bad_status_line_from_a_garbled_response() -> None:
 
     error = exc_info.value
     assert error.method == "getUpdates"
-    assert isinstance(error.__cause__, http.client.BadStatusLine)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert "BadStatusLine" in str(error)
 
 
 def test_call_normalises_any_http_client_exception() -> None:
@@ -167,7 +178,9 @@ def test_call_normalises_any_http_client_exception() -> None:
 
     error = exc_info.value
     assert error.method == "sendMessage"
-    assert isinstance(error.__cause__, ProtocolFailure)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert "ProtocolFailure" in str(error)
 
 
 def test_call_normalises_protocol_error_while_reading_the_error_body() -> None:
@@ -229,3 +242,69 @@ def test_http_socket_timeout_outlasts_the_long_poll_hold() -> None:
     from telegram_documentaries.transport import DEFAULT_TIMEOUT
 
     assert DEFAULT_TIMEOUT >= LONG_POLL_TIMEOUT
+
+
+def test_download_gets_the_file_url_and_returns_raw_bytes() -> None:
+    transport, opener = make_transport([FakeResponse(b"\xff\xd8image-bytes")])
+
+    data = transport.download("photos/file_0.jpg")
+
+    url, body, timeout = opener.requests[0]
+    assert url == (
+        "https://api.telegram.org/file/botTEST-TOKEN/photos/file_0.jpg"
+    )
+    assert opener.methods[0] == "GET"
+    assert body is None
+    assert data == b"\xff\xd8image-bytes"
+    assert timeout == pytest.approx(30.0)
+
+
+def test_download_normalises_an_http_error() -> None:
+    http_error = urllib.error.HTTPError(
+        "https://api.telegram.org/file/botTEST-TOKEN/photos/missing.jpg",
+        404,
+        "Not Found",
+        cast(Any, None),
+        io.BytesIO(b'{"ok": false, "description": "file not found"}'),
+    )
+    transport, _ = make_transport([http_error])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.download("photos/missing.jpg")
+
+    error = exc_info.value
+    assert error.method == "download"
+    assert error.status_code == 404
+    assert error.description == "file not found"
+
+
+def test_download_normalises_a_network_failure() -> None:
+    transport, _ = make_transport([urllib.error.URLError("connection refused")])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.download("photos/file_0.jpg")
+
+    error = exc_info.value
+    assert error.method == "download"
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert "URLError" in str(error)
+
+
+def test_download_normalises_an_os_error() -> None:
+    transport, _ = make_transport([TimeoutError("timed out")])
+
+    with pytest.raises(TelegramApiError):
+        transport.download("photos/file_0.jpg")
+
+
+def test_download_normalises_a_protocol_failure() -> None:
+    transport, _ = make_transport([http.client.IncompleteRead(b"half")])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.download("photos/file_0.jpg")
+
+    error = exc_info.value
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert "IncompleteRead" in str(error)
