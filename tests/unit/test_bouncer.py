@@ -28,13 +28,18 @@ from telegram_documentaries.bouncer import (
     PROMPT_PHOTO,
     REJECTION_REPLY,
     SUCCESS_REPLY,
+    _send,
     handle_update,
 )
 from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
 from telegram_documentaries.logging_config import SKIPPED
 from telegram_documentaries.models import Update
 from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
-from telegram_documentaries.transport import TelegramApiError
+from telegram_documentaries.transport import (
+    MAX_MESSAGE_LENGTH,
+    TelegramApiError,
+    message_length,
+)
 from telegram_documentaries.vision import HumanVerdict, VisionError
 
 
@@ -906,6 +911,28 @@ def test_process_control_exceptions_are_not_swallowed() -> None:
             gate=FakeGate(),
             llm=FakeLLM(),
         )
+
+
+def test_oversized_text_is_truncated_at_the_bouncer_boundary() -> None:
+    # Mechanism guard for the over-long outbound-text bug class: Telegram
+    # rejects sendMessage over 4096 UTF-16 code units, so the bouncer's send
+    # chokepoint must bound every reply — even one that is (defensively) over
+    # the limit. All current replies are short constants, so the chokepoint is
+    # probed directly to prove the guard fires.
+    transport = FakeTransport()
+
+    with _capture("bouncer.truncate") as (logger, _records):
+        sent = _send(
+            transport,
+            5,
+            "x" * (MAX_MESSAGE_LENGTH + 1),
+            update=_update(text_update(900, chat_id=5)),
+            log=logger,
+        )
+
+    assert sent is True
+    (call,) = transport.calls_for("sendMessage")
+    assert message_length(call["text"]) <= MAX_MESSAGE_LENGTH
 
 
 def test_sessions_never_leak_between_chats() -> None:
