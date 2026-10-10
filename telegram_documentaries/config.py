@@ -12,13 +12,17 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from telegram_documentaries.defaults import DEFAULT_VISION_MODEL
+from telegram_documentaries.defaults import (
+    DEFAULT_INTERVIEW_MODEL,
+    DEFAULT_VISION_MODEL,
+)
 
 DEFAULT_ENV_FILE = Path(".env")
 
 _TOKEN_KEY = "TELEGRAM_BOT_TOKEN"
 _API_KEY = "GEMINI_API_KEY"
 _VISION_MODEL_KEY = "GEMINI_VISION_MODEL"
+_INTERVIEW_MODEL_KEY = "GEMINI_INTERVIEW_MODEL"
 
 
 class ConfigError(Exception):
@@ -136,3 +140,24 @@ def get_vision_model(
 
     model = load_env_file(env_file).get(_VISION_MODEL_KEY, "").strip()
     return model or DEFAULT_VISION_MODEL
+
+
+def get_interview_model(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> str:
+    """Resolve the Gemini interview model, defaulting to Flash Lite.
+
+    An optional ``GEMINI_INTERVIEW_MODEL`` override follows the same
+    env-beats-file precedence as the vision model; a blank override falls back
+    to the default. Kept dependency-free (constants come from ``defaults``) so
+    importing config never drags the interviewer adapter in.
+    """
+    env = os.environ if environ is None else environ
+    model = env.get(_INTERVIEW_MODEL_KEY, "").strip()
+    if model:
+        return model
+
+    model = load_env_file(env_file).get(_INTERVIEW_MODEL_KEY, "").strip()
+    return model or DEFAULT_INTERVIEW_MODEL

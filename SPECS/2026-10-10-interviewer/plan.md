@@ -182,5 +182,55 @@ Finish: `scripts/test` + `scripts/hooks` green; commit; push; open PR to
 
 ## Verification notes (filled at verification)
 
-> To be completed at verification: what shipped, deviations from this plan
-> with user approval (mirrors Phase 2's §Verification notes).
+Verified 2026-10-10. All six groups shipped; `scripts/test` = **367 passed**
+and `scripts/hooks` green. The plan was followed with the deviations below
+(full evidence in `validation.md`; accepted deviations #1–#8 recorded there).
+
+### Group-by-group
+
+- **Group 1 (session):** as planned, plus `ask_question` and the
+  `pending_question` field, and an optional `question` argument on
+  `start_interview` — all in service of the delayed commit (deviation #2).
+- **Group 2 (shared client + vision refactor):** `gemini.py` created as
+  planned; the existing suites stayed green. Confirmed behaviour-neutral:
+  `test_vision.py` and `test_token_redaction.py` are byte-identical to `main`
+  (0-line diff) and pass. The client gained an injectable `logger` beyond the
+  planned signature (deviation #3). This group's "244 unchanged" is true for
+  the refactor; later groups deliberately rewrote a few Phase 2 handoff
+  assertions (deviation #4).
+- **Group 3 (port + adapter):** as planned. Prompts carry the researcher
+  persona as `systemInstruction` (never a user turn) and the transcript as
+  strict user/model alternation ending in one user turn. Added the
+  `MAX_QUESTION_LENGTH` guard (deviation #6).
+- **Group 4 (routing):** as planned, except the answer "rollback" is a
+  **delayed commit** (deviation #1), not a store undo. `pending_question`
+  makes re-asks exact and LLM-free. Non-answers, ask/synthesize failures,
+  post-`done` replies and the no-escape guarantee all verified.
+- **Group 5 (handoff + wiring):** as planned: `bouncer.handle_update` gained
+  `llm` and delegates `gate_passed`/`interviewing`/`done`; `polling`/`cli`
+  thread the interviewer. `get_interview_model()` and the defaults shipped.
+- **Group 6 (component + docs):** `test_interviewer_flow.py` (4 tests) drives
+  the real `poll_once`; docs reconciled at verification (this section, plus
+  ROADMAP/MISSION/TECH/README).
+
+### Deviations from this plan
+
+1. Delayed commit replaces "roll back" (group 4) — same observable contract.
+2. Store surface larger than the three methods in group 1 (`ask_question`,
+   `pending_question`, optional `start_interview(question=…)`).
+3. `GeminiJsonClient` gained an injectable `logger`; `vision.py` re-exports
+   the moved names for compatibility.
+4. "All 244 pre-existing tests unchanged" was not literally maintained across
+   *all* groups: the handoff intentionally changed pass-path assertions
+   (success + Q1, `interviewing`), and handlers gained an `llm` parameter.
+5. ROADMAP/MISSION "5–7 questions" reconciled to the delivered exactly 5
+   (user decision).
+6. Added `MAX_QUESTION_LENGTH` (4096) guard, not listed in the plan.
+7. `cli.py` description / `__init__.py` docstring Phase-2 wording corrected at
+   verification (documentation fix; no test depended on the strings).
+
+### Not done by the verifier
+
+Commit/push/PR and the user merge (merge gate) are the build agent's/user's
+steps, not the verifier's. The optional live manual smoke was not run (no
+credentials/consent).

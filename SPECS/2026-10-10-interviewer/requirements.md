@@ -148,5 +148,52 @@ from message guessing.
 
 ## Delivered (filled at verification)
 
-> To be completed at verification: deviations from *this* spec and from
-> `plan.md`, recorded with user approval (mirrors Phase 2's §Delivered).
+Verified 2026-10-10 on branch `feature/2026-10-10-interviewer`:
+`scripts/test` = **367 passed**; `scripts/hooks` green (compileall + smoke
+import + ruff + mypy "no issues found in 33 source files"); the full suite also
+passes with all socket entry points patched to raise (no network I/O). The
+`vision.py` refactor is behaviour-neutral: `test_vision.py` and
+`test_token_redaction.py` are byte-identical to `main` (which collects 244
+tests). Full checklist and per-item evidence in `validation.md`.
+
+### What shipped
+
+- `session.py`: `Phase` gains `interviewing`/`done`; `SESSION_VERSION = 2`;
+  `SessionState` adds `interview: list[QaPair]`, `pending_question: str | None`
+  and `dossier: Dossier | None`; `SessionStore` adds `start_interview`
+  (optional question), `ask_question`, `record_interview_answer` and
+  `appoint_dossier`; `QaPair`/`Dossier` Pydantic models.
+- `gemini.py` (new): the shared `GeminiJsonClient` (single REST plumbing +
+  single API-key redaction), used by both adapters.
+- `vision.py`: refactored onto `GeminiJsonClient`; public API unchanged.
+- `interviewer.py` (new): typed `InterviewLLM` port + `GeminiInterviewer`
+  adapter (`next_question`, `summarize`), and the routing
+  (`start_interview`, `handle_update`) that owns the phase machine, the
+  exactly-5 cap and the single-question-per-message rule.
+- `bouncer.py`: automatic handoff — the pass path sends the success line then
+  Q1; `gate_passed`/`interviewing`/`done` updates are delegated to the
+  Interviewer; `/start`/`/restart` still reset everything.
+- `config.py`/`defaults.py`: `DEFAULT_INTERVIEW_MODEL = gemini-3.1-flash-lite`,
+  `DEFAULT_QUESTION_COUNT = 5`, `MAX_ANSWER_LENGTH = 400`,
+  `get_interview_model()` reading optional `GEMINI_INTERVIEW_MODEL`
+  (env-beats-file).
+- `polling.py`/`cli.py`: one `GeminiInterviewer` built from the API key and
+  interview model, threaded through the poll loop.
+- Structured events: `interview_started`, `question_asked`,
+  `answer_recorded`, `answer_truncated`, `dossier_created`,
+  `interview_failed`, `interview_skipped`.
+
+### Deviations from this spec
+
+1. **Delayed commit instead of "roll back"** (see `validation.md` #1): the
+   Q/A pair is committed only after the next question/report is sent.
+   `pending_question` stores the exact shown question so re-asks make no LLM
+   call. The session store therefore also adds `ask_question` and the
+   `pending_question` field beyond the three methods named in §Scope.
+2. **`MAX_QUESTION_LENGTH = 4096` guard** added in the adapter (not specified):
+   an empty/whitespace or unsendable over-long question is unusable output and
+   raises `InterviewError`, so the retry path takes a fresh draw.
+3. **Exactly 5, not "5–7".** Already locked in this spec (decision 3); the
+   ROADMAP/MISSION wording was reconciled to match.
+4. No other scope drift: Phase 4+ consumers, retry/backoff policy, durable
+   storage and a configurable question count all remain out of scope.

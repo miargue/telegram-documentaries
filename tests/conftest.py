@@ -12,6 +12,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from telegram_documentaries.session import Dossier, QaPair
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict
 
@@ -263,3 +264,44 @@ class FakeGate:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+class FakeLLM:
+    """Scripted ``InterviewLLM`` double.
+
+    ``next_question`` is deterministic by transcript length — ``questions`` is
+    indexed by ``len(transcript)`` — so the router's one next-question call per
+    answer is easy to predict. The session stores the pending question, so the
+    fake is only ever consulted to produce the *next* question (and the
+    dossier), never to re-derive the current one. ``next_errors`` /
+    ``summarize_errors`` are FIFO queues of exceptions raised in place of the
+    scripted result; ``dossiers`` is a queue that ``summarize`` pops from.
+    Every call's transcript argument is recorded for assertions.
+    """
+
+    def __init__(
+        self,
+        *,
+        questions: list[str] | None = None,
+        dossiers: list[Dossier] | None = None,
+    ) -> None:
+        self.questions: list[str] = questions or [
+            f"Q{number}" for number in range(1, 6)
+        ]
+        self.next_errors: list[BaseException] = []
+        self.summarize_errors: list[BaseException] = []
+        self.dossiers: list[Dossier] = list(dossiers or [])
+        self.next_calls: list[list[QaPair]] = []
+        self.summarize_calls: list[list[QaPair]] = []
+
+    def next_question(self, transcript: list[QaPair]) -> str:
+        self.next_calls.append(list(transcript))
+        if self.next_errors:
+            raise self.next_errors.pop(0)
+        return self.questions[len(transcript)]
+
+    def summarize(self, transcript: list[QaPair]) -> Dossier:
+        self.summarize_calls.append(list(transcript))
+        if self.summarize_errors:
+            raise self.summarize_errors.pop(0)
+        return self.dossiers.pop(0)

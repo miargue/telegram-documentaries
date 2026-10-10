@@ -13,8 +13,8 @@ voice note describing their "natural habitat."
 1. User sends `/start` (or just a photo) and uploads one portrait.
 2. **The Bouncer** checks the image: is a human present? Yes → move on.
    No → a cheeky rejection message and the conversation resets.
-3. **The Interviewer** asks 5–7 questions about the user, one at a time,
-   building a behavioural dossier and suggesting an animal.
+3. **The Interviewer** asks exactly 5 questions about the user, one at a
+   time, building a behavioural dossier and suggesting an animal.
 4. **The Converter** fuses the original photo with the interview dossier into
    a hybrid animal portrait, sent directly to the chat.
 5. **The Scripter** writes a 60–90 word dramatic documentary narration.

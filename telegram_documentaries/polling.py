@@ -18,6 +18,7 @@ import logging
 from pydantic import ValidationError
 
 from telegram_documentaries.bouncer import handle_update
+from telegram_documentaries.interviewer import InterviewLLM
 from telegram_documentaries.logging_config import log_lifecycle
 from telegram_documentaries.models import Update
 from telegram_documentaries.session import SessionStore
@@ -36,6 +37,7 @@ def poll_once(
     *,
     session: SessionStore,
     gate: VisionGate,
+    llm: InterviewLLM,
     logger: logging.Logger | None = None,
 ) -> int:
     """Fetch one batch, handle every message in it, return the next offset."""
@@ -96,7 +98,14 @@ def poll_once(
             continue
 
         next_offset = max(next_offset, update.update_id + 1)
-        handle_update(update, transport, session=session, gate=gate, logger=log)
+        handle_update(
+            update,
+            transport,
+            session=session,
+            gate=gate,
+            llm=llm,
+            logger=log,
+        )
 
     return next_offset
 
@@ -107,6 +116,7 @@ def run_polling(
     *,
     session: SessionStore,
     gate: VisionGate,
+    llm: InterviewLLM,
     offset: int = -1,
     max_polls: int | None = None,
     logger: logging.Logger | None = None,
@@ -128,6 +138,7 @@ def run_polling(
             offset,
             session=session,
             gate=gate,
+            llm=llm,
             logger=log,
         )
         polls += 1
