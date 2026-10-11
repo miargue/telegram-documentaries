@@ -64,6 +64,27 @@ client, **not** Google ADK (still deferred — see `SPECS/TECH.md`).
 **Acceptance:** a new hybrid portrait image arrives in chat, derived from the
 user's photo and dossier. *Serves: keeps the single-photo in-memory contract.*
 
+**Status: complete (verified 2026-10-11, branch `feature/2026-10-10-converter`).**
+Delivered: typed `ConverterLLM` port + `GeminiConverter` Gemini REST image
+adapter over the shared `GeminiJsonClient` (new `generate_image`: one
+multimodal `generateContent` call — photo bytes + dossier text in a single
+`user` turn, persona in `systemInstruction`, `responseModalities: ["IMAGE"]`,
+no intermediate text step); multipart `sendPhoto` in the transport (pure
+`_multipart` helper, stable filename, shared redaction); `SESSION_VERSION` 3
+with the stored `portrait_sent` flag; the Bouncer routes `done && !portrait_sent`
+to the Converter and runs the same-update handoff after the interview
+completes; optional `GEMINI_CONVERTER_MODEL` / `GEMINI_CONVERTER_TIMEOUT` (120 s
+default). `scripts/test` (483 passed) and `scripts/hooks` green; no test
+touches the network (full suite re-run with every socket entry point patched to
+raise, patch sanity-checked). Live Gemini smoke: **not reached** — the
+configured `GEMINI_API_KEY` is blocked provider-side ("API key was reported as
+leaked", HTTP 403, reproduced with a bare list-models call), so no real image
+bytes were observed; not an adapter failure (per the approved classification
+only HTTP-400/malformed output is a code failure). Full evidence in
+`SPECS/2026-10-10-converter/validation.md`. Framework note: the shipped
+integration is a typed port over stdlib `urllib`, **not** Google ADK (still
+deferred — see `SPECS/TECH.md`).
+
 ## 5. The Scripter
 
 - Gemini 3.1 Flash Lite: one-paragraph (~60–90 words) dramatic

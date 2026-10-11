@@ -14,12 +14,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeGate, FakeLLM, FakeTransport, photo_update, text_update
+from conftest import (
+    FakeConverter,
+    FakeGate,
+    FakeLLM,
+    FakeTransport,
+    photo_update,
+    text_update,
+)
 
 from telegram_documentaries.bouncer import PROMPT_PHOTO, SUCCESS_REPLY
 from telegram_documentaries.cli import main, positive_int
+from telegram_documentaries.converter import ConverterLLM
 from telegram_documentaries.interviewer import InterviewLLM
 from telegram_documentaries.logging_config import JsonFormatter
+from telegram_documentaries.session import Dossier
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict, VisionGate
 
@@ -436,3 +445,92 @@ def test_main_logs_get_updates_failure_and_exits_non_zero(
 
     assert exit_code == 1
     assert any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_main_builds_the_converter_from_the_api_key_model_and_timeout(
+    tmp_path: Path,
+) -> None:
+    built: list[tuple[str, str, float]] = []
+
+    def converter_factory(
+        api_key: str, model: str, timeout: float
+    ) -> ConverterLLM:
+        built.append((api_key, model, timeout))
+        return FakeConverter()
+
+    exit_code = main(
+        ["--max-polls", "1"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        converter_factory=converter_factory,
+    )
+
+    assert exit_code == 0
+    assert built == [(API_KEY, "gemini-3.1-flash-image", 120.0)]
+
+
+def test_main_uses_the_converter_model_and_timeout_overrides(
+    tmp_path: Path,
+) -> None:
+    built: list[tuple[str, str, float]] = []
+
+    def converter_factory(
+        api_key: str, model: str, timeout: float
+    ) -> ConverterLLM:
+        built.append((api_key, model, timeout))
+        return FakeConverter()
+
+    main(
+        ["--max-polls", "1"],
+        environ={
+            "TELEGRAM_BOT_TOKEN": "token",
+            "GEMINI_API_KEY": API_KEY,
+            "GEMINI_CONVERTER_MODEL": "gemini-image-custom",
+            "GEMINI_CONVERTER_TIMEOUT": "30",
+        },
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        converter_factory=converter_factory,
+    )
+
+    assert built == [(API_KEY, "gemini-image-custom", 30.0)]
+
+
+def test_main_delivers_the_portrait_end_to_end(tmp_path: Path) -> None:
+    # One chat walks the whole pipeline in the poll loop: photo → gate → five
+    # answers → dossier → hybrid portrait. The injected converter is the one
+    # the CLI built, and its image is uploaded exactly once.
+    converter = FakeConverter()
+    transport = FakeTransport(
+        batches=[
+            [photo_update(1, chat_id=5)],
+            [text_update(2, chat_id=5, text="a1")],
+            [text_update(3, chat_id=5, text="a2")],
+            [text_update(4, chat_id=5, text="a3")],
+            [text_update(5, chat_id=5, text="a4")],
+            [text_update(6, chat_id=5, text="a5")],
+        ],
+        files={"abc123": ("photos/a.jpg", b"portrait-bytes")},
+    )
+
+    exit_code = main(
+        ["--max-polls", "6"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: transport,
+        gate_factory=lambda api_key, model: FakeGate(
+            [HumanVerdict(is_human=True)]
+        ),
+        interview_factory=lambda api_key, model: FakeLLM(
+            dossiers=[Dossier(summary="S", suggested_animal="Capybara")]
+        ),
+        converter_factory=lambda api_key, model, timeout: converter,
+    )
+
+    assert exit_code == 0
+    assert len(transport.photos) == 1
+    assert transport.photos[0]["image"] == converter.default.data
+    assert len(converter.calls) == 1

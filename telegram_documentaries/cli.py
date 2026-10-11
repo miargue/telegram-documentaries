@@ -2,8 +2,8 @@
 
 Kept thin on purpose: argument parsing, structured logging setup, secret
 resolution, and normalising top-level failures into exit codes. The process
-owns exactly one ``SessionStore``, one ``VisionGate`` and one
-``InterviewLLM``, built here and threaded into the poll loop.
+owns exactly one ``SessionStore``, one ``VisionGate``, one ``InterviewLLM`` and
+one ``ConverterLLM``, built here and threaded into the poll loop.
 
 Exit codes: ``0`` clean stop, ``1`` runtime/API failure (including a failed
 startup ``getMe`` probe), ``2`` configuration problem or invalid command-line
@@ -23,10 +23,13 @@ from telegram_documentaries.config import (
     DEFAULT_ENV_FILE,
     ConfigError,
     get_api_key,
+    get_converter_model,
+    get_converter_timeout,
     get_interview_model,
     get_token,
     get_vision_model,
 )
+from telegram_documentaries.converter import ConverterLLM, GeminiConverter
 from telegram_documentaries.interviewer import GeminiInterviewer, InterviewLLM
 from telegram_documentaries.logging_config import configure_logging
 from telegram_documentaries.polling import run_polling
@@ -45,6 +48,8 @@ TransportFactory = Callable[[str], Transport]
 GateFactory = Callable[[str, str], VisionGate]
 # Builds the interview adapter from the resolved API key and model id.
 InterviewFactory = Callable[[str, str], InterviewLLM]
+# Builds the image Converter from the API key, model id and timeout (seconds).
+ConverterFactory = Callable[[str, str, float], ConverterLLM]
 
 
 def _build_gate(api_key: str, model: str) -> VisionGate:
@@ -55,6 +60,11 @@ def _build_gate(api_key: str, model: str) -> VisionGate:
 def _build_interviewer(api_key: str, model: str) -> InterviewLLM:
     """Default interview factory: a Gemini REST adapter (no ADK)."""
     return GeminiInterviewer(api_key, model=model)
+
+
+def _build_converter(api_key: str, model: str, timeout: float) -> ConverterLLM:
+    """Default converter factory: a Gemini REST image adapter."""
+    return GeminiConverter(api_key, model=model, timeout=timeout)
 
 
 def _probe_bot_username(transport: Transport) -> str | None:
@@ -142,6 +152,7 @@ def main(
     transport_factory: TransportFactory = UrllibTransport,
     gate_factory: GateFactory = _build_gate,
     interview_factory: InterviewFactory = _build_interviewer,
+    converter_factory: ConverterFactory = _build_converter,
 ) -> int:
     """Run the gateway; return a process exit code instead of raising."""
     # Configure a sane level first so even an argparse usage error is emitted
@@ -181,6 +192,11 @@ def main(
     llm = interview_factory(
         api_key, get_interview_model(environ=environ, env_file=env_file)
     )
+    converter = converter_factory(
+        api_key,
+        get_converter_model(environ=environ, env_file=env_file),
+        get_converter_timeout(environ=environ, env_file=env_file),
+    )
 
     LOGGER.info(
         "gateway starting",
@@ -197,6 +213,7 @@ def main(
             session=session,
             gate=gate,
             llm=llm,
+            converter=converter,
             max_polls=args.max_polls,
         )
     except KeyboardInterrupt:

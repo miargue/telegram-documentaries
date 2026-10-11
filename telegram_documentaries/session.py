@@ -3,8 +3,11 @@
 Phase 2 needs the Bouncer phases — waiting for a portrait and having passed
 the gate — and Phase 3 adds the Interviewer's ``interviewing``/``done``
 phases, the question-then-answer log (``list[QaPair]``) and the behavioural
-``Dossier``. The schema is versioned and explicit so later phases extend it
-instead of inferring state (see ``SPECS/TECH.md`` §Session state).
+``Dossier``. Phase 4 adds the ``portrait_sent`` flag: a ``done`` chat that has
+not yet received its hybrid portrait stays retryable, and the flag (never
+inferred) marks the true terminal state. The schema is versioned and explicit
+so later phases extend it instead of inferring state (see ``SPECS/TECH.md``
+§Session state).
 
 This module is the **single owner** of conversation read/write/reset. State is
 in-memory only (per ``SPECS/MISSION.md`` — no long-term storage); every chat's
@@ -19,7 +22,10 @@ from enum import Enum
 from pydantic import BaseModel
 
 # Bump when the persisted shape changes in a way later phases must migrate.
-SESSION_VERSION = 2
+# v2 (Phase 3): interview log + pending question + dossier.
+# v3 (Phase 4): the ``portrait_sent`` flag the Converter sets once the hybrid
+# portrait has actually reached the chat.
+SESSION_VERSION = 3
 
 
 class Phase(str, Enum):
@@ -59,16 +65,21 @@ class SessionState(BaseModel):
     # saw without asking the model again.
     pending_question: str | None = None
     dossier: Dossier | None = None
+    # Phase 4: True once the generated hybrid portrait has actually been sent
+    # to this chat. Stored (never inferred) so a failed conversion simply
+    # leaves it False and the next update retries.
+    portrait_sent: bool = False
 
 
 class SessionStore:
     """In-memory, per-``chat_id`` session state.
 
     ``get`` never fails: an unknown chat starts from a clean default. ``reset``
-    always produces a fresh default (purging any retained photo, interview log
-    and dossier); ``record_pass`` retains the accepted portrait for later
-    pipeline stages; the interview methods are the only writers of the
-    question/answer log, the pending question and the final ``Dossier``.
+    always produces a fresh default (purging any retained photo, interview log,
+    dossier and portrait flag); ``record_pass`` retains the accepted portrait
+    for later pipeline stages; the interview methods are the only writers of
+    the question/answer log, the pending question and the final ``Dossier``;
+    ``mark_portrait_sent`` is the only writer of the Phase 4 portrait flag.
     """
 
     def __init__(self) -> None:
@@ -83,7 +94,12 @@ class SessionStore:
         return state
 
     def reset(self, chat_id: int) -> SessionState:
-        """Replace this chat's state with a fresh default and purge its data."""
+        """Replace this chat's state with a fresh default and purge its data.
+
+        A fresh default clears everything the previous subject left behind —
+        photo, interview log, dossier, media-group dedupe and the
+        ``portrait_sent`` flag.
+        """
         state = SessionState()
         self._sessions[chat_id] = state
         return state
@@ -151,4 +167,16 @@ class SessionStore:
         state.dossier = dossier
         state.pending_question = None
         state.phase = Phase.done
+        return state
+
+    def mark_portrait_sent(self, chat_id: int) -> SessionState:
+        """Record that the hybrid portrait reached this chat.
+
+        Called only *after* a successful ``sendPhoto`` (the flag is evidence,
+        not intent), which makes ``done && portrait_sent`` the true terminal
+        state while a ``done`` chat without it stays retryable. Only the flag
+        moves: the photo, interview log and dossier survive for later phases.
+        """
+        state = self.get(chat_id)
+        state.portrait_sent = True
         return state

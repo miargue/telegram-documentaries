@@ -13,6 +13,18 @@ DEFAULT_VISION_MODEL = "gemini-3.1-flash-lite"
 # Gemini model used by the Phase 3 Interviewer when no override is configured.
 DEFAULT_INTERVIEW_MODEL = "gemini-3.1-flash-lite"
 
+# Gemini image model used by the Phase 4 Converter when no override is set.
+DEFAULT_CONVERTER_MODEL = "gemini-3.1-flash-image"
+
+# The Converter's image call is slow: Flash Image routinely exceeds the 30 s
+# shared default, so the adapter gets its own longer timeout.
+DEFAULT_CONVERTER_TIMEOUT = 120.0
+
+# Largest generated portrait the bot will upload (Telegram's practical photo
+# cap). Checked before any ``sendPhoto`` so an oversized model output degrades
+# to a retry instead of a rejected upload.
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+
 # Number of interview questions asked before the dossier is synthesised.
 DEFAULT_QUESTION_COUNT = 5
 

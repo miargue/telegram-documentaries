@@ -2,14 +2,21 @@
 
 Honest label: no real I/O. The real polling loop, update parsing, Bouncer
 routing/handoff, Interviewer turn-taking and session driver all run; only
-Telegram (``FakeTransport``), Gemini (``FakeGate``) and the interview model
-(``FakeLLM``) are doubles, so the whole pass → 5-answer → dossier conversation
-is exercised without a network.
+Telegram (``FakeTransport``), Gemini (``FakeGate``), the interview model
+(``FakeLLM``) and the image model (``FakeConverter``) are doubles, so the whole
+pass → 5-answer → dossier conversation is exercised without a network.
 """
 
 from __future__ import annotations
 
-from conftest import FakeGate, FakeLLM, FakeTransport, photo_update, text_update
+from conftest import (
+    FakeConverter,
+    FakeGate,
+    FakeLLM,
+    FakeTransport,
+    photo_update,
+    text_update,
+)
 
 from telegram_documentaries.bouncer import PROMPT_PHOTO, SUCCESS_REPLY
 from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
@@ -40,7 +47,12 @@ def _poll(
     offset: int,
 ) -> int:
     return poll_once(
-        transport, offset=offset, session=store, gate=gate, llm=llm
+        transport,
+        offset=offset,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=FakeConverter(),
     )
 
 
@@ -76,12 +88,15 @@ def test_full_interview_delivers_and_stores_the_dossier() -> None:
 
     replies = _texts(transport)
     # The success line is followed by exactly one question; every later answer
-    # turn produces exactly one message (one question, or the final report).
+    # turn produces exactly one message (one question, or the final report),
+    # and the final turn also delivers the hybrid portrait (two messages: the
+    # dossier report plus the teaser, then a ``sendPhoto``).
     assert replies[0] == SUCCESS_REPLY
-    assert sent_per_turn == [2, 1, 1, 1, 1, 1]
+    assert sent_per_turn == [2, 1, 1, 1, 1, 2]
     assert replies[1:6] == ["Q1", "Q2", "Q3", "Q4", "Q5"]
     assert "House cat" in replies[6]
     assert "Snores on the sofa" in replies[6]
+    assert len(transport.photos) == 1
 
     state = store.get(1)
     assert state.phase is Phase.done

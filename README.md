@@ -3,13 +3,15 @@
 A Telegram bot that turns a portrait photo into a narrated, comedy-wildlife
 documentary about the person in it (see `SPECS/MISSION.md`).
 
-**Status: Phase 3 — the Interviewer.** The bot long-polls the Telegram Bot API,
-gates incoming portraits with a Gemini vision check, then takes a passing
-portrait straight into a one-question-at-a-time behavioural interview and
-delivers a dossier with a suggested animal. Anything that is not a portrait is
-rejected with a reset. Phase 1's unconditional echo (`hey mate!`) is gone.
+**Status: Phase 4 — the Converter.** The bot long-polls the Telegram Bot API,
+gates incoming portraits with a Gemini vision check, takes a passing portrait
+straight into a one-question-at-a-time behavioural interview, and — as soon as
+the interview finishes — fuses the original photo with the behavioural dossier
+in a single Gemini image call and delivers the hybrid animal portrait straight
+to the chat. Anything that is not a portrait is rejected with a reset. Phase
+1's unconditional echo (`hey mate!`) is gone.
 
-## What the bot does (Phase 3: the Bouncer + the Interviewer)
+## What the bot does (Phase 4: the Bouncer + the Interviewer + the Converter)
 
 The gateway routes every incoming message with one rule set:
 
@@ -37,8 +39,20 @@ The gateway routes every incoming message with one rule set:
     never changes.
   - A failed dispatch never advances the interview: the answer is only
     committed once the next question (or the report) has actually been sent.
-- **After `done`** → non-command text gets a light "observation complete"
-  reply; no further model call, no state change.
+- **The hybrid portrait (phase `done`)** → the moment the dossier report is
+  sent, the Converter runs **in the same update** (no user input): a short
+  teaser ("Painting your portrait…") is sent first, then the original photo and
+  the dossier are fused by Gemini 3.1 Flash Image in **one multimodal call**
+  (no intermediate text step), and the returned image — validated before any
+  send (non-empty, `image/*`, ≤ 10 MB) — is delivered via a multipart
+  `sendPhoto` with a tiny caption naming the suggested animal. The original
+  portrait is **never** sent to Telegram, only the generated hybrid.
+  - A failed generation or upload logs `conversion_failed` loudly and sends an
+    apology; `portrait_sent` is only set after a successful upload, so the chat
+    stays retryable and the next update completes the delivery.
+- **After the portrait is delivered** (`portrait_sent`) → non-command text gets
+  the Interviewer's light "observation complete" reply; no further model call,
+  no re-conversion, no state change.
 - **Plain text** or any non-photo content (document / sticker / voice) while a
   portrait is expected → the photo prompt again; the session is never lost or
   corrupted.
@@ -46,7 +60,8 @@ The gateway routes every incoming message with one rule set:
   siblings that Telegram delivers as separate updates sharing a
   `media_group_id` are ignored (and logged as skipped), at any phase.
 - **Everything degrades gracefully**: a failed download, a Gemini/vision
-  error, an interview `InterviewError`, or a `sendMessage` failure is logged
+  error, an interview `InterviewError`, a conversion `ConverterError` (image
+  generation or `sendPhoto` upload), or a `sendMessage` failure is logged
   loudly with a traceback, the user gets an apology/re-prompt, and nothing
   crashes the polling loop.
 - Updates that carry no `message` at all (edited messages, callback queries,
@@ -93,7 +108,7 @@ pip install -r requirements-dev.txt   # runtime + test/lint/type deps
 
 Runtime-only install: `pip install -r requirements.txt`.
 
-> `pydantic` is the only runtime dependency — for Phases 1–3.
+> `pydantic` is the only runtime dependency — for Phases 1–4.
 > The Telegram transport *and* the Gemini adapter speak plain stdlib
 > `urllib`, so no third-party HTTP client library is pinned.
 
@@ -110,21 +125,27 @@ Two secrets are **required** to start the bot:
 
 - `TELEGRAM_BOT_TOKEN` — the Bot API token.
 - `GEMINI_API_KEY` — the Google AI Studio key used by the Bouncer's vision
-  gate **and** the Interviewer. A missing/blank key is a hard startup error
-  (exit code `2`) — the bot refuses to run keyless.
+  gate, the Interviewer **and** the Converter. A missing/blank key is a hard
+  startup error (exit code `2`) — the bot refuses to run keyless.
 
 Both are read by a minimal built-in `.env` loader
 (`telegram_documentaries/config.py`): the process environment wins over the
 file, and a missing/empty value is a hard error — the bot never falls back to
 a hardcoded value.
 
-Two optional variables:
+Four optional variables, all following the same env-beats-file precedence (a
+blank value falls back to the default):
 
 - `GEMINI_VISION_MODEL` — overrides the Bouncer's vision model; defaults to
   `gemini-3.1-flash-lite`.
 - `GEMINI_INTERVIEW_MODEL` — overrides the Interviewer's model; defaults to
-  `gemini-3.1-flash-lite`. Both follow the same env-beats-file precedence, and
-  a blank value falls back to the default.
+  `gemini-3.1-flash-lite`.
+- `GEMINI_CONVERTER_MODEL` — overrides the Converter's image model; defaults to
+  `gemini-3.1-flash-image`.
+- `GEMINI_CONVERTER_TIMEOUT` — the Converter's image-call timeout in seconds;
+  defaults to `120.0` (Flash Image routinely exceeds the shared 30 s default).
+  A value that is not a positive, finite number of seconds is a hard startup
+  error.
 
 ## Run
 
@@ -164,10 +185,14 @@ The Bouncer adds structured events for the gate (`bouncer_verdict`,
 (`bouncer_album_skipped`). The Interviewer adds `interview_started`,
 `question_asked`, `answer_recorded`, `answer_truncated`, `dossier_created`,
 `interview_failed` and `interview_skipped` (a dossier logs only the suggested
-animal, never the user-derived summary). Secrets never appear in any log line —
-the Telegram transport redacts the token and the shared Gemini client
-(`gemini.py`) redacts the API key for **both** adapters, from every message,
-log line and formatted traceback.
+animal, never the user-derived summary). The Converter adds
+`conversion_started`, `conversion_succeeded`, `portrait_sent`,
+`conversion_failed` and `conversion_skipped` (only ids and the image's mime
+type — never photo bytes, base64 payloads or dossier text). Secrets never
+appear in any log line — the Telegram transport redacts the token and the
+shared Gemini client (`gemini.py`) redacts the API key for **all three**
+adapters (vision, interview, converter), from every message, log line and
+formatted traceback.
 
 ## Test
 
@@ -177,13 +202,15 @@ scripts/test -k offset       # extra pytest args are forwarded
 ```
 
 The suite is Red/Green TDD and uses fake transports / fake `urlopen` /
-`FakeGate` / `FakeLLM` throughout — **no test contacts Telegram or Gemini**
-(the full suite passes with every socket entry point patched to raise). The
-Gemini adapter tests (`test_gemini`, `test_vision`, `test_interviewer`) assert
-on the outgoing request body (base64 `inline_data`, JSON `responseSchema`,
-model id, transcript role alternation) without a socket. New in Phase 3:
-`test_gemini.py` (24), `test_interviewer.py` (65) and the component
-`test_interviewer_flow.py` (4).
+`FakeGate` / `FakeLLM` / `FakeConverter` throughout — **no test contacts
+Telegram or Gemini** (the full suite passes with every socket entry point
+patched to raise). The Gemini adapter tests (`test_gemini`, `test_vision`,
+`test_interviewer`, `test_converter`) assert on the outgoing request body
+(base64 `inline_data`, JSON `responseSchema` / `responseModalities`, model id,
+transcript role alternation) without a socket. New in Phase 4:
+`test_converter.py` (35) and the component `test_converter_flow.py` (2); the
+shared client's image path (`generate_image`) and the multipart `sendPhoto`
+upload are covered by `test_gemini.py` and `test_transport.py`.
 
 ## Pre-commit checks
 
@@ -205,9 +232,10 @@ Both ruff and mypy read their configuration from `pyproject.toml`.
 ```
 telegram_documentaries/
   __main__.py         # python -m entrypoint
-  bouncer.py          # message routing: /start, prompt, gate, reject, handoff
+  bouncer.py          # router across stages: /start, gate, interview, handoff
   cli.py              # argparse wiring, exit codes
   config.py           # minimal .env loader + secret resolution + model defaults
+  converter.py        # typed ConverterLLM port + Gemini image adapter + routing
   defaults.py         # shared constant home (models, question count, limits)
   gemini.py           # shared Gemini generateContent JSON client + redaction
   interviewer.py      # typed InterviewLLM port + Gemini adapter + interview routing
@@ -215,11 +243,11 @@ telegram_documentaries/
   media.py            # photo intake: largest PhotoSize + safe getFile/download
   models.py           # Pydantic boundary models (Update/Message/PhotoSize/FileRef)
   polling.py          # getUpdates loop + offset acking
-  session.py          # per-chat_id state driver (phases, photo, interview, dossier)
+  session.py          # per-chat_id state driver (v3: phases, photo, dossier, portrait_sent)
   transport.py        # stdlib urllib transport (injectable urlopen)
   vision.py           # typed VisionGate port + Gemini REST adapter (shared client)
 tests/
-  conftest.py         # FakeTransport + FakeGate + FakeLLM + payload builders
+  conftest.py         # FakeTransport + FakeGate + FakeLLM + FakeConverter + payload builders
   unit/               # isolated logic, no I/O (session, media, gemini, vision, ...)
   component/          # whole gateway over faked seams (transport + gate + LLM)
 scripts/
@@ -231,6 +259,6 @@ SPECS/                # MISSION.md, TECH.md, ROADMAP.md (the contract)
 
 ## Roadmap
 
-Phase 3 of `SPECS/ROADMAP.md` (the Interviewer) is implemented on branch
-`feature/2026-10-10-interviewer` and verified. Phases 1–2 (gateway, Bouncer)
-are on `main`. Next: the Phase 4 Converter, then Scripter → Narrator.
+Phase 4 of `SPECS/ROADMAP.md` (the Converter) is implemented on branch
+`feature/2026-10-10-converter` and verified. Phases 1–3 (gateway, Bouncer,
+Interviewer) are on `main`. Next: the Phase 5 Scripter, then Narrator.

@@ -185,4 +185,35 @@ Finish: `scripts/test` + `scripts/hooks` green; commit; push; open PR to
 
 ## Verification notes (filled at verification)
 
-_To be completed by the verifier._
+- **Automated checks.** `scripts/test` = `483 passed in 4.21s`; `scripts/hooks`
+  = `[hooks] all checks passed` (ruff "All checks passed!", mypy "Success: no
+  issues found in 36 source files"). Baseline confirmed: collecting the suite
+  on `main` in a throwaway worktree = `379 tests collected`; the delta is the
+  104 Phase 4 additions. All read paths through the shipped modules match the
+  plan's task groups (§1 session, §2 `generate_image`, §3 multipart, §4 port +
+  adapter, §5 routing, §6 dispatch/wiring, §7 component + docs).
+- **No-network proof.** Throwaway plugin at `/tmp/opencode/nonet/nonet_plugin.py`
+  patches `socket.socket.connect`, `connect_ex`, `socket.create_connection`
+  and `socket.getaddrinfo`; its sanity probe fired for all four, and the full
+  suite re-ran green: `483 passed in 2.68s`.
+- **Behaviour.** Same-update handoff (photo → Q1..Q5 → dossier → teaser →
+  `sendPhoto` → `portrait_sent`, no user input) verified by
+  `test_final_answer_hands_off_to_the_converter_in_the_same_update` and the
+  component `test_full_pass_delivers_the_hybrid_portrait_exactly_once`.
+  Request-shape, validation, degradation/retry, missing-artifact reset,
+  post-portrait light reply, `/start` reset and redaction are each covered by
+  the named tests recorded in `validation.md`.
+- **Events.** `conversion_started`, `conversion_succeeded`, `portrait_sent`,
+  `conversion_failed`, `conversion_skipped` — all present and asserted; payloads
+  carry only `chat_id` / `phase` / `portrait_sent` / `mime_type`.
+- **Live smoke.** Live Gemini call **not reached**: `thispersondoesnotexist.com`
+  was unavailable (404 / HTML), the fallback Wikimedia Commons portrait
+  (1,276,121 bytes, `image/jpeg`) was fetched, and `hybridize` got
+  `http error: HTTP 403 Forbidden: Your API key was reported as leaked. Please
+  use another API key.` A bare list-models call with the same key returned the
+  same 403, confirming a blocked credential. Classified "not reached" (not
+  HTTP-400 / malformed output). Recorded in `validation.md` §5.
+- **Deviations.** One benign extension: `get_converter_timeout` raises
+  `ConfigError` on non-numeric / non-positive / non-finite values (the plan only
+  specified blank → default). No other drift from `requirements.md` /
+  `plan.md`; `SPECS/MISSION.md` unchanged.

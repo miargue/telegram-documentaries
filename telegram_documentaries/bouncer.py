@@ -9,19 +9,26 @@ Routes each incoming Telegram message:
   A human is retained and — since Phase 3 — the chat immediately hands off to
   the Interviewer, which asks question 1 right after the success line. A
   non-human gets a cheeky rejection and a session reset.
-- ``gate_passed`` / ``interviewing`` / ``done``: every update (except a
-  ``/start`` command or an album sibling already handled) is delegated to the
-  Interviewer, which owns the turn-taking.
+- ``gate_passed`` / ``interviewing``: every update (except a ``/start`` command
+  or an album sibling already handled) is delegated to the Interviewer, which
+  owns the turn-taking. When that turn completes the interview, the Converter
+  runs in the same update so the dossier report and the hybrid portrait arrive
+  together.
+- ``done``: a chat whose portrait was already delivered delegates to the
+  Interviewer's light completion reply; a chat whose hybrid portrait was never
+  delivered (e.g. the image call failed at handoff time) is routed to the
+  Converter, which retries and completes the delivery.
 
-Every download/gate/send failure is caught, logged loudly with a traceback and
-degraded to an apology/re-prompt — nothing is allowed to raise into the polling
-loop (``SPECS/TECH.md`` §Logging & error policy).
+Every download/gate/generate/send failure is caught, logged loudly with a
+traceback and degraded to an apology/re-prompt — nothing is allowed to raise
+into the polling loop (``SPECS/TECH.md`` §Logging & error policy).
 """
 
 from __future__ import annotations
 
 import logging
 
+from telegram_documentaries.converter import ConverterLLM, handle_conversion
 from telegram_documentaries.interviewer import (
     InterviewLLM,
     start_interview,
@@ -65,17 +72,22 @@ def handle_update(
     session: SessionStore,
     gate: VisionGate,
     llm: InterviewLLM,
+    converter: ConverterLLM,
     logger: logging.Logger | None = None,
 ) -> bool | Skipped:
     """Route one update; return whether a reply was sent.
 
-    ``session``, ``gate`` and ``llm`` are injected so the caller owns their
-    lifetime (the CLI builds one store, one gate and one interviewer for the
-    process). A ``/start`` command always resets, whatever the phase. Once a
-    portrait has passed, the chat is delegated to the Interviewer for every
-    other update. A deliberate, benign no-op returns :data:`SKIPPED` (so
-    ``log_lifecycle`` logs it as ``skipped`` rather than a false ``degraded``
-    warning); a genuine reply failure returns ``False``.
+    ``session``, ``gate``, ``llm`` and ``converter`` are injected so the caller
+    owns their lifetime (the CLI builds one store and one adapter per process).
+    A ``/start`` command always resets, whatever the phase. Once a portrait has
+    passed, the chat is delegated to the Interviewer for every other update —
+    except a ``done`` chat whose hybrid portrait was never delivered, which is
+    routed to the Converter (the retry path). When an Interviewer turn
+    *completes* the interview, the Converter runs in the same update so the
+    dossier report and the hybrid portrait arrive together. A deliberate, benign
+    no-op returns :data:`SKIPPED` (so ``log_lifecycle`` logs it as ``skipped``
+    rather than a false ``degraded`` warning); a genuine reply failure returns
+    ``False``.
     """
     log = LOGGER if logger is None else logger
     message = update.message
@@ -113,8 +125,14 @@ def handle_update(
         # Interviewer once per member and send one identical re-ask per photo.
         if message.media_group_id is not None and message.photo:
             session.remember_media_group(chat_id, message.media_group_id)
-        return handle_interview_update(
-            update, transport, session=session, llm=llm, logger=log
+        return _route_after_gate(
+            update,
+            transport,
+            chat_id=chat_id,
+            session=session,
+            llm=llm,
+            converter=converter,
+            log=log,
         )
 
     if text:
@@ -125,6 +143,42 @@ def handle_update(
             session=session, gate=gate, llm=llm, log=log,
         )
     return _prompt(transport, chat_id, update, log, reason="unsupported_content")
+
+
+def _route_after_gate(
+    update: Update,
+    transport: Transport,
+    *,
+    chat_id: int,
+    session: SessionStore,
+    llm: InterviewLLM,
+    converter: ConverterLLM,
+    log: logging.Logger,
+) -> bool | Skipped:
+    """Delegate an already-gated chat and complete the Converter handoff.
+
+    A ``done`` chat whose hybrid portrait was never delivered goes straight to
+    the Converter (the retry path). Every other update goes to the Interviewer;
+    if that turn *completed* the interview, the Converter runs in the same
+    update so the dossier report and the hybrid portrait arrive together.
+    """
+    state = session.get(chat_id)
+    if state.phase is Phase.done and not state.portrait_sent:
+        return handle_conversion(
+            transport, chat_id, session=session, converter=converter, logger=log
+        )
+
+    sent = handle_interview_update(
+        update, transport, session=session, llm=llm, logger=log
+    )
+    if sent is not True:
+        return sent
+    after = session.get(chat_id)
+    if after.phase is Phase.done and not after.portrait_sent:
+        return handle_conversion(
+            transport, chat_id, session=session, converter=converter, logger=log
+        )
+    return sent
 
 
 def _is_album_follow_up(

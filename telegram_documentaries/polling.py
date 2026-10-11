@@ -18,6 +18,7 @@ import logging
 from pydantic import ValidationError
 
 from telegram_documentaries.bouncer import handle_update
+from telegram_documentaries.converter import ConverterLLM
 from telegram_documentaries.interviewer import InterviewLLM
 from telegram_documentaries.logging_config import log_lifecycle
 from telegram_documentaries.models import Update
@@ -38,6 +39,7 @@ def poll_once(
     session: SessionStore,
     gate: VisionGate,
     llm: InterviewLLM,
+    converter: ConverterLLM,
     logger: logging.Logger | None = None,
 ) -> int:
     """Fetch one batch, handle every message in it, return the next offset."""
@@ -98,12 +100,15 @@ def poll_once(
             continue
 
         next_offset = max(next_offset, update.update_id + 1)
+        # Converter generation (up to ~120s) is the first slow call on this
+        # polling hot path; resilience/off-loop handling is Phase 7 scope.
         handle_update(
             update,
             transport,
             session=session,
             gate=gate,
             llm=llm,
+            converter=converter,
             logger=log,
         )
 
@@ -117,6 +122,7 @@ def run_polling(
     session: SessionStore,
     gate: VisionGate,
     llm: InterviewLLM,
+    converter: ConverterLLM,
     offset: int = -1,
     max_polls: int | None = None,
     logger: logging.Logger | None = None,
@@ -139,6 +145,7 @@ def run_polling(
             session=session,
             gate=gate,
             llm=llm,
+            converter=converter,
             logger=log,
         )
         polls += 1

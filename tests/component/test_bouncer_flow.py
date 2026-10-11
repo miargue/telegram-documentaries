@@ -8,7 +8,14 @@ conversation is exercised without a network.
 
 from __future__ import annotations
 
-from conftest import FakeGate, FakeLLM, FakeTransport, photo_update, text_update
+from conftest import (
+    FakeConverter,
+    FakeGate,
+    FakeLLM,
+    FakeTransport,
+    photo_update,
+    text_update,
+)
 
 from telegram_documentaries.bouncer import (
     APOLOGY_REPLY,
@@ -46,7 +53,14 @@ def test_start_then_non_human_photo_rejects_and_resets_the_session() -> None:
         ]
     )
 
-    poll_once(transport, offset=0, session=store, gate=gate, llm=FakeLLM())
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=gate,
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+    )
 
     assert _texts(transport) == [PROMPT_PHOTO, REJECTION_REPLY]
     state = store.get(10)
@@ -59,7 +73,14 @@ def test_human_photo_passes_and_hands_off_to_the_interview() -> None:
     gate = FakeGate([HumanVerdict(is_human=True, reason="a face")])
     transport = _transport([photo_update(1, chat_id=20)])
 
-    poll_once(transport, offset=0, session=store, gate=gate, llm=FakeLLM())
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=gate,
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+    )
 
     # The success line is immediately followed by exactly one question.
     assert _texts(transport) == [SUCCESS_REPLY, "Q1"]
@@ -78,7 +99,14 @@ def test_first_answer_after_pass_is_recorded_without_losing_the_portrait() -> No
         ]
     )
 
-    poll_once(transport, offset=0, session=store, gate=gate, llm=FakeLLM())
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=gate,
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+    )
 
     assert _texts(transport) == [SUCCESS_REPLY, "Q1", "Q2"]
     # Advancing the interview must not purge the accepted portrait.
@@ -105,7 +133,14 @@ def test_full_conversation_sequence_over_one_batch() -> None:
         ]
     )
 
-    poll_once(transport, offset=0, session=store, gate=gate, llm=FakeLLM())
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=gate,
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+    )
 
     assert _texts(transport) == [
         PROMPT_PHOTO,
@@ -133,7 +168,14 @@ def test_album_batch_uses_only_the_first_photo() -> None:
         ]
     )
 
-    poll_once(transport, offset=0, session=store, gate=gate, llm=FakeLLM())
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=gate,
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+    )
 
     assert _texts(transport) == [SUCCESS_REPLY, "Q1"]
     assert gate.calls == 1
@@ -157,7 +199,14 @@ def test_gate_failure_degrades_then_a_later_photo_still_passes() -> None:
         ]
     )
 
-    poll_once(transport, offset=0, session=store, gate=gate, llm=FakeLLM())
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=gate,
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+    )
 
     assert _texts(transport) == [APOLOGY_REPLY, SUCCESS_REPLY, "Q1"]
     assert store.get(50).phase is Phase.interviewing

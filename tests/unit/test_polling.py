@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from conftest import (
+    FakeConverter,
     FakeGate,
     FakeLLM,
     FakeTransport,
@@ -22,7 +23,7 @@ from conftest import (
 )
 
 from telegram_documentaries.polling import LONG_POLL_TIMEOUT, poll_once, run_polling
-from telegram_documentaries.session import Phase, QaPair, SessionStore
+from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict
 
@@ -37,6 +38,16 @@ class _NonDictTransport:
 
     def download(self, file_path: str) -> bytes:
         return b""
+
+    def send_photo(
+        self,
+        chat_id: int,
+        image: bytes,
+        *,
+        media_type: str,
+        caption: str | None = None,
+    ) -> Any:
+        return {"ok": True}
 
 
 def _store() -> SessionStore:
@@ -58,6 +69,7 @@ def test_non_object_get_updates_payload_is_logged_and_never_crashes() -> None:
             offset=0,
             session=_store(),
             gate=FakeGate(),
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -73,7 +85,21 @@ def test_non_object_get_updates_payload_is_logged_and_never_crashes() -> None:
 def test_get_updates_is_long_polling_with_offset_param() -> None:
     transport = FakeTransport(batches=[[]])
 
-    poll_once(transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM())
+    poll_once(
+
+        transport,
+
+        offset=0,
+
+        session=_store(),
+
+        gate=FakeGate(),
+
+        llm=FakeLLM(),
+
+        converter=FakeConverter(),
+
+    )
 
     params = transport.calls_for("getUpdates")[0]
     assert params["timeout"] == LONG_POLL_TIMEOUT
@@ -85,7 +111,12 @@ def test_offset_ack_advances_to_one_past_the_processed_update() -> None:
     transport = FakeTransport(batches=[[text_update(10, chat_id=1)], []])
 
     next_offset = poll_once(
-        transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM()
+        transport,
+        offset=0,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
     )
     assert next_offset == 11
 
@@ -94,6 +125,7 @@ def test_offset_ack_advances_to_one_past_the_processed_update() -> None:
         offset=next_offset,
         session=_store(),
         gate=FakeGate(),
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
     second_fetch = transport.calls_for("getUpdates")[1]
@@ -107,7 +139,12 @@ def test_offset_advances_past_the_highest_update_in_a_batch() -> None:
 
     assert (
         poll_once(
-            transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM()
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
         )
         == 10
     )
@@ -118,7 +155,12 @@ def test_empty_batch_keeps_the_current_offset() -> None:
 
     assert (
         poll_once(
-            transport, offset=5, session=_store(), gate=FakeGate(), llm=FakeLLM()
+            transport,
+            offset=5,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
         )
         == 5
     )
@@ -131,7 +173,12 @@ def test_offset_never_goes_backwards_when_updates_arrive_unordered() -> None:
 
     assert (
         poll_once(
-            transport, offset=6, session=_store(), gate=FakeGate(), llm=FakeLLM()
+            transport,
+            offset=6,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
         )
         == 9
     )
@@ -148,7 +195,12 @@ def test_malformed_update_is_acked_and_skipped_without_crashing() -> None:
     )
 
     next_offset = poll_once(
-        transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM()
+        transport,
+        offset=0,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
     )
 
     assert next_offset == 16  # the good update is acked...
@@ -162,7 +214,12 @@ def test_poison_update_is_acked_so_it_cannot_loop_forever() -> None:
     transport = FakeTransport(batches=[[poison, text_update(22, chat_id=4)]])
 
     next_offset = poll_once(
-        transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM()
+        transport,
+        offset=0,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
     )
 
     assert next_offset == 23
@@ -175,7 +232,12 @@ def test_non_dict_entry_in_batch_is_ignored_without_crash() -> None:
     transport = FakeTransport(batches=[["garbage", text_update(30, chat_id=9)]])
 
     next_offset = poll_once(
-        transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM()
+        transport,
+        offset=0,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
     )
 
     assert next_offset == 31
@@ -186,7 +248,12 @@ def test_messageless_update_is_acked_without_a_reply() -> None:
     transport = FakeTransport(batches=[[messageless_update(35)]])
 
     next_offset = poll_once(
-        transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM()
+        transport,
+        offset=0,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
     )
 
     assert next_offset == 36  # acknowledged...
@@ -209,6 +276,7 @@ def test_send_failure_is_logged_and_the_loop_keeps_acking() -> None:
             offset=0,
             session=_store(),
             gate=FakeGate(),
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -226,7 +294,14 @@ def test_get_updates_transport_failure_propagates_loudly() -> None:
     )
 
     try:
-        poll_once(transport, offset=0, session=_store(), gate=FakeGate(), llm=FakeLLM())
+        poll_once(
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
+        )
     except TelegramApiError:
         pass
     else:  # pragma: no cover - fail loudly is the contract
@@ -243,7 +318,21 @@ def test_poll_once_threads_the_injected_session_and_gate_to_the_handler() -> Non
         files={"abc123": ("photos/p.jpg", b"portrait")},
     )
 
-    poll_once(transport, offset=0, session=store, gate=gate, llm=FakeLLM())
+    poll_once(
+
+        transport,
+
+        offset=0,
+
+        session=store,
+
+        gate=gate,
+
+        llm=FakeLLM(),
+
+        converter=FakeConverter(),
+
+    )
 
     state = store.get(45)
     assert state.phase is Phase.interviewing
@@ -260,7 +349,12 @@ def test_poll_once_threads_the_injected_llm_to_the_handler() -> None:
     transport = FakeTransport(batches=[[text_update(46, chat_id=46, text="a1")]])
 
     poll_once(
-        transport, offset=0, session=store, gate=FakeGate(), llm=llm
+        transport,
+        offset=0,
+        session=store,
+        gate=FakeGate(),
+        llm=llm,
+        converter=FakeConverter(),
     )
 
     # Exactly one model call per answer: the pending question is read from the
@@ -278,7 +372,12 @@ def test_run_polling_starts_at_offset_minus_one_to_drop_the_backlog() -> None:
     transport = FakeTransport(batches=[[]])
 
     run_polling(
-        transport, session=_store(), gate=FakeGate(), llm=FakeLLM(), max_polls=1
+        transport,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        max_polls=1,
     )
 
     assert transport.calls_for("getUpdates")[0]["offset"] == -1
@@ -290,7 +389,12 @@ def test_run_polling_returns_to_a_valid_offset_after_the_backlog_drop() -> None:
     transport = FakeTransport(batches=[[], []])
 
     run_polling(
-        transport, session=_store(), gate=FakeGate(), llm=FakeLLM(), max_polls=2
+        transport,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        max_polls=2,
     )
 
     assert [fetch["offset"] for fetch in transport.calls_for("getUpdates")] == [-1, 0]
@@ -304,6 +408,7 @@ def test_run_polling_stops_after_max_polls_and_carries_offset() -> None:
         offset=0,
         session=_store(),
         gate=FakeGate(),
+        converter=FakeConverter(),
         llm=FakeLLM(),
         max_polls=2,
     )
@@ -322,9 +427,39 @@ def test_run_polling_from_a_given_offset() -> None:
         offset=60,
         session=_store(),
         gate=FakeGate(),
+        converter=FakeConverter(),
         llm=FakeLLM(),
         max_polls=1,
     )
 
     assert final_offset == 61
     assert transport.calls_for("getUpdates")[0]["offset"] == 60
+
+
+def test_poll_once_threads_the_injected_converter_to_the_handler() -> None:
+    # A finished chat whose portrait was never delivered retries the
+    # conversion through the loop: proof poll_once passes the injected
+    # converter down rather than silently building its own.
+    store = SessionStore()
+    store.record_pass(chat_id=47, photo=b"portrait")
+    store.start_interview(47, question="Q1")
+    for number in range(1, 6):
+        store.record_interview_answer(47, f"Q{number}", f"a{number}")
+    store.appoint_dossier(
+        47, Dossier(summary="S", suggested_animal="Capybara")
+    )
+    converter = FakeConverter()
+    transport = FakeTransport(batches=[[text_update(47, chat_id=47, text="hi")]])
+
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=converter,
+    )
+
+    assert len(transport.photos) == 1
+    assert store.get(47).portrait_sent is True
+    assert len(converter.calls) == 1

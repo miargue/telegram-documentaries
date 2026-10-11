@@ -23,6 +23,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import secrets
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 from urllib import error as urllib_error
@@ -33,6 +34,11 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.telegram.org"
 DEFAULT_TIMEOUT = 30.0
+
+# Stable filename for the generated hybrid portrait part. Telegram does not care
+# about the extension, and the declared part ``Content-Type`` carries the real
+# media type, so one constant keeps the multipart body deterministic.
+PHOTO_FILENAME = "portrait"
 
 # ------------------------------------------------------------- outbound length
 #
@@ -75,6 +81,48 @@ def truncate_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> str:
 UrlopenFn = Callable[..., Any]
 
 
+def _multipart(
+    *,
+    boundary: str,
+    fields: Mapping[str, str],
+    file_field: str,
+    filename: str,
+    content_type: str,
+    content: bytes,
+) -> bytes:
+    """Build a ``multipart/form-data`` body (pure: no I/O, no globals).
+
+    Text ``fields`` are rendered in insertion order, then exactly one file
+    part. Text values are UTF-8 encoded; the file part's bytes are copied
+    verbatim, so the body is binary-safe. The caller owns the boundary and
+    declares it in the ``Content-Type`` header.
+    """
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n'
+                f"\r\n"
+            ).encode("utf-8")
+            + value.encode("utf-8")
+            + b"\r\n"
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n"
+            f"\r\n"
+        ).encode("utf-8")
+        + content
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode("ascii"))
+    return b"".join(parts)
+
+
 class TelegramApiError(Exception):
     """A failed call to the Telegram Bot API (network, HTTP or ``ok: false``).
 
@@ -105,6 +153,15 @@ class Transport(Protocol):
     ) -> dict[str, Any]: ...
 
     def download(self, file_path: str) -> bytes: ...
+
+    def send_photo(
+        self,
+        chat_id: int,
+        image: bytes,
+        *,
+        media_type: str,
+        caption: str | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class UrllibTransport:
@@ -155,6 +212,46 @@ class UrllibTransport:
         url = f"{self._base_url}/file/bot{self._token}/{file_path}"
         request = urllib_request.Request(url, method="GET")
         return self._read("download", request)
+
+    def send_photo(
+        self,
+        chat_id: int,
+        image: bytes,
+        *,
+        media_type: str,
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload ``image`` to ``sendPhoto`` as ``multipart/form-data``.
+
+        The body is built by the pure :func:`_multipart` helper and sent
+        through the same :meth:`_read`/:meth:`_decode` normalisation as
+        :meth:`call`, so failures and token redaction behave identically. The
+        file part carries a stable filename and the declared ``media_type``;
+        ``caption`` is omitted when absent.
+        """
+        boundary = secrets.token_hex(16)
+        fields: dict[str, str] = {"chat_id": str(chat_id)}
+        if caption:
+            fields["caption"] = caption
+        body = _multipart(
+            boundary=boundary,
+            fields=fields,
+            file_field="photo",
+            filename=PHOTO_FILENAME,
+            content_type=media_type,
+            content=image,
+        )
+        url = f"{self._base_url}/bot{self._token}/sendPhoto"
+        request = urllib_request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            },
+            method="POST",
+        )
+        raw = self._read("sendPhoto", request)
+        return self._decode("sendPhoto", raw)
 
     def _read(self, method: str, request: urllib_request.Request) -> bytes:
         """Run a request and normalise every failure into ``TelegramApiError``.

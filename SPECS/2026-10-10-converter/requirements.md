@@ -186,4 +186,48 @@ successful `sendPhoto`).
 
 ## Delivered (filled at verification)
 
-_To be completed by the verifier._
+Shipped surface (verified 2026-10-11, branch `feature/2026-10-10-converter`;
+working tree uncommitted at verification time):
+
+- **New module `telegram_documentaries/converter.py`** — `ConverterError`,
+  `GeneratedImage(BaseModel: data: bytes, mime_type: str)`,
+  `ConverterLLM(Protocol).hybridize(photo: bytes, dossier: Dossier, *,
+  media_type: str = "image/jpeg") -> GeneratedImage`,
+  `GeminiConverter(api_key, *, model=DEFAULT_CONVERTER_MODEL,
+  base_url=DEFAULT_BASE_URL, timeout=DEFAULT_CONVERTER_TIMEOUT, urlopen=None)`,
+  the `CONVERTER_PERSONA` / `HYBRIDIZE_DIRECTIVE` / teaser / apology / reset /
+  caption constants, and the routing entry
+  `handle_conversion(transport, chat_id, *, session, converter, logger=None)`.
+- **Modified modules** — `gemini.py` (`InlineImagePayload` +
+  `GeminiJsonClient.generate_image`, shared POST/normalisation/redaction with
+  `generate_json`); `transport.py` (`Transport.send_photo` Protocol member,
+  pure `_multipart(...)` helper, `PHOTO_FILENAME`, `UrllibTransport.send_photo`
+  reusing `_read`/`_decode`); `session.py` (`SESSION_VERSION = 3`,
+  `SessionState.portrait_sent: bool = False`,
+  `SessionStore.mark_portrait_sent`, `reset` clears the flag);
+  `bouncer.py` (accepts `converter`, routes `done && !portrait_sent` to the
+  Converter and runs the same-update handoff after a delegated interview turn
+  completes); `config.py` (`get_converter_model`, `get_converter_timeout`);
+  `defaults.py` (`DEFAULT_CONVERTER_MODEL = "gemini-3.1-flash-image"`,
+  `DEFAULT_CONVERTER_TIMEOUT = 120.0`, `MAX_PHOTO_BYTES = 10 MiB`);
+  `polling.py` and `cli.py` (thread one `GeminiConverter` through the loop and
+  handler signatures / `ConverterFactory`).
+- **Structured events**: `conversion_started`, `conversion_succeeded`,
+  `portrait_sent`, `conversion_failed`, `conversion_skipped` (ids and mime only
+  — never photo bytes, base64 or dossier text).
+- **Tests**: `483 passed` (Phase 3 `main` baseline `379` + 104 new). New
+  `tests/unit/test_converter.py` (35 collected) and
+  `tests/component/test_converter_flow.py` (2); image-path coverage added to
+  `test_gemini.py` and multipart coverage to `test_transport.py`; routing /
+  config / wiring coverage in `test_bouncer.py`, `test_polling.py`,
+  `test_config.py`, `test_cli.py`, `test_session.py`. `scripts/hooks` green
+  (compileall + smoke import + ruff + mypy). Full suite green under a
+  throwaway plugin that patches all four socket entry points to raise.
+- **Live Gemini smoke**: **not reached** — the configured `GEMINI_API_KEY` is
+  blocked provider-side ("Your API key was reported as leaked", HTTP 403,
+  reproduced with a bare list-models call). No adapter failure; per the
+  approved classification only HTTP-400/malformed output is a code failure.
+- **Deviations**: one benign extension — `get_converter_timeout` rejects
+  non-numeric / non-positive / non-finite values with `ConfigError` (stricter
+  than the plan's blank-fallback rule). Full evidence in
+  `SPECS/2026-10-10-converter/validation.md`.
