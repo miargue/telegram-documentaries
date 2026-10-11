@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from conftest import (
+    FakeConverter,
     FakeGate,
     FakeLLM,
     FakeTransport,
@@ -31,6 +32,7 @@ from telegram_documentaries.bouncer import (
     _send,
     handle_update,
 )
+from telegram_documentaries.converter import TEASER_REPLY, ConverterError
 from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
 from telegram_documentaries.logging_config import SKIPPED
 from telegram_documentaries.models import Update
@@ -97,6 +99,7 @@ def test_start_resets_the_session_and_prompts_for_a_photo() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -121,6 +124,7 @@ def test_restart_behaves_like_start() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -139,6 +143,7 @@ def test_start_with_a_bot_mention_is_recognised() -> None:
         transport,
         session=store,
         gate=FakeGate(),
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -155,6 +160,7 @@ def test_plain_text_re_prompts_without_calling_the_gate() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -175,6 +181,7 @@ def test_other_content_re_prompts_without_calling_the_gate(kind: str) -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -193,6 +200,7 @@ def test_photo_without_a_human_is_rejected_and_resets_the_session() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -214,6 +222,7 @@ def test_photo_of_a_human_passes_and_retains_the_image() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=llm,
     )
 
@@ -246,6 +255,7 @@ def test_text_during_the_interview_is_delegated_to_the_interviewer() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=llm,
     )
 
@@ -264,6 +274,7 @@ def test_text_after_completion_is_delegated_to_the_interviewer() -> None:
     store.appoint_dossier(
         82, Dossier(summary="S", suggested_animal="Capybara")
     )
+    store.mark_portrait_sent(82)
     gate = FakeGate()
     transport = FakeTransport()
 
@@ -273,12 +284,14 @@ def test_text_after_completion_is_delegated_to_the_interviewer() -> None:
         session=store,
         gate=gate,
         llm=FakeLLM(),
+        converter=FakeConverter(),
     )
 
     assert sent is True
     assert transport.calls_for("sendMessage")[-1]["text"] == (
         OBSERVATION_COMPLETE_REPLY
     )
+    assert transport.photos == []
     assert gate.calls == 0
 
 
@@ -294,6 +307,7 @@ def test_start_mid_interview_resets_the_whole_session() -> None:
         transport,
         session=store,
         gate=FakeGate(),
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -316,6 +330,7 @@ def test_photo_with_a_caption_is_still_treated_as_a_photo() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -334,6 +349,7 @@ def test_album_first_photo_is_gated_and_its_siblings_are_ignored() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
     second = handle_update(
@@ -341,6 +357,7 @@ def test_album_first_photo_is_gated_and_its_siblings_are_ignored() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -363,6 +380,7 @@ def test_album_follow_up_after_a_rejection_is_still_ignored() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
     sent = handle_update(
@@ -370,6 +388,7 @@ def test_album_follow_up_after_a_rejection_is_still_ignored() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -396,6 +415,7 @@ def test_album_sent_while_interviewing_gets_exactly_one_reply() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=llm,
     )
     second = handle_update(
@@ -403,6 +423,7 @@ def test_album_sent_while_interviewing_gets_exactly_one_reply() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=llm,
     )
 
@@ -424,6 +445,7 @@ def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
     store.appoint_dossier(
         91, Dossier(summary="S", suggested_animal="Capybara")
     )
+    store.mark_portrait_sent(91)
     gate = FakeGate()
     transport = FakeTransport()
     llm = FakeLLM()
@@ -434,6 +456,7 @@ def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
         session=store,
         gate=gate,
         llm=llm,
+        converter=FakeConverter(),
     )
     second = handle_update(
         _update(photo_update(93, chat_id=91, media_group_id="album-done")),
@@ -441,6 +464,7 @@ def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
         session=store,
         gate=gate,
         llm=llm,
+        converter=FakeConverter(),
     )
 
     assert first is True
@@ -448,6 +472,7 @@ def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
     assert [call["text"] for call in transport.calls_for("sendMessage")] == [
         OBSERVATION_COMPLETE_REPLY
     ]
+    assert transport.photos == []
 
 
 @pytest.mark.parametrize(
@@ -485,7 +510,12 @@ def test_album_is_gated_once_whichever_member_arrives_first(
 
     results = [
         handle_update(
-            update, transport, session=store, gate=gate, llm=FakeLLM()
+            update,
+            transport,
+            session=store,
+            gate=gate,
+            llm=FakeLLM(),
+            converter=FakeConverter(),
         )
         for update in uploads
     ]
@@ -512,6 +542,7 @@ def test_distinct_albums_are_each_gated() -> None:
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
         )
 
@@ -534,6 +565,7 @@ def test_photos_without_a_media_group_are_always_gated() -> None:
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
         )
 
@@ -551,6 +583,7 @@ def test_start_clears_the_album_dedupe() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
     handle_update(
@@ -558,6 +591,7 @@ def test_start_clears_the_album_dedupe() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
     handle_update(
@@ -565,6 +599,7 @@ def test_start_clears_the_album_dedupe() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
     sent = handle_update(
@@ -572,6 +607,7 @@ def test_start_clears_the_album_dedupe() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -590,6 +626,7 @@ def test_album_skip_is_logged() -> None:
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -598,6 +635,7 @@ def test_album_skip_is_logged() -> None:
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -627,6 +665,7 @@ def test_multi_size_photo_is_gated_once_with_the_largest_resolution() -> None:
         transport,
         session=SessionStore(),
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -644,6 +683,7 @@ def test_empty_photo_list_re_prompts_without_gating() -> None:
         transport,
         session=SessionStore(),
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -659,6 +699,7 @@ def test_messageless_update_is_skipped() -> None:
         transport,
         session=SessionStore(),
         gate=FakeGate(),
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -675,6 +716,7 @@ def test_messageless_update_logs_a_skip_lifecycle_not_a_degraded_warning() -> No
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            converter=FakeConverter(),
             llm=FakeLLM(),
         )
 
@@ -695,6 +737,7 @@ def test_album_follow_up_logs_a_skip_lifecycle_not_a_degraded_warning() -> None:
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
         )
         sent = handle_update(
@@ -702,6 +745,7 @@ def test_album_follow_up_logs_a_skip_lifecycle_not_a_degraded_warning() -> None:
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
         )
 
@@ -727,6 +771,7 @@ def test_vision_error_becomes_an_apology_and_leaves_the_session_usable() -> None
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -745,6 +790,7 @@ def test_vision_error_becomes_an_apology_and_leaves_the_session_usable() -> None
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
         logger=logger,
     )
@@ -764,6 +810,7 @@ def test_photo_fetch_failure_becomes_an_apology() -> None:
             transport,
             session=store,
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -786,6 +833,7 @@ def test_download_failure_becomes_an_apology() -> None:
         transport,
         session=SessionStore(),
         gate=FakeGate(),
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -805,6 +853,7 @@ def test_hostile_file_path_is_rejected_without_downloading_or_gating() -> None:
             transport,
             session=SessionStore(),
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -827,6 +876,7 @@ def test_empty_downloaded_image_is_treated_as_a_gate_failure() -> None:
             transport,
             session=SessionStore(),
             gate=gate,
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -848,6 +898,7 @@ def test_send_failure_is_logged_loudly_and_returns_false() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -872,6 +923,7 @@ def test_send_failure_marks_the_lifecycle_degraded_not_success() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            converter=FakeConverter(),
             llm=FakeLLM(),
         )
 
@@ -892,6 +944,7 @@ def test_unexpected_send_exception_is_swallowed_and_logged() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            converter=FakeConverter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -909,6 +962,7 @@ def test_process_control_exceptions_are_not_swallowed() -> None:
             transport,
             session=SessionStore(),
             gate=FakeGate(),
+            converter=FakeConverter(),
             llm=FakeLLM(),
         )
 
@@ -945,6 +999,7 @@ def test_sessions_never_leak_between_chats() -> None:
         transport,
         session=store,
         gate=gate,
+        converter=FakeConverter(),
         llm=FakeLLM(),
     )
 
@@ -952,3 +1007,161 @@ def test_sessions_never_leak_between_chats() -> None:
     assert other.phase is Phase.awaiting_photo
     assert other.photo is None
     assert store.get(20).photo == b"PORTRAIT-BYTES"
+
+
+def _completed_store(chat_id: int, *, portrait_sent: bool = False) -> SessionStore:
+    """A store whose chat has finished the interview (``done`` phase)."""
+    store = SessionStore()
+    store.record_pass(chat_id=chat_id, photo=b"PORTRAIT-BYTES")
+    store.start_interview(chat_id, question="Q1")
+    for number in range(1, 6):
+        store.record_interview_answer(chat_id, f"Q{number}", f"a{number}")
+    store.appoint_dossier(
+        chat_id, Dossier(summary="S", suggested_animal="Capybara")
+    )
+    if portrait_sent:
+        store.mark_portrait_sent(chat_id)
+    return store
+
+
+def test_done_without_a_portrait_routes_the_update_to_the_converter() -> None:
+    # A ``done`` chat that never received its portrait (e.g. the image call
+    # failed at handoff time) must retry the conversion on the next update
+    # rather than fall through to the Interviewer's light completion reply.
+    store = _completed_store(100)
+    transport = FakeTransport()
+    converter = FakeConverter()
+
+    sent = handle_update(
+        _update(text_update(100, chat_id=100, text="hello again")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=converter,
+    )
+
+    assert sent is True
+    assert len(transport.photos) == 1
+    assert transport.photos[0]["image"] == converter.default.data
+    assert store.get(100).portrait_sent is True
+    assert TEASER_REPLY in [c["text"] for c in transport.calls_for("sendMessage")]
+
+
+def test_final_answer_hands_off_to_the_converter_in_the_same_update() -> None:
+    # The fifth answer produces the dossier report *and*, in the same update,
+    # the hybrid portrait: the bouncer delegates to the Interviewer and then
+    # completes the handoff itself.
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=True)])
+    llm = FakeLLM(
+        dossiers=[Dossier(summary="S", suggested_animal="Capybara")]
+    )
+    converter = FakeConverter()
+    transport = _photo_transport()
+
+    handle_update(
+        _update(photo_update(1, chat_id=1)),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+    )
+    assert store.get(1).phase is Phase.interviewing
+    for number in range(1, 5):
+        handle_update(
+            _update(text_update(10 + number, chat_id=1, text=f"a{number}")),
+            transport,
+            session=store,
+            gate=gate,
+            llm=llm,
+            converter=converter,
+        )
+    assert store.get(1).phase is Phase.interviewing
+
+    sent = handle_update(
+        _update(text_update(20, chat_id=1, text="a5")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+    )
+
+    assert sent is True
+    state = store.get(1)
+    assert state.phase is Phase.done
+    assert state.portrait_sent is True
+    assert len(transport.photos) == 1
+    assert len(converter.calls) == 1
+    texts = [call["text"] for call in transport.calls_for("sendMessage")]
+    assert any("behavioural dossier is ready" in text for text in texts)
+    assert TEASER_REPLY in texts
+
+
+def test_handoff_conversion_failure_leaves_the_chat_retryable() -> None:
+    # If the image call fails right after the dossier, the flag is never set;
+    # a later update retries and delivers the portrait exactly once.
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=True)])
+    llm = FakeLLM(
+        dossiers=[Dossier(summary="S", suggested_animal="Capybara")]
+    )
+    converter = FakeConverter(results=[ConverterError("boom")])
+    transport = _photo_transport()
+
+    handle_update(
+        _update(photo_update(30, chat_id=30)),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+    )
+    for number in range(1, 6):
+        sent = handle_update(
+            _update(text_update(30 + number, chat_id=30, text=f"a{number}")),
+            transport,
+            session=store,
+            gate=gate,
+            llm=llm,
+            converter=converter,
+        )
+
+    assert sent is False
+    assert store.get(30).phase is Phase.done
+    assert store.get(30).portrait_sent is False
+    assert transport.photos == []
+
+    retried = handle_update(
+        _update(text_update(40, chat_id=30, text="try again")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+    )
+
+    assert retried is True
+    assert store.get(30).portrait_sent is True
+    assert len(transport.photos) == 1
+
+
+def test_start_clears_the_portrait_sent_flag() -> None:
+    store = _completed_store(50, portrait_sent=True)
+    transport = FakeTransport()
+
+    sent = handle_update(
+        _update(text_update(50, chat_id=50, text="/start")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+    )
+
+    assert sent is True
+    state = store.get(50)
+    assert state.phase is Phase.awaiting_photo
+    assert state.portrait_sent is False

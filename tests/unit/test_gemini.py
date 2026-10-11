@@ -11,6 +11,7 @@ at the adapter level).
 
 from __future__ import annotations
 
+import base64
 import http.client
 import io
 import json
@@ -29,6 +30,7 @@ from telegram_documentaries.gemini import (
     DEFAULT_TIMEOUT,
     GeminiError,
     GeminiJsonClient,
+    InlineImagePayload,
 )
 
 SECRET_KEY = "SECRET-GEMINI-KEY-CANARY"
@@ -427,3 +429,280 @@ def test_unreadable_http_error_body_warns_on_the_injected_logger() -> None:
         and getattr(record, "event", None) == "http_error_body_unreadable"
         for record in records
     )
+
+
+# ------------------------------------------------------------ generate_image
+#
+# The Phase 4 Converter needs image *output*: the same POST, failure
+# normalisation and single API-key redaction implementation as
+# ``generate_json``, but the candidate is decoded from its first inlineData
+# part instead of being parsed as JSON text.
+
+IMAGE_BYTES = b"\x89PNG\r\n\x1a\nhybrid-portrait-bytes"
+
+
+def inline_part(
+    data: bytes = IMAGE_BYTES, mime_type: str = "image/png"
+) -> dict[str, Any]:
+    """One ``inlineData`` part shaped exactly as Gemini serialises it."""
+    return {
+        "inlineData": {
+            "mimeType": mime_type,
+            "data": base64.b64encode(data).decode("ascii"),
+        }
+    }
+
+
+def image_body(
+    parts: list[dict[str, Any]] | None = None,
+    *,
+    candidates: list[dict[str, Any]] | None = None,
+) -> bytes:
+    """A ``generateContent`` response carrying image candidates."""
+    if candidates is None:
+        candidates = [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [inline_part()] if parts is None else parts,
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    return json.dumps({"candidates": candidates}).encode("utf-8")
+
+
+def image_request() -> dict[str, Any]:
+    return {"contents": [{"role": "user", "parts": [{"text": "paint"}]}]}
+
+
+def test_generate_image_posts_to_the_generate_content_endpoint() -> None:
+    client, opener = make_client([FakeResponse(image_body())])
+
+    client.generate_image(image_request())
+
+    url, data, timeout = opener.requests[0]
+    assert opener.methods[0] == "POST"
+    assert url == (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-test-model:generateContent?key={SECRET_KEY}"
+    )
+    assert data is not None
+    assert json.loads(data) == image_request()
+    assert timeout == pytest.approx(DEFAULT_TIMEOUT)
+
+
+def test_generate_image_returns_the_decoded_bytes_and_mime_type() -> None:
+    client, _ = make_client(
+        [FakeResponse(image_body([inline_part(b"JPEG-DATA", "image/jpeg")]))]
+    )
+
+    payload = client.generate_image(image_request())
+
+    assert isinstance(payload, InlineImagePayload)
+    assert payload.data == b"JPEG-DATA"
+    assert payload.mime_type == "image/jpeg"
+
+
+def test_generate_image_skips_text_parts_and_takes_the_first_inline_part() -> None:
+    # A model may mix prose with the image: the *first* inlineData part wins.
+    client, _ = make_client(
+        [
+            FakeResponse(
+                image_body(
+                    [
+                        {"text": "here you go"},
+                        inline_part(b"FIRST", "image/png"),
+                        inline_part(b"SECOND", "image/webp"),
+                    ]
+                )
+            )
+        ]
+    )
+
+    payload = client.generate_image(image_request())
+
+    assert payload.data == b"FIRST"
+    assert payload.mime_type == "image/png"
+
+
+def test_generate_image_uses_the_first_candidate_only() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                image_body(
+                    candidates=[
+                        {"content": {"role": "model", "parts": [inline_part(b"ONE")]}},
+                        {"content": {"role": "model", "parts": [inline_part(b"TWO")]}},
+                    ]
+                )
+            )
+        ]
+    )
+
+    payload = client.generate_image(image_request())
+
+    assert payload.data == b"ONE"
+
+
+def test_generate_image_rejects_a_candidate_without_an_image_part() -> None:
+    client, _ = make_client([FakeResponse(image_body([{"text": "all done"}]))])
+
+    with pytest.raises(GeminiError, match="inlineData"):
+        client.generate_image(image_request())
+
+
+def test_generate_image_rejects_a_candidate_without_content_parts() -> None:
+    client, _ = make_client(
+        [FakeResponse(image_body(candidates=[{"content": {}}]))]
+    )
+
+    with pytest.raises(GeminiError, match="content parts"):
+        client.generate_image(image_request())
+
+
+def test_generate_image_rejects_empty_image_data() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                image_body(
+                    [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/png",
+                                "data": base64.b64encode(b"").decode("ascii"),
+                            }
+                        }
+                    ]
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(GeminiError, match="empty"):
+        client.generate_image(image_request())
+
+
+@pytest.mark.parametrize("junk", ["not base64!!", "AAAA!"])
+def test_generate_image_rejects_non_base64_image_data(junk: str) -> None:
+    # ``AAAA!`` decodes silently under ``b64decode``'s default lenient mode
+    # (junk characters are discarded); strict validation must reject it.
+    client, _ = make_client(
+        [
+            FakeResponse(
+                image_body([{"inlineData": {"mimeType": "image/png", "data": junk}}])
+            )
+        ]
+    )
+
+    with pytest.raises(GeminiError, match="base64"):
+        client.generate_image(image_request())
+
+
+def test_generate_image_rejects_a_part_without_data_or_mime_type() -> None:
+    missing_data, _ = make_client(
+        [FakeResponse(image_body([{"inlineData": {"mimeType": "image/png"}}]))]
+    )
+    with pytest.raises(GeminiError, match="data"):
+        missing_data.generate_image(image_request())
+
+    missing_mime, _ = make_client(
+        [FakeResponse(image_body([{"inlineData": {"data": "AAAA"}}]))]
+    )
+    with pytest.raises(GeminiError, match="mimeType"):
+        missing_mime.generate_image(image_request())
+
+    wrong_mime, _ = make_client(
+        [FakeResponse(image_body([{"inlineData": {"mimeType": 7, "data": "AAAA"}}]))]
+    )
+    with pytest.raises(GeminiError, match="mimeType"):
+        wrong_mime.generate_image(image_request())
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (b"not json at all", "JSON"),
+        (b"[1, 2, 3]", "JSON object"),
+        (json.dumps({"candidates": []}).encode(), "no candidates"),
+    ],
+)
+def test_generate_image_normalises_malformed_responses(
+    raw: bytes, match: str
+) -> None:
+    client, _ = make_client([FakeResponse(raw)])
+
+    with pytest.raises(GeminiError, match=match):
+        client.generate_image(image_request())
+
+
+def test_generate_image_normalises_an_error_payload() -> None:
+    body = json.dumps(
+        {"error": {"code": 400, "message": "API key not valid", "status": "BAD"}}
+    ).encode()
+    client, _ = make_client([FakeResponse(body)])
+
+    with pytest.raises(GeminiError, match="API key not valid"):
+        client.generate_image(image_request())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError(
+            "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent",
+            500,
+            "Server Error",
+            cast(Any, None),
+            io.BytesIO(b'{"error": {"code": 500, "message": "backend exploded"}}'),
+        ),
+        urllib.error.URLError("connection refused"),
+        http.client.IncompleteRead(b"half"),
+        TimeoutError("timed out"),
+    ],
+)
+def test_generate_image_normalises_transport_failures(error: BaseException) -> None:
+    client, _ = make_client([error])
+
+    with pytest.raises(GeminiError):
+        client.generate_image(image_request())
+
+
+@pytest.mark.parametrize("label", sorted(_gemini_failures()))
+def test_every_generate_image_failure_redacts_the_api_key(label: str) -> None:
+    client, _ = make_client([_gemini_failures()[label]()])
+
+    with pytest.raises(GeminiError) as exc_info:
+        client.generate_image(image_request())
+
+    error = exc_info.value
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    json_line = _format_exception((type(error), error, error.__traceback__))
+
+    assert SECRET_KEY not in str(error), f"{label} leaked in str(exc)"
+    assert SECRET_KEY not in formatted, f"{label} leaked via traceback"
+    assert SECRET_KEY not in json_line, f"{label} leaked via JsonFormatter"
+    assert error.__cause__ is None, f"{label} leaked via __cause__"
+    assert error.__suppress_context__ is True, f"{label} leaked via __context__"
+
+
+def test_generate_image_redacts_a_control_character_key() -> None:
+    key = "SECRET-GEMINI-KEY-\nCANARY"
+    client, _ = make_client(
+        [real_invalid_url(f"/v1beta/models/m:generateContent?key={key}")],
+        api_key=key,
+    )
+
+    with pytest.raises(GeminiError) as exc_info:
+        client.generate_image(image_request())
+
+    error = exc_info.value
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+
+    assert "CANARY" not in str(error)
+    assert "CANARY" not in formatted
+    assert error.__cause__ is None

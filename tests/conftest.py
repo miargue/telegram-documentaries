@@ -12,6 +12,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from telegram_documentaries.converter import GeneratedImage
 from telegram_documentaries.session import Dossier, QaPair
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict
@@ -187,6 +188,9 @@ class FakeTransport:
         # file_id -> (file_path returned by getFile, raw bytes to download).
         self.files: dict[str, tuple[str | None, bytes]] = dict(files or {})
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # Every attempted ``sendPhoto`` upload, in order. Recorded before any
+        # scripted failure (like ``calls``) so tests can assert the attempt.
+        self.photos: list[dict[str, Any]] = []
 
     def call(
         self, method: str, params: Mapping[str, Any] | None = None
@@ -213,6 +217,30 @@ class FakeTransport:
             if path == file_path:
                 return data
         raise TelegramApiError("download", f"no such file: {file_path}")
+
+    def send_photo(
+        self,
+        chat_id: int,
+        image: bytes,
+        *,
+        media_type: str,
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        """Record an attempted hybrid-portrait upload and (unless scripted) ok."""
+        self.photos.append(
+            {
+                "chat_id": chat_id,
+                "image": image,
+                "media_type": media_type,
+                "caption": caption,
+            }
+        )
+        if "sendPhoto" in self.fail_on:
+            raise self.fail_on["sendPhoto"]
+        return {
+            "ok": True,
+            "result": {"message_id": 1, "chat": {"id": chat_id}},
+        }
 
     def _file_result(self, file_id: Any) -> dict[str, Any]:
         entry = self.files.get(str(file_id)) if file_id is not None else None
@@ -305,3 +333,43 @@ class FakeLLM:
         if self.summarize_errors:
             raise self.summarize_errors.pop(0)
         return self.dossiers.pop(0)
+
+
+class FakeConverter:
+    """Scripted ``ConverterLLM`` double.
+
+    ``results`` is a FIFO queue of :class:`GeneratedImage` values or exceptions
+    to raise; once exhausted the ``default`` image is returned, so tests only
+    script the calls they care about. Every call records the photo, dossier and
+    media type it was handed for assertions.
+    """
+
+    def __init__(
+        self,
+        results: list[Any] | None = None,
+        *,
+        default: GeneratedImage | None = None,
+    ) -> None:
+        self.results: list[Any] = list(results or [])
+        self.default: GeneratedImage = (
+            GeneratedImage(
+                data=b"\x89PNG\r\n\x1a\nfake-hybrid-portrait",
+                mime_type="image/png",
+            )
+            if default is None
+            else default
+        )
+        self.calls: list[tuple[bytes, Dossier, str]] = []
+
+    def hybridize(
+        self,
+        photo: bytes,
+        dossier: Dossier,
+        *,
+        media_type: str = "image/jpeg",
+    ) -> GeneratedImage:
+        self.calls.append((photo, dossier, media_type))
+        result = self.results.pop(0) if self.results else self.default
+        if isinstance(result, BaseException):
+            raise result
+        return result

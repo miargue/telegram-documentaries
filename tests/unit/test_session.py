@@ -24,12 +24,13 @@ def test_unknown_chat_yields_a_fresh_awaiting_photo_default() -> None:
 
     state = store.get(chat_id=42)
 
-    assert state.version == 2
+    assert state.version == 3
     assert state.phase is Phase.awaiting_photo
     assert state.photo is None
     assert state.interview == []
     assert state.dossier is None
     assert state.pending_question is None
+    assert state.portrait_sent is False
 
 
 def test_get_returns_the_same_state_for_the_same_chat() -> None:
@@ -98,10 +99,11 @@ def test_session_state_is_a_pydantic_model_with_a_stable_version() -> None:
     state = SessionState()
 
     assert isinstance(state, SessionState)
-    assert state.version == 2
+    assert state.version == 3
     assert state.phase is Phase.awaiting_photo
     assert state.interview == []
     assert state.dossier is None
+    assert state.portrait_sent is False
 
 
 def test_unknown_chat_has_no_remembered_media_group() -> None:
@@ -303,6 +305,69 @@ def test_reset_purges_photo_interview_and_dossier() -> None:
     assert state.dossier is None
     assert store.get(chat_id=7).interview == []
     assert store.get(chat_id=7).dossier is None
+
+
+def _dossier_store(chat_id: int) -> SessionStore:
+    """A store whose chat has completed the interview: photo, log, dossier."""
+    store = SessionStore()
+    store.record_pass(chat_id=chat_id, photo=b"portrait")
+    store.start_interview(chat_id=chat_id, question="Q1")
+    for number in range(1, 6):
+        store.record_interview_answer(chat_id, f"Q{number}", f"a{number}")
+    store.appoint_dossier(
+        chat_id,
+        Dossier(summary="A very dramatic sleeper.", suggested_animal="House cat"),
+    )
+    return store
+
+
+def test_mark_portrait_sent_sets_the_flag_without_touching_the_artifacts() -> (
+    None
+):
+    store = _dossier_store(chat_id=7)
+
+    state = store.mark_portrait_sent(chat_id=7)
+
+    assert state.portrait_sent is True
+    # Only the flag moves: the photo, interview log and dossier stay intact so
+    # later phases (Scripter/Narrator) can still consume them.
+    assert state.phase is Phase.done
+    assert state.photo == b"portrait"
+    assert len(state.interview) == 5
+    assert state.dossier is not None
+    assert store.get(7).portrait_sent is True
+
+
+def test_reset_clears_the_portrait_sent_flag() -> None:
+    store = _dossier_store(chat_id=7)
+    store.mark_portrait_sent(chat_id=7)
+
+    state = store.reset(chat_id=7)
+
+    assert state.portrait_sent is False
+    assert store.get(7).portrait_sent is False
+    # The reset still purges everything else too.
+    assert state.photo is None
+    assert state.interview == []
+    assert state.dossier is None
+
+
+def test_portrait_sent_rejects_a_non_boolean_value() -> None:
+    with pytest.raises(ValidationError):
+        SessionState(portrait_sent="banana")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        SessionState.model_validate({"portrait_sent": 42})
+
+
+def test_portrait_flag_is_isolated_per_chat_id() -> None:
+    store = _dossier_store(chat_id=1)
+    store.get(chat_id=2)  # a second chat, never marked
+
+    store.mark_portrait_sent(chat_id=1)
+
+    assert store.get(1).portrait_sent is True
+    assert store.get(2).portrait_sent is False
 
 
 def test_qa_pair_parses_and_validates() -> None:

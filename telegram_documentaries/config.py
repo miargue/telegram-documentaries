@@ -8,11 +8,14 @@ pure/injectable so tests never read the real ``.env``.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from pathlib import Path
 
 from telegram_documentaries.defaults import (
+    DEFAULT_CONVERTER_MODEL,
+    DEFAULT_CONVERTER_TIMEOUT,
     DEFAULT_INTERVIEW_MODEL,
     DEFAULT_VISION_MODEL,
 )
@@ -23,6 +26,8 @@ _TOKEN_KEY = "TELEGRAM_BOT_TOKEN"
 _API_KEY = "GEMINI_API_KEY"
 _VISION_MODEL_KEY = "GEMINI_VISION_MODEL"
 _INTERVIEW_MODEL_KEY = "GEMINI_INTERVIEW_MODEL"
+_CONVERTER_MODEL_KEY = "GEMINI_CONVERTER_MODEL"
+_CONVERTER_TIMEOUT_KEY = "GEMINI_CONVERTER_TIMEOUT"
 
 
 class ConfigError(Exception):
@@ -161,3 +166,59 @@ def get_interview_model(
 
     model = load_env_file(env_file).get(_INTERVIEW_MODEL_KEY, "").strip()
     return model or DEFAULT_INTERVIEW_MODEL
+
+
+def get_converter_model(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> str:
+    """Resolve the Gemini image model used by the Converter.
+
+    An optional ``GEMINI_CONVERTER_MODEL`` override follows the same
+    env-beats-file precedence as the other models; a blank override falls back
+    to :data:`DEFAULT_CONVERTER_MODEL`.
+    """
+    env = os.environ if environ is None else environ
+    model = env.get(_CONVERTER_MODEL_KEY, "").strip()
+    if model:
+        return model
+
+    model = load_env_file(env_file).get(_CONVERTER_MODEL_KEY, "").strip()
+    return model or DEFAULT_CONVERTER_MODEL
+
+
+def get_converter_timeout(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> float:
+    """Resolve the Converter timeout (seconds), defaulting to 120.
+
+    An optional ``GEMINI_CONVERTER_TIMEOUT`` override follows the same
+    env-beats-file precedence as the models; a blank override falls back to
+    :data:`DEFAULT_CONVERTER_TIMEOUT`. A present but unparsable value is a hard
+    ``ConfigError`` rather than a silent fallback, so a typo cannot hide behind
+    the default. The same fail-loud rule applies to values that parse but cannot
+    be a real timeout — non-finite (``nan``/``inf``) or non-positive — which
+    would otherwise disarm the deadline or invert its meaning.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(_CONVERTER_TIMEOUT_KEY, "").strip()
+    if not raw:
+        raw = load_env_file(env_file).get(_CONVERTER_TIMEOUT_KEY, "").strip()
+    if not raw:
+        return DEFAULT_CONVERTER_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        raise ConfigError(
+            f"{_CONVERTER_TIMEOUT_KEY} must be a number of seconds, "
+            f"got {raw!r}"
+        ) from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ConfigError(
+            f"{_CONVERTER_TIMEOUT_KEY} must be a positive number of seconds, "
+            f"got {raw!r}"
+        )
+    return timeout

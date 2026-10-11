@@ -11,6 +11,8 @@ import pytest
 from telegram_documentaries.config import (
     ConfigError,
     get_api_key,
+    get_converter_model,
+    get_converter_timeout,
     get_interview_model,
     get_token,
     get_vision_model,
@@ -276,3 +278,98 @@ def test_importing_config_does_not_pull_in_the_vision_adapter() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_get_converter_model_defaults_to_flash_image() -> None:
+    assert (
+        get_converter_model(environ={}, env_file=None)
+        == "gemini-3.1-flash-image"
+    )
+
+
+def test_get_converter_model_env_override_wins(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_CONVERTER_MODEL=from-file\n", encoding="utf-8")
+
+    model = get_converter_model(
+        environ={"GEMINI_CONVERTER_MODEL": "from-env"}, env_file=env_file
+    )
+
+    assert model == "from-env"
+
+
+def test_get_converter_model_falls_back_to_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_CONVERTER_MODEL=file-model\n", encoding="utf-8")
+
+    assert get_converter_model(environ={}, env_file=env_file) == "file-model"
+
+
+def test_get_converter_model_blank_override_falls_back_to_default() -> None:
+    model = get_converter_model(
+        environ={"GEMINI_CONVERTER_MODEL": "   "}, env_file=None
+    )
+
+    assert model == "gemini-3.1-flash-image"
+
+
+def test_default_converter_model_lives_in_a_neutral_module() -> None:
+    from telegram_documentaries import defaults
+
+    assert (
+        get_converter_model(environ={}, env_file=None)
+        == defaults.DEFAULT_CONVERTER_MODEL
+    )
+
+
+def test_get_converter_timeout_defaults_to_120_seconds() -> None:
+    assert get_converter_timeout(environ={}, env_file=None) == 120.0
+
+
+def test_get_converter_timeout_env_override_wins(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_CONVERTER_TIMEOUT=30\n", encoding="utf-8")
+
+    timeout = get_converter_timeout(
+        environ={"GEMINI_CONVERTER_TIMEOUT": "45.5"}, env_file=env_file
+    )
+
+    assert timeout == 45.5
+
+
+def test_get_converter_timeout_falls_back_to_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_CONVERTER_TIMEOUT=90\n", encoding="utf-8")
+
+    assert get_converter_timeout(environ={}, env_file=env_file) == 90.0
+
+
+def test_get_converter_timeout_blank_override_falls_back_to_default() -> None:
+    timeout = get_converter_timeout(
+        environ={"GEMINI_CONVERTER_TIMEOUT": "   "}, env_file=None
+    )
+
+    assert timeout == 120.0
+
+
+def test_get_converter_timeout_rejects_a_non_numeric_value() -> None:
+    with pytest.raises(ConfigError, match="GEMINI_CONVERTER_TIMEOUT"):
+        get_converter_timeout(
+            environ={"GEMINI_CONVERTER_TIMEOUT": "soon"}, env_file=None
+        )
+
+
+@pytest.mark.parametrize("raw", ["0", "0.0", "-1", "-0.5"])
+def test_get_converter_timeout_rejects_a_non_positive_value(raw: str) -> None:
+    with pytest.raises(ConfigError, match="GEMINI_CONVERTER_TIMEOUT"):
+        get_converter_timeout(
+            environ={"GEMINI_CONVERTER_TIMEOUT": raw}, env_file=None
+        )
+
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "Infinity"])
+def test_get_converter_timeout_rejects_a_non_finite_value(raw: str) -> None:
+    with pytest.raises(ConfigError, match="GEMINI_CONVERTER_TIMEOUT"):
+        get_converter_timeout(
+            environ={"GEMINI_CONVERTER_TIMEOUT": raw}, env_file=None
+        )

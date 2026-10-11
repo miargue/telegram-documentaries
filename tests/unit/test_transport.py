@@ -10,15 +10,18 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import re
 import urllib.error
 from typing import Any, cast
 
 import pytest
+from conftest import real_invalid_url
 
 from telegram_documentaries.transport import (
     MAX_MESSAGE_LENGTH,
     TelegramApiError,
     UrllibTransport,
+    _multipart,
     message_length,
     truncate_message,
 )
@@ -48,10 +51,12 @@ class RecordingUrlopen:
         self.responses = list(responses)
         self.requests: list[tuple[str, bytes | None, float]] = []
         self.methods: list[str] = []
+        self.headers: list[dict[str, str]] = []
 
     def __call__(self, request: Any, timeout: float) -> FakeResponse:
         self.requests.append((request.full_url, request.data, timeout))
         self.methods.append(request.get_method())
+        self.headers.append(dict(request.headers))
         result = self.responses.pop(0)
         if isinstance(result, BaseException):
             raise result
@@ -380,3 +385,249 @@ def test_truncate_message_accepts_a_custom_limit() -> None:
 
 def test_truncate_message_with_a_zero_limit_returns_empty() -> None:
     assert truncate_message("anything", limit=0) == ""
+
+
+# ------------------------------------------------------------ photo upload
+#
+# ``sendPhoto`` is the only multipart call: the generated hybrid portrait is
+# uploaded as a file part (the user's original photo is never sent). The body
+# is built by the pure ``_multipart`` helper so its shape is unit-testable
+# without a socket, and it goes through the same ``_read``/``_decode``
+# normalisation (and token redaction) as every other transport call.
+
+BOUNDARY = "test-boundary-1234567890"
+PHOTO_BYTES = b"\xff\xd8\xff\xe0hybrid-portrait-bytes"
+
+
+def parse_multipart(
+    body: bytes, boundary: str
+) -> list[tuple[dict[str, str], bytes]]:
+    """Parse a multipart/form-data body back into ``(headers, content)`` pairs."""
+    delimiter = b"--" + boundary.encode("ascii")
+    parts: list[tuple[dict[str, str], bytes]] = []
+    for chunk in body.split(delimiter)[1:]:
+        if chunk.startswith(b"--"):
+            break
+        if chunk.startswith(b"\r\n"):
+            chunk = chunk[2:]
+        header_blob, _, content = chunk.partition(b"\r\n\r\n")
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+        headers: dict[str, str] = {}
+        for line in header_blob.split(b"\r\n"):
+            name, _, value = line.decode("utf-8").partition(": ")
+            headers[name.lower()] = value
+        parts.append((headers, content))
+    return parts
+
+
+def disposition_param(header: str, param: str) -> str | None:
+    match = re.search(rf'{re.escape(param)}="([^"]*)"', header)
+    return match.group(1) if match else None
+
+
+def header(request_headers: dict[str, str], name: str) -> str | None:
+    """Case-insensitive header lookup (urllib capitalises the names)."""
+    for key, value in request_headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def multipart_boundary(request_headers: dict[str, str]) -> str:
+    """Extract the boundary the request announces in its ``Content-Type``."""
+    content_type = header(request_headers, "content-type")
+    assert content_type is not None
+    assert content_type.startswith("multipart/form-data; boundary=")
+    return content_type.split("boundary=")[1]
+
+
+def test_multipart_renders_text_fields_then_the_file_part() -> None:
+    body = _multipart(
+        boundary=BOUNDARY,
+        fields={"chat_id": "5", "caption": "a badger"},
+        file_field="photo",
+        filename="portrait",
+        content_type="image/png",
+        content=PHOTO_BYTES,
+    )
+
+    assert body.startswith(f"--{BOUNDARY}\r\n".encode())
+    assert body.endswith(f"--{BOUNDARY}--\r\n".encode())
+
+    parts = parse_multipart(body, BOUNDARY)
+    assert len(parts) == 3
+
+    chat_headers, chat_content = parts[0]
+    assert chat_headers["content-disposition"] == 'form-data; name="chat_id"'
+    assert chat_content == b"5"
+
+    caption_headers, caption_content = parts[1]
+    assert caption_headers["content-disposition"] == 'form-data; name="caption"'
+    assert caption_content == b"a badger"
+
+    photo_headers, photo_content = parts[2]
+    assert disposition_param(
+        photo_headers["content-disposition"], "name"
+    ) == "photo"
+    assert disposition_param(
+        photo_headers["content-disposition"], "filename"
+    ) == "portrait"
+    assert photo_headers["content-type"] == "image/png"
+    assert photo_content == PHOTO_BYTES
+
+
+def test_multipart_keeps_binary_content_byte_exact() -> None:
+    # NUL bytes and CRLFs must survive untouched; only the transport-added
+    # trailing CRLF may be stripped when parsing.
+    content = b"\x00\r\n\xff\xfe\x00END\r\n"
+    body = _multipart(
+        boundary=BOUNDARY,
+        fields={"chat_id": "1"},
+        file_field="photo",
+        filename="portrait",
+        content_type="image/jpeg",
+        content=content,
+    )
+
+    parts = parse_multipart(body, BOUNDARY)
+
+    assert parts[-1][1] == content
+
+
+def test_send_photo_posts_a_multipart_body_to_sendphoto() -> None:
+    transport, opener = make_transport(
+        [FakeResponse(b'{"ok": true, "result": {"message_id": 9}}')]
+    )
+
+    result = transport.send_photo(
+        5, PHOTO_BYTES, media_type="image/png", caption="meet your badger"
+    )
+
+    url, body, _timeout = opener.requests[0]
+    assert url == "https://api.telegram.org/botTEST-TOKEN/sendPhoto"
+    assert opener.methods[0] == "POST"
+    assert body is not None
+    boundary = multipart_boundary(opener.headers[0])
+
+    parts = parse_multipart(body, boundary)
+    assert len(parts) == 3
+    fields = {
+        headers["content-disposition"]: content for headers, content in parts[:2]
+    }
+    assert fields['form-data; name="chat_id"'] == b"5"
+    assert fields['form-data; name="caption"'] == b"meet your badger"
+
+    photo_headers, photo_content = parts[2]
+    assert disposition_param(photo_headers["content-disposition"], "name") == "photo"
+    assert photo_headers["content-type"] == "image/png"
+    assert photo_content == PHOTO_BYTES
+    assert result == {"ok": True, "result": {"message_id": 9}}
+
+
+def test_send_photo_omits_the_caption_field_when_absent() -> None:
+    transport, opener = make_transport([FakeResponse(b'{"ok": true, "result": {}}')])
+
+    transport.send_photo(5, PHOTO_BYTES, media_type="image/jpeg")
+
+    _url, body, _timeout = opener.requests[0]
+    assert body is not None
+    boundary = multipart_boundary(opener.headers[0])
+    parts = parse_multipart(body, boundary)
+
+    assert [h["content-disposition"] for h, _ in parts] == [
+        'form-data; name="chat_id"',
+        'form-data; name="photo"; filename="portrait"',
+    ]
+
+
+def test_send_photo_uses_a_stable_filename_and_the_given_content_type() -> None:
+    transport, opener = make_transport([FakeResponse(b'{"ok": true}')])
+
+    transport.send_photo(7, PHOTO_BYTES, media_type="image/webp")
+
+    _url, body, _timeout = opener.requests[0]
+    assert body is not None
+    boundary = multipart_boundary(opener.headers[0])
+    photo_headers, _ = parse_multipart(body, boundary)[-1]
+
+    assert disposition_param(photo_headers["content-disposition"], "filename") == (
+        "portrait"
+    )
+    assert photo_headers["content-type"] == "image/webp"
+
+
+def test_send_photo_raises_when_the_api_reports_not_ok() -> None:
+    body = json.dumps(
+        {"ok": False, "error_code": 413, "description": "request entity too large"}
+    ).encode()
+    transport, _ = make_transport([FakeResponse(body)])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_photo(1, PHOTO_BYTES, media_type="image/png")
+
+    error = exc_info.value
+    assert error.method == "sendPhoto"
+    assert error.description == "request entity too large"
+    assert error.error_code == 413
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("connection refused"),
+        urllib.error.HTTPError(
+            "https://api.telegram.org/botTEST-TOKEN/sendPhoto",
+            502,
+            "Bad Gateway",
+            cast(Any, None),
+            io.BytesIO(b'{"ok": false, "description": "bad gateway"}'),
+        ),
+        http.client.IncompleteRead(b"half a body"),
+        TimeoutError("timed out"),
+    ],
+)
+def test_send_photo_normalises_every_transport_failure(
+    failure: BaseException,
+) -> None:
+    transport, _ = make_transport([failure])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_photo(1, PHOTO_BYTES, media_type="image/png")
+
+    error = exc_info.value
+    assert error.method == "sendPhoto"
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+
+
+def test_send_photo_never_leaks_the_token_in_a_failure() -> None:
+    endpoint = "https://api.telegram.org/botTEST-TOKEN/sendPhoto"
+    transport, _ = make_transport(
+        [urllib.error.URLError(f"connection refused: {endpoint}")]
+    )
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_photo(1, PHOTO_BYTES, media_type="image/png")
+
+    error = exc_info.value
+    assert "TEST-TOKEN" not in str(error)
+    assert "***" in str(error)
+
+
+def test_send_photo_redacts_a_control_character_token() -> None:
+    token = "TEST-TOKEN-\nCANARY"
+    opener = RecordingUrlopen(
+        [real_invalid_url(f"/bot{token}/sendPhoto")]
+    )
+    transport = UrllibTransport(token, urlopen=opener)
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_photo(1, PHOTO_BYTES, media_type="image/png")
+
+    error = exc_info.value
+    assert "CANARY" not in str(error)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    # The escaped form (``\n`` spelled out) must be redacted too.
+    assert "CANARY" not in error.description.encode("unicode_escape").decode()
