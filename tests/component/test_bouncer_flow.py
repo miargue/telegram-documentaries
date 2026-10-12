@@ -12,6 +12,7 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeScripter,
     FakeTransport,
     photo_update,
     text_update,
@@ -60,6 +61,7 @@ def test_start_then_non_human_photo_rejects_and_resets_the_session() -> None:
         gate=gate,
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert _texts(transport) == [PROMPT_PHOTO, REJECTION_REPLY]
@@ -80,6 +82,7 @@ def test_human_photo_passes_and_hands_off_to_the_interview() -> None:
         gate=gate,
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     # The success line is immediately followed by exactly one question.
@@ -106,6 +109,7 @@ def test_first_answer_after_pass_is_recorded_without_losing_the_portrait() -> No
         gate=gate,
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert _texts(transport) == [SUCCESS_REPLY, "Q1", "Q2"]
@@ -140,6 +144,7 @@ def test_full_conversation_sequence_over_one_batch() -> None:
         gate=gate,
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert _texts(transport) == [
@@ -175,6 +180,7 @@ def test_album_batch_uses_only_the_first_photo() -> None:
         gate=gate,
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert _texts(transport) == [SUCCESS_REPLY, "Q1"]
@@ -206,6 +212,7 @@ def test_gate_failure_degrades_then_a_later_photo_still_passes() -> None:
         gate=gate,
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert _texts(transport) == [APOLOGY_REPLY, SUCCESS_REPLY, "Q1"]

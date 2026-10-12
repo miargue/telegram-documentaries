@@ -17,6 +17,7 @@ from telegram_documentaries.defaults import (
     DEFAULT_CONVERTER_MODEL,
     DEFAULT_CONVERTER_TIMEOUT,
     DEFAULT_INTERVIEW_MODEL,
+    DEFAULT_SCRIPT_MODEL,
     DEFAULT_VISION_MODEL,
 )
 
@@ -28,6 +29,7 @@ _VISION_MODEL_KEY = "GEMINI_VISION_MODEL"
 _INTERVIEW_MODEL_KEY = "GEMINI_INTERVIEW_MODEL"
 _CONVERTER_MODEL_KEY = "GEMINI_CONVERTER_MODEL"
 _CONVERTER_TIMEOUT_KEY = "GEMINI_CONVERTER_TIMEOUT"
+_SCRIPT_MODEL_KEY = "GEMINI_SCRIPT_MODEL"
 
 
 class ConfigError(Exception):
@@ -186,6 +188,26 @@ def get_converter_model(
 
     model = load_env_file(env_file).get(_CONVERTER_MODEL_KEY, "").strip()
     return model or DEFAULT_CONVERTER_MODEL
+
+
+def get_script_model(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> str:
+    """Resolve the Gemini model used by the Scripter.
+
+    An optional ``GEMINI_SCRIPT_MODEL`` override follows the same
+    env-beats-file precedence as the other models; a blank override falls back
+    to :data:`DEFAULT_SCRIPT_MODEL`.
+    """
+    env = os.environ if environ is None else environ
+    model = env.get(_SCRIPT_MODEL_KEY, "").strip()
+    if model:
+        return model
+
+    model = load_env_file(env_file).get(_SCRIPT_MODEL_KEY, "").strip()
+    return model or DEFAULT_SCRIPT_MODEL
 
 
 def get_converter_timeout(

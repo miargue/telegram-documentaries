@@ -18,6 +18,7 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeScripter,
     FakeTransport,
     photo_update,
     text_update,
@@ -28,6 +29,7 @@ from telegram_documentaries.cli import main, positive_int
 from telegram_documentaries.converter import ConverterLLM
 from telegram_documentaries.interviewer import InterviewLLM
 from telegram_documentaries.logging_config import JsonFormatter
+from telegram_documentaries.scripter import ScripterLLM
 from telegram_documentaries.session import Dossier
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict, VisionGate
@@ -499,11 +501,58 @@ def test_main_uses_the_converter_model_and_timeout_overrides(
     assert built == [(API_KEY, "gemini-image-custom", 30.0)]
 
 
-def test_main_delivers_the_portrait_end_to_end(tmp_path: Path) -> None:
+def test_main_builds_the_scripter_from_the_api_key_and_default_model(
+    tmp_path: Path,
+) -> None:
+    built: list[tuple[str, str]] = []
+
+    def scripter_factory(api_key: str, model: str) -> ScripterLLM:
+        built.append((api_key, model))
+        return FakeScripter()
+
+    exit_code = main(
+        ["--max-polls", "1"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        scripter_factory=scripter_factory,
+    )
+
+    assert exit_code == 0
+    assert built == [(API_KEY, "gemini-3.1-flash-lite")]
+
+
+def test_main_uses_the_script_model_override(tmp_path: Path) -> None:
+    built: list[tuple[str, str]] = []
+
+    def scripter_factory(api_key: str, model: str) -> ScripterLLM:
+        built.append((api_key, model))
+        return FakeScripter()
+
+    main(
+        ["--max-polls", "1"],
+        environ={
+            "TELEGRAM_BOT_TOKEN": "token",
+            "GEMINI_API_KEY": API_KEY,
+            "GEMINI_SCRIPT_MODEL": "gemini-script-custom",
+        },
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        scripter_factory=scripter_factory,
+    )
+
+    assert built == [(API_KEY, "gemini-script-custom")]
+
+
+def test_main_delivers_the_portrait_and_script_end_to_end(tmp_path: Path) -> None:
     # One chat walks the whole pipeline in the poll loop: photo → gate → five
-    # answers → dossier → hybrid portrait. The injected converter is the one
-    # the CLI built, and its image is uploaded exactly once.
+    # answers → dossier → hybrid portrait → narration script. The injected
+    # converter and scripter are the ones the CLI built, its image is uploaded
+    # exactly once, and the script is generated and delivered in the same update.
     converter = FakeConverter()
+    scripter = FakeScripter()
     transport = FakeTransport(
         batches=[
             [photo_update(1, chat_id=5)],
@@ -528,9 +577,13 @@ def test_main_delivers_the_portrait_end_to_end(tmp_path: Path) -> None:
             dossiers=[Dossier(summary="S", suggested_animal="Capybara")]
         ),
         converter_factory=lambda api_key, model, timeout: converter,
+        scripter_factory=lambda api_key, model: scripter,
     )
 
     assert exit_code == 0
     assert len(transport.photos) == 1
     assert transport.photos[0]["image"] == converter.default.data
     assert len(converter.calls) == 1
+    assert len(scripter.calls) == 1
+    texts = [message["text"] for message in transport.calls_for("sendMessage")]
+    assert texts[-1] == "A dramatic nature documentary script."

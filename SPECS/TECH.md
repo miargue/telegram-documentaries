@@ -8,21 +8,23 @@ agent and every review is judged against it.
 - **Language:** Python 3.
 - **Transport:** Telegram Bot API over **long polling** (`getUpdates`). No
   webhooks, no public URL.
-- **Framework:** **No vendor agent framework as of Phase 4.** Each pipeline
+- **Framework:** **No vendor agent framework as of Phase 5.** Each pipeline
   stage is a discrete module behind a narrow typed port. The Bouncer exposes a
   typed `VisionGate` port, the Interviewer a typed `InterviewLLM` port
-  (`next_question` / `summarize`), and the Converter a typed `ConverterLLM`
-  port (`hybridize(photo, dossier) -> GeneratedImage`); all three adapters are
-  direct **Gemini REST** callers (`generateContent`) over stdlib `urllib` with
-  an injectable `urlopen` seam — the same no-third-party-HTTP pattern as the
-  Phase 1 transport. The shared REST plumbing (endpoint build, POST, failure
-  normalisation, candidate extraction, schema validation, image-part decoding
-  and the **single** API-key redaction implementation) lives once in
+  (`next_question` / `summarize`), the Converter a typed `ConverterLLM`
+  port (`hybridize(photo, dossier) -> GeneratedImage`), and the Scripter a
+  typed `ScripterLLM` port (`write_script(dossier) -> str`); all four adapters
+  are direct **Gemini REST** callers (`generateContent`) over stdlib `urllib`
+  with an injectable `urlopen` seam — the same no-third-party-HTTP pattern as
+  the Phase 1 transport. The shared REST plumbing (endpoint build, POST,
+  failure normalisation, candidate extraction, schema validation, image-part
+  decoding and the **single** API-key redaction implementation) lives once in
   `gemini.py` (`GeminiJsonClient` — `generate_json` for the JSON output of
-  `vision.py`/`interviewer.py`, `generate_image` for the image output of
-  Phase 4's `converter.py`) and is reused by `vision.py`, `interviewer.py` and
-  `converter.py`. The Telegram transport owns a multipart `sendPhoto`
-  (`transport.py`) for delivering the generated portrait.
+  `vision.py`/`interviewer.py`/`scripter.py`, `generate_image` for the image
+  output of Phase 4's `converter.py`) and is reused by `vision.py`,
+  `interviewer.py`, `converter.py` and `scripter.py`. The Telegram transport
+  owns a multipart `sendPhoto` (`transport.py`) for delivering the generated
+  portrait.
   **Google Agent Development Kit (ADK) is deferred**; if a later phase adopts
   it, it will wrap these same ports.
 - **Models:**
@@ -43,18 +45,25 @@ agent and every review is judged against it.
   Interviewer, a `done` chat without a portrait runs the Converter, and when an
   Interviewer turn *completes* the interview the Bouncer runs the same-update
   Converter handoff itself (hub-and-spoke: neither the Interviewer nor the
-  Converter knows the other). Each pipeline stage is a discrete module
-  (Bouncer, Interviewer, Converter, Scripter) plus the non-agent TTS renderer.
+  Converter knows the other). The handoff chain is **dossier → portrait →
+  script in one update**: once the converted portrait lands, the same update
+  continues into the Scripter, so the narration script follows the portrait
+  with **no user input** in between; the raw script is stored on the session
+  for the Phase 6 Narrator. Each pipeline stage is a discrete module (Bouncer,
+  Interviewer, Converter, Scripter) plus the non-agent TTS renderer.
   Stage boundaries are **typed ports**, not vendor SDKs: the Bouncer is
   `VisionGate.classify(image) -> HumanVerdict`, the Interviewer is
-  `InterviewLLM.next_question(...) -> str` / `summarize(...) -> Dossier`, and
-  the Converter is `ConverterLLM.hybridize(photo, dossier) -> GeneratedImage`,
-  so the Gemini REST adapters can later be swapped for ADK agents without
-  touching the routing code. The Interviewer owns its own turn-taking (the
+  `InterviewLLM.next_question(...) -> str` / `summarize(...) -> Dossier`, the
+  Converter is `ConverterLLM.hybridize(photo, dossier) -> GeneratedImage`, and
+  the Scripter is `ScripterLLM.write_script(dossier) -> str`, so the Gemini
+  REST adapters can later be swapped for ADK agents without touching the
+  routing code. The Interviewer owns its own turn-taking (the
   phase machine, the exactly-5 cap and the one-question-per-message rule);
   `InterviewLLM` merely supplies one validated question or the final dossier at
-  a time, and the Converter's routing owns its teaser, validation guards and
-  caption.
+  a time, the Converter's routing owns its teaser, validation guards and
+  caption, and the Scripter's routing owns the apology/retry and stored-script
+  re-send (the re-ask pattern: a failed *delivery* re-sends the stored script
+  LLM-free, so one subject always gets one narration).
 - **Explicit state machine:** one well-defined phase per pipeline stage, with
   explicit transitions and a single shared state driver. Phase is stored in the
   session state, never inferred implicitly.
@@ -87,17 +96,21 @@ agent and every review is judged against it.
   (Phase 3) adds the interview log (`list[QaPair]`, question-then-answer in
   order), the outstanding `pending_question` and the synthesised `Dossier`.
   **Version 3** (Phase 4) adds the `portrait_sent` flag — set only after the
-  generated hybrid portrait actually reached the chat. In-memory only — the
-  version bump is the schema contract, not a migration.
+  generated hybrid portrait actually reached the chat. **Version 4** (Phase 5)
+  adds the raw narration `script` (stored for the Phase 6 Narrator) and the
+  `script_sent` flag — set only after the script actually reached the chat.
+  In-memory only — the version bump is the schema contract, not a migration.
 - Phases: `awaiting_photo` → `gate_passed` → `interviewing` → `done`. A
   `gate_passed` chat only survives a degraded interview start and is retried on
   the next update. A `done` chat with `portrait_sent == False` is "interview
-  finished, portrait pending" — the Converter retries on the next update;
-  `portrait_sent == True` is the true terminal state (stored, never inferred).
+  finished, portrait pending" — the Converter retries on the next update; a
+  `done` chat with `portrait_sent == True` and `script_sent == False` is
+  "portrait delivered, narration pending" — the Scripter retries on the next
+  update; `portrait_sent` and `script_sent` are stored, never inferred.
 - One shared state driver (single module owns read/write/reset).
 - Reset semantics: `/start` and `/restart` clear state, the interview log, the
-  pending question, the dossier, the `portrait_sent` flag and temp media
-  without restarting the process.
+  pending question, the dossier, the `portrait_sent` and `script_sent` flags,
+  the stored `script`, and temp media without restarting the process.
 
 ## Testing
 

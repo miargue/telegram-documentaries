@@ -16,6 +16,7 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeScripter,
     FakeTransport,
     _RecordingHandler,
     document_update,
@@ -36,6 +37,7 @@ from telegram_documentaries.converter import TEASER_REPLY, ConverterError
 from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
 from telegram_documentaries.logging_config import SKIPPED
 from telegram_documentaries.models import Update
+from telegram_documentaries.scripter import SCRIPT_APOLOGY_REPLY, ScriptError
 from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
 from telegram_documentaries.transport import (
     MAX_MESSAGE_LENGTH,
@@ -100,6 +102,7 @@ def test_start_resets_the_session_and_prompts_for_a_photo() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -125,6 +128,7 @@ def test_restart_behaves_like_start() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -144,6 +148,7 @@ def test_start_with_a_bot_mention_is_recognised() -> None:
         session=store,
         gate=FakeGate(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -161,6 +166,7 @@ def test_plain_text_re_prompts_without_calling_the_gate() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -182,6 +188,7 @@ def test_other_content_re_prompts_without_calling_the_gate(kind: str) -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -201,6 +208,7 @@ def test_photo_without_a_human_is_rejected_and_resets_the_session() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -223,6 +231,7 @@ def test_photo_of_a_human_passes_and_retains_the_image() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=llm,
     )
 
@@ -256,6 +265,7 @@ def test_text_during_the_interview_is_delegated_to_the_interviewer() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=llm,
     )
 
@@ -275,6 +285,7 @@ def test_text_after_completion_is_delegated_to_the_interviewer() -> None:
         82, Dossier(summary="S", suggested_animal="Capybara")
     )
     store.mark_portrait_sent(82)
+    store.mark_script_sent(82)  # fully complete: portrait and script delivered
     gate = FakeGate()
     transport = FakeTransport()
 
@@ -285,6 +296,7 @@ def test_text_after_completion_is_delegated_to_the_interviewer() -> None:
         gate=gate,
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert sent is True
@@ -308,6 +320,7 @@ def test_start_mid_interview_resets_the_whole_session() -> None:
         session=store,
         gate=FakeGate(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -331,6 +344,7 @@ def test_photo_with_a_caption_is_still_treated_as_a_photo() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -350,6 +364,7 @@ def test_album_first_photo_is_gated_and_its_siblings_are_ignored() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
     second = handle_update(
@@ -358,6 +373,7 @@ def test_album_first_photo_is_gated_and_its_siblings_are_ignored() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -381,6 +397,7 @@ def test_album_follow_up_after_a_rejection_is_still_ignored() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
     sent = handle_update(
@@ -389,6 +406,7 @@ def test_album_follow_up_after_a_rejection_is_still_ignored() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -416,6 +434,7 @@ def test_album_sent_while_interviewing_gets_exactly_one_reply() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=llm,
     )
     second = handle_update(
@@ -424,6 +443,7 @@ def test_album_sent_while_interviewing_gets_exactly_one_reply() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=llm,
     )
 
@@ -446,6 +466,7 @@ def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
         91, Dossier(summary="S", suggested_animal="Capybara")
     )
     store.mark_portrait_sent(91)
+    store.mark_script_sent(91)  # fully complete: portrait and script delivered
     gate = FakeGate()
     transport = FakeTransport()
     llm = FakeLLM()
@@ -457,6 +478,7 @@ def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
         gate=gate,
         llm=llm,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
     second = handle_update(
         _update(photo_update(93, chat_id=91, media_group_id="album-done")),
@@ -465,6 +487,7 @@ def test_album_sent_after_completion_gets_exactly_one_reply() -> None:
         gate=gate,
         llm=llm,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert first is True
@@ -516,6 +539,7 @@ def test_album_is_gated_once_whichever_member_arrives_first(
             gate=gate,
             llm=FakeLLM(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
         )
         for update in uploads
     ]
@@ -543,6 +567,7 @@ def test_distinct_albums_are_each_gated() -> None:
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
         )
 
@@ -566,6 +591,7 @@ def test_photos_without_a_media_group_are_always_gated() -> None:
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
         )
 
@@ -584,6 +610,7 @@ def test_start_clears_the_album_dedupe() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
     handle_update(
@@ -592,6 +619,7 @@ def test_start_clears_the_album_dedupe() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
     handle_update(
@@ -600,6 +628,7 @@ def test_start_clears_the_album_dedupe() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
     sent = handle_update(
@@ -608,6 +637,7 @@ def test_start_clears_the_album_dedupe() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -627,6 +657,7 @@ def test_album_skip_is_logged() -> None:
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -636,6 +667,7 @@ def test_album_skip_is_logged() -> None:
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -666,6 +698,7 @@ def test_multi_size_photo_is_gated_once_with_the_largest_resolution() -> None:
         session=SessionStore(),
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -684,6 +717,7 @@ def test_empty_photo_list_re_prompts_without_gating() -> None:
         session=SessionStore(),
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -700,6 +734,7 @@ def test_messageless_update_is_skipped() -> None:
         session=SessionStore(),
         gate=FakeGate(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -717,6 +752,7 @@ def test_messageless_update_logs_a_skip_lifecycle_not_a_degraded_warning() -> No
             session=SessionStore(),
             gate=FakeGate(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
         )
 
@@ -738,6 +774,7 @@ def test_album_follow_up_logs_a_skip_lifecycle_not_a_degraded_warning() -> None:
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
         )
         sent = handle_update(
@@ -746,6 +783,7 @@ def test_album_follow_up_logs_a_skip_lifecycle_not_a_degraded_warning() -> None:
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
         )
 
@@ -772,6 +810,7 @@ def test_vision_error_becomes_an_apology_and_leaves_the_session_usable() -> None
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -791,6 +830,7 @@ def test_vision_error_becomes_an_apology_and_leaves_the_session_usable() -> None
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
         logger=logger,
     )
@@ -811,6 +851,7 @@ def test_photo_fetch_failure_becomes_an_apology() -> None:
             session=store,
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -834,6 +875,7 @@ def test_download_failure_becomes_an_apology() -> None:
         session=SessionStore(),
         gate=FakeGate(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -854,6 +896,7 @@ def test_hostile_file_path_is_rejected_without_downloading_or_gating() -> None:
             session=SessionStore(),
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -877,6 +920,7 @@ def test_empty_downloaded_image_is_treated_as_a_gate_failure() -> None:
             session=SessionStore(),
             gate=gate,
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -899,6 +943,7 @@ def test_send_failure_is_logged_loudly_and_returns_false() -> None:
             session=SessionStore(),
             gate=FakeGate(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -924,6 +969,7 @@ def test_send_failure_marks_the_lifecycle_degraded_not_success() -> None:
             session=SessionStore(),
             gate=FakeGate(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
         )
 
@@ -945,6 +991,7 @@ def test_unexpected_send_exception_is_swallowed_and_logged() -> None:
             session=SessionStore(),
             gate=FakeGate(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -963,6 +1010,7 @@ def test_process_control_exceptions_are_not_swallowed() -> None:
             session=SessionStore(),
             gate=FakeGate(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
         )
 
@@ -1000,6 +1048,7 @@ def test_sessions_never_leak_between_chats() -> None:
         session=store,
         gate=gate,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
 
@@ -1039,6 +1088,7 @@ def test_done_without_a_portrait_routes_the_update_to_the_converter() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=converter,
+        scripter=FakeScripter(),
     )
 
     assert sent is True
@@ -1046,6 +1096,41 @@ def test_done_without_a_portrait_routes_the_update_to_the_converter() -> None:
     assert transport.photos[0]["image"] == converter.default.data
     assert store.get(100).portrait_sent is True
     assert TEASER_REPLY in [c["text"] for c in transport.calls_for("sendMessage")]
+
+
+def test_retried_portrait_is_followed_by_the_script_in_the_same_update() -> None:
+    # A ``done`` chat whose portrait never landed is routed to the Converter on
+    # the next update; when that retry succeeds the *same* update must continue
+    # into scripting, exactly like the fresh-completion handoff, so the
+    # narration follows the retried portrait with no user input in between and
+    # the Scripter is called exactly once.
+    store = _completed_store(102)  # done with no portrait delivered yet
+    transport = FakeTransport()
+    converter = FakeConverter()
+    scripter = FakeScripter()
+
+    sent = handle_update(
+        _update(text_update(102, chat_id=102, text="hello again")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=converter,
+        scripter=scripter,
+    )
+
+    assert sent is True
+    state = store.get(102)
+    assert state.portrait_sent is True
+    assert len(transport.photos) == 1
+    # Portrait then narration, both in this one update, with a single script
+    # generation (never a re-generation on the retry).
+    texts = [call["text"] for call in transport.calls_for("sendMessage")]
+    assert TEASER_REPLY in texts
+    assert texts[-1] == "A dramatic nature documentary script."
+    assert len(scripter.calls) == 1
+    assert state.script == "A dramatic nature documentary script."
+    assert state.script_sent is True
 
 
 def test_final_answer_hands_off_to_the_converter_in_the_same_update() -> None:
@@ -1067,6 +1152,7 @@ def test_final_answer_hands_off_to_the_converter_in_the_same_update() -> None:
         gate=gate,
         llm=llm,
         converter=converter,
+        scripter=FakeScripter(),
     )
     assert store.get(1).phase is Phase.interviewing
     for number in range(1, 5):
@@ -1077,6 +1163,7 @@ def test_final_answer_hands_off_to_the_converter_in_the_same_update() -> None:
             gate=gate,
             llm=llm,
             converter=converter,
+            scripter=FakeScripter(),
         )
     assert store.get(1).phase is Phase.interviewing
 
@@ -1087,6 +1174,7 @@ def test_final_answer_hands_off_to_the_converter_in_the_same_update() -> None:
         gate=gate,
         llm=llm,
         converter=converter,
+        scripter=FakeScripter(),
     )
 
     assert sent is True
@@ -1098,6 +1186,11 @@ def test_final_answer_hands_off_to_the_converter_in_the_same_update() -> None:
     texts = [call["text"] for call in transport.calls_for("sendMessage")]
     assert any("behavioural dossier is ready" in text for text in texts)
     assert TEASER_REPLY in texts
+    # The script rides in the SAME update as the dossier and the portrait:
+    # no user message in between.
+    assert texts[-1] == "A dramatic nature documentary script."
+    assert state.script == "A dramatic nature documentary script."
+    assert state.script_sent is True
 
 
 def test_handoff_conversion_failure_leaves_the_chat_retryable() -> None:
@@ -1118,6 +1211,7 @@ def test_handoff_conversion_failure_leaves_the_chat_retryable() -> None:
         gate=gate,
         llm=llm,
         converter=converter,
+        scripter=FakeScripter(),
     )
     for number in range(1, 6):
         sent = handle_update(
@@ -1127,6 +1221,7 @@ def test_handoff_conversion_failure_leaves_the_chat_retryable() -> None:
             gate=gate,
             llm=llm,
             converter=converter,
+            scripter=FakeScripter(),
         )
 
     assert sent is False
@@ -1141,11 +1236,157 @@ def test_handoff_conversion_failure_leaves_the_chat_retryable() -> None:
         gate=gate,
         llm=llm,
         converter=converter,
+        scripter=FakeScripter(),
     )
 
     assert retried is True
     assert store.get(30).portrait_sent is True
     assert len(transport.photos) == 1
+
+
+def _scripted_store(
+    chat_id: int, *, portrait_sent: bool = True, script_sent: bool = False
+) -> SessionStore:
+    """A store whose chat has a portrait but no (or an unsent) narration."""
+    store = _completed_store(chat_id, portrait_sent=portrait_sent)
+    if script_sent:
+        store.store_script(chat_id, "Once spoken.")
+        store.mark_script_sent(chat_id)
+    return store
+
+
+def test_done_with_a_portrait_but_no_script_routes_the_update_to_the_scripter() -> None:
+    # A ``done`` chat that received its portrait but never its narration (e.g.
+    # the script call failed at handoff time) must retry the scripting on the
+    # next update rather than fall through to the Interviewer's light reply.
+    store = _scripted_store(101)
+    transport = FakeTransport()
+    scripter = FakeScripter()
+
+    sent = handle_update(
+        _update(text_update(101, chat_id=101, text="hello again")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=scripter,
+    )
+
+    assert sent is True
+    assert len(scripter.calls) == 1
+    texts = [call["text"] for call in transport.calls_for("sendMessage")]
+    assert texts[-1] == "A dramatic nature documentary script."
+    assert store.get(101).script_sent is True
+
+
+def test_done_with_a_stored_script_resends_it_without_calling_the_scripter() -> None:
+    # A failed narration *send* leaves the script stored but undelivered; the
+    # next update re-sends that exact text through the Bouncer route and never
+    # asks the Scripter to generate a second narration.
+    store = _scripted_store(103)
+    store.store_script(103, "The stored narration, verbatim.")
+    transport = FakeTransport()
+    scripter = FakeScripter()
+
+    sent = handle_update(
+        _update(text_update(103, chat_id=103, text="hello again")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=scripter,
+    )
+
+    assert sent is True
+    assert scripter.calls == []
+    texts = [call["text"] for call in transport.calls_for("sendMessage")]
+    assert texts[-1] == "The stored narration, verbatim."
+    assert store.get(103).script == "The stored narration, verbatim."
+    assert store.get(103).script_sent is True
+
+
+def test_handoff_scripting_failure_leaves_the_chat_retryable() -> None:
+    # If the script call fails right after the portrait handoff, the flag is
+    # never set; a later update retries and delivers the narration exactly once.
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=True)])
+    llm = FakeLLM(
+        dossiers=[Dossier(summary="S", suggested_animal="Capybara")]
+    )
+    scripter = FakeScripter(scripts=[ScriptError("boom")])
+    transport = _photo_transport()
+
+    handle_update(
+        _update(photo_update(31, chat_id=31)),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=FakeConverter(),
+        scripter=scripter,
+    )
+    for number in range(1, 6):
+        sent = handle_update(
+            _update(text_update(31 + number, chat_id=31, text=f"a{number}")),
+            transport,
+            session=store,
+            gate=gate,
+            llm=llm,
+            converter=FakeConverter(),
+            scripter=scripter,
+        )
+
+    assert sent is False
+    state = store.get(31)
+    assert state.phase is Phase.done
+    assert state.portrait_sent is True
+    assert state.script_sent is False
+    assert state.script is None
+    # The failure apologises in-band and asks the user to prompt the retry.
+    texts = [call["text"] for call in transport.calls_for("sendMessage")]
+    assert texts[-1] == SCRIPT_APOLOGY_REPLY
+    assert "A dramatic nature documentary script." not in texts
+
+    retried = handle_update(
+        _update(text_update(41, chat_id=31, text="go")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=FakeConverter(),
+        scripter=scripter,
+    )
+
+    assert retried is True
+    assert store.get(31).script_sent is True
+    assert store.get(31).script == "A dramatic nature documentary script."
+    assert transport.calls_for("sendMessage")[-1]["text"] == (
+        "A dramatic nature documentary script."
+    )
+
+
+def test_start_clears_the_script_and_script_sent_flag() -> None:
+    store = _scripted_store(51, script_sent=True)
+    transport = FakeTransport()
+
+    sent = handle_update(
+        _update(text_update(51, chat_id=51, text="/start")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+    )
+
+    assert sent is True
+    state = store.get(51)
+    assert state.phase is Phase.awaiting_photo
+    assert state.portrait_sent is False
+    assert state.script is None
+    assert state.script_sent is False
 
 
 def test_start_clears_the_portrait_sent_flag() -> None:
@@ -1159,6 +1400,7 @@ def test_start_clears_the_portrait_sent_flag() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert sent is True

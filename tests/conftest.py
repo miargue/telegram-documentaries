@@ -373,3 +373,34 @@ class FakeConverter:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+class FakeScripter:
+    """Scripted ``ScripterLLM`` double.
+
+    ``scripts`` is a FIFO queue of narration strings or exceptions to raise;
+    once exhausted the ``default`` script is returned, so tests only script
+    the calls they care about. Every call records the dossier it was handed
+    for assertions.
+    """
+
+    def __init__(
+        self,
+        scripts: list[Any] | None = None,
+        *,
+        default: str | None = None,
+    ) -> None:
+        self.scripts: list[Any] = list(scripts or [])
+        self.default: str = (
+            "A dramatic nature documentary script."
+            if default is None
+            else default
+        )
+        self.calls: list[Dossier] = []
+
+    def write_script(self, dossier: Dossier) -> str:
+        self.calls.append(dossier)
+        result = self.scripts.pop(0) if self.scripts else self.default
+        if isinstance(result, BaseException):
+            raise result
+        return result

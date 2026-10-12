@@ -5,9 +5,12 @@ the gate — and Phase 3 adds the Interviewer's ``interviewing``/``done``
 phases, the question-then-answer log (``list[QaPair]``) and the behavioural
 ``Dossier``. Phase 4 adds the ``portrait_sent`` flag: a ``done`` chat that has
 not yet received its hybrid portrait stays retryable, and the flag (never
-inferred) marks the true terminal state. The schema is versioned and explicit
-so later phases extend it instead of inferring state (see ``SPECS/TECH.md``
-§Session state).
+inferred) marks the true terminal state. Phase 5 adds the raw narration
+``script`` and the ``script_sent`` flag (set only once the script actually
+reached the chat), so a failed send re-sends the exact stored text while the
+raw script stays ready for Phase 6 audio synthesis. The schema is versioned
+and explicit so later phases extend it instead of inferring state (see
+``SPECS/TECH.md`` §Session state).
 
 This module is the **single owner** of conversation read/write/reset. State is
 in-memory only (per ``SPECS/MISSION.md`` — no long-term storage); every chat's
@@ -25,7 +28,9 @@ from pydantic import BaseModel
 # v2 (Phase 3): interview log + pending question + dossier.
 # v3 (Phase 4): the ``portrait_sent`` flag the Converter sets once the hybrid
 # portrait has actually reached the chat.
-SESSION_VERSION = 3
+# v4 (Phase 5): the raw narration ``script`` (ready for Phase 6 audio
+# synthesis) and the ``script_sent`` flag marking that it reached the chat.
+SESSION_VERSION = 4
 
 
 class Phase(str, Enum):
@@ -69,6 +74,13 @@ class SessionState(BaseModel):
     # to this chat. Stored (never inferred) so a failed conversion simply
     # leaves it False and the next update retries.
     portrait_sent: bool = False
+    # Phase 5: the raw narration script (plain one-paragraph prose, validated
+    # and bounded before storage), kept for the Phase 6 audio-synthesis stage.
+    script: str | None = None
+    # Phase 5: True once the script actually reached this chat. Stored (never
+    # inferred) so a failed *send* re-sends the stored script LLM-free while a
+    # failed *generation* (nothing stored yet) retries on the next update.
+    script_sent: bool = False
 
 
 class SessionStore:
@@ -76,10 +88,12 @@ class SessionStore:
 
     ``get`` never fails: an unknown chat starts from a clean default. ``reset``
     always produces a fresh default (purging any retained photo, interview log,
-    dossier and portrait flag); ``record_pass`` retains the accepted portrait
-    for later pipeline stages; the interview methods are the only writers of
-    the question/answer log, the pending question and the final ``Dossier``;
-    ``mark_portrait_sent`` is the only writer of the Phase 4 portrait flag.
+    dossier, portrait flag, script and script flag); ``record_pass`` retains the
+    accepted portrait for later pipeline stages; the interview methods are the
+    only writers of the question/answer log, the pending question and the final
+    ``Dossier``; ``mark_portrait_sent`` is the only writer of the Phase 4
+    portrait flag; ``store_script``/``mark_script_sent`` are the only writers
+    of the Phase 5 script and its delivered flag.
     """
 
     def __init__(self) -> None:
@@ -97,8 +111,8 @@ class SessionStore:
         """Replace this chat's state with a fresh default and purge its data.
 
         A fresh default clears everything the previous subject left behind —
-        photo, interview log, dossier, media-group dedupe and the
-        ``portrait_sent`` flag.
+        photo, interview log, dossier, media-group dedupe, the
+        ``portrait_sent`` flag and the Phase 5 ``script``/``script_sent``.
         """
         state = SessionState()
         self._sessions[chat_id] = state
@@ -179,4 +193,28 @@ class SessionStore:
         """
         state = self.get(chat_id)
         state.portrait_sent = True
+        return state
+
+    def store_script(self, chat_id: int, script: str) -> SessionState:
+        """Store the raw narration script for this chat (Phase 5).
+
+        The script is captured *before* the send attempt so a failed delivery
+        re-sends the exact stored text on the next update (the Interviewer's
+        re-ask pattern — no re-generation). ``script_sent`` is left untouched:
+        that flag only moves after the script actually reached the chat.
+        """
+        state = self.get(chat_id)
+        state.script = script
+        return state
+
+    def mark_script_sent(self, chat_id: int) -> SessionState:
+        """Record that the narration script reached this chat.
+
+        Called only *after* a successful ``sendMessage`` (the flag is evidence,
+        not intent): ``script_sent`` makes Phase 6 read a script the user truly
+        heard, while ``done && portrait_sent && !script_sent`` stays retryable.
+        Only the flag moves — the stored script survives for the Narrator.
+        """
+        state = self.get(chat_id)
+        state.script_sent = True
         return state

@@ -15,6 +15,7 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeScripter,
     FakeTransport,
     _RecordingHandler,
     messageless_update,
@@ -70,6 +71,7 @@ def test_non_object_get_updates_payload_is_logged_and_never_crashes() -> None:
             session=_store(),
             gate=FakeGate(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -98,6 +100,7 @@ def test_get_updates_is_long_polling_with_offset_param() -> None:
         llm=FakeLLM(),
 
         converter=FakeConverter(),
+        scripter=FakeScripter(),
 
     )
 
@@ -117,6 +120,7 @@ def test_offset_ack_advances_to_one_past_the_processed_update() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
     assert next_offset == 11
 
@@ -126,6 +130,7 @@ def test_offset_ack_advances_to_one_past_the_processed_update() -> None:
         session=_store(),
         gate=FakeGate(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
     )
     second_fetch = transport.calls_for("getUpdates")[1]
@@ -145,6 +150,7 @@ def test_offset_advances_past_the_highest_update_in_a_batch() -> None:
             gate=FakeGate(),
             llm=FakeLLM(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
         )
         == 10
     )
@@ -161,6 +167,7 @@ def test_empty_batch_keeps_the_current_offset() -> None:
             gate=FakeGate(),
             llm=FakeLLM(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
         )
         == 5
     )
@@ -179,6 +186,7 @@ def test_offset_never_goes_backwards_when_updates_arrive_unordered() -> None:
             gate=FakeGate(),
             llm=FakeLLM(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
         )
         == 9
     )
@@ -201,6 +209,7 @@ def test_malformed_update_is_acked_and_skipped_without_crashing() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert next_offset == 16  # the good update is acked...
@@ -220,6 +229,7 @@ def test_poison_update_is_acked_so_it_cannot_loop_forever() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert next_offset == 23
@@ -238,6 +248,7 @@ def test_non_dict_entry_in_batch_is_ignored_without_crash() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert next_offset == 31
@@ -254,6 +265,7 @@ def test_messageless_update_is_acked_without_a_reply() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     assert next_offset == 36  # acknowledged...
@@ -277,6 +289,7 @@ def test_send_failure_is_logged_and_the_loop_keeps_acking() -> None:
             session=_store(),
             gate=FakeGate(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
             llm=FakeLLM(),
             logger=logger,
         )
@@ -301,6 +314,7 @@ def test_get_updates_transport_failure_propagates_loudly() -> None:
             gate=FakeGate(),
             llm=FakeLLM(),
             converter=FakeConverter(),
+            scripter=FakeScripter(),
         )
     except TelegramApiError:
         pass
@@ -331,6 +345,7 @@ def test_poll_once_threads_the_injected_session_and_gate_to_the_handler() -> Non
         llm=FakeLLM(),
 
         converter=FakeConverter(),
+        scripter=FakeScripter(),
 
     )
 
@@ -355,6 +370,7 @@ def test_poll_once_threads_the_injected_llm_to_the_handler() -> None:
         gate=FakeGate(),
         llm=llm,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
     # Exactly one model call per answer: the pending question is read from the
@@ -377,6 +393,7 @@ def test_run_polling_starts_at_offset_minus_one_to_drop_the_backlog() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         max_polls=1,
     )
 
@@ -394,6 +411,7 @@ def test_run_polling_returns_to_a_valid_offset_after_the_backlog_drop() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         max_polls=2,
     )
 
@@ -409,6 +427,7 @@ def test_run_polling_stops_after_max_polls_and_carries_offset() -> None:
         session=_store(),
         gate=FakeGate(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
         max_polls=2,
     )
@@ -428,6 +447,7 @@ def test_run_polling_from_a_given_offset() -> None:
         session=_store(),
         gate=FakeGate(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         llm=FakeLLM(),
         max_polls=1,
     )
@@ -458,6 +478,7 @@ def test_poll_once_threads_the_injected_converter_to_the_handler() -> None:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=converter,
+        scripter=FakeScripter(),
     )
 
     assert len(transport.photos) == 1

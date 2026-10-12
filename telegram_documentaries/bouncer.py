@@ -13,11 +13,15 @@ Routes each incoming Telegram message:
   or an album sibling already handled) is delegated to the Interviewer, which
   owns the turn-taking. When that turn completes the interview, the Converter
   runs in the same update so the dossier report and the hybrid portrait arrive
-  together.
-- ``done``: a chat whose portrait was already delivered delegates to the
-  Interviewer's light completion reply; a chat whose hybrid portrait was never
-  delivered (e.g. the image call failed at handoff time) is routed to the
-  Converter, which retries and completes the delivery.
+  together — and when the portrait lands, the Scripter runs in the same update
+  too, so the narration script follows the portrait immediately.
+- ``done``: a chat whose portrait was already delivered but whose script never
+  was (e.g. narration failed at handoff time) is routed to the Scripter, which
+  generates and delivers the script; a chat that has both already delegates to
+  the Interviewer's light completion reply; a chat whose hybrid portrait was
+  never delivered (e.g. the image call failed at handoff time) is routed to
+  the Converter, which retries and — once the portrait lands — continues into
+  scripting so the narration still follows in the same update.
 
 Every download/gate/generate/send failure is caught, logged loudly with a
 traceback and degraded to an apology/re-prompt — nothing is allowed to raise
@@ -39,6 +43,7 @@ from telegram_documentaries.interviewer import (
 from telegram_documentaries.logging_config import SKIPPED, Skipped, log_lifecycle
 from telegram_documentaries.media import fetch_photo, largest_photo
 from telegram_documentaries.models import Message, Update
+from telegram_documentaries.scripter import ScripterLLM, handle_scripting
 from telegram_documentaries.session import Phase, SessionStore
 from telegram_documentaries.transport import Transport, truncate_message
 from telegram_documentaries.vision import VisionGate
@@ -73,21 +78,25 @@ def handle_update(
     gate: VisionGate,
     llm: InterviewLLM,
     converter: ConverterLLM,
+    scripter: ScripterLLM,
     logger: logging.Logger | None = None,
 ) -> bool | Skipped:
     """Route one update; return whether a reply was sent.
 
-    ``session``, ``gate``, ``llm`` and ``converter`` are injected so the caller
-    owns their lifetime (the CLI builds one store and one adapter per process).
-    A ``/start`` command always resets, whatever the phase. Once a portrait has
-    passed, the chat is delegated to the Interviewer for every other update —
-    except a ``done`` chat whose hybrid portrait was never delivered, which is
-    routed to the Converter (the retry path). When an Interviewer turn
-    *completes* the interview, the Converter runs in the same update so the
-    dossier report and the hybrid portrait arrive together. A deliberate, benign
-    no-op returns :data:`SKIPPED` (so ``log_lifecycle`` logs it as ``skipped``
-    rather than a false ``degraded`` warning); a genuine reply failure returns
-    ``False``.
+    ``session``, ``gate``, ``llm``, ``converter`` and ``scripter`` are injected
+    so the caller owns their lifetime (the CLI builds one store and one adapter
+    per process). A ``/start`` command always resets, whatever the phase. Once a
+    portrait has passed, the chat is delegated to the Interviewer for every
+    other update — except a ``done`` chat whose hybrid portrait was never
+    delivered, which is routed to the Converter (the retry path), and a ``done``
+    chat whose portrait arrived but whose narration script was never delivered,
+    which is routed to the Scripter. When an Interviewer turn *completes* the
+    interview, the Converter runs in the same update so the dossier report and
+    the hybrid portrait arrive together — and if the portrait then lands, the
+    Scripter runs in that same update so the narration follows immediately. A
+    deliberate, benign no-op returns :data:`SKIPPED` (so ``log_lifecycle`` logs
+    it as ``skipped`` rather than a false ``degraded`` warning); a genuine reply
+    failure returns ``False``.
     """
     log = LOGGER if logger is None else logger
     message = update.message
@@ -132,6 +141,7 @@ def handle_update(
             session=session,
             llm=llm,
             converter=converter,
+            scripter=scripter,
             log=log,
         )
 
@@ -153,19 +163,42 @@ def _route_after_gate(
     session: SessionStore,
     llm: InterviewLLM,
     converter: ConverterLLM,
+    scripter: ScripterLLM,
     log: logging.Logger,
 ) -> bool | Skipped:
-    """Delegate an already-gated chat and complete the Converter handoff.
+    """Delegate an already-gated chat and complete the Converter/Scripter handoff.
 
-    A ``done`` chat whose hybrid portrait was never delivered goes straight to
-    the Converter (the retry path). Every other update goes to the Interviewer;
-    if that turn *completed* the interview, the Converter runs in the same
-    update so the dossier report and the hybrid portrait arrive together.
+    A ``done`` chat whose hybrid portrait was never delivered goes to the
+    Converter (the retry path); if that retry lands, the Scripter runs in the
+    same update so the narration follows the recovered portrait. A ``done`` chat
+    whose portrait arrived but whose narration script never did goes straight
+    to the Scripter. Every other update goes to the Interviewer; if that turn
+    *completed* the interview, the Converter runs in the same update so the
+    dossier report and the hybrid portrait arrive together — and if the
+    portrait then landed, the Scripter runs in that same update so the
+    narration follows immediately.
     """
     state = session.get(chat_id)
     if state.phase is Phase.done and not state.portrait_sent:
-        return handle_conversion(
+        # The retry path: the portrait never landed at handoff time. When the
+        # retried conversion succeeds, fall through (with refreshed state) so
+        # the narration still follows in this same update — exactly like the
+        # fresh-completion handoff below.
+        converted = handle_conversion(
             transport, chat_id, session=session, converter=converter, logger=log
+        )
+        if converted is not True:
+            # The portrait still did not land: the script needs it, so stay
+            # short of the scripting stage until a later update retries.
+            return converted
+        state = session.get(chat_id)
+    if (
+        state.phase is Phase.done
+        and state.portrait_sent
+        and not state.script_sent
+    ):
+        return handle_scripting(
+            transport, chat_id, session=session, scripter=scripter, logger=log
         )
 
     sent = handle_interview_update(
@@ -175,8 +208,17 @@ def _route_after_gate(
         return sent
     after = session.get(chat_id)
     if after.phase is Phase.done and not after.portrait_sent:
-        return handle_conversion(
+        converted = handle_conversion(
             transport, chat_id, session=session, converter=converter, logger=log
+        )
+        if converted is not True:
+            # The portrait did not land: the script needs it, so stay short of
+            # the scripting stage until a later update retries the conversion.
+            return converted
+        after = session.get(chat_id)
+    if after.phase is Phase.done and not after.script_sent:
+        return handle_scripting(
+            transport, chat_id, session=session, scripter=scripter, logger=log
         )
     return sent
 

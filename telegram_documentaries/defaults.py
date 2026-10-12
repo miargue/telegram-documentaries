@@ -16,6 +16,18 @@ DEFAULT_INTERVIEW_MODEL = "gemini-3.1-flash-lite"
 # Gemini image model used by the Phase 4 Converter when no override is set.
 DEFAULT_CONVERTER_MODEL = "gemini-3.1-flash-image"
 
+# Gemini model used by the Phase 5 Scripter when no override is configured.
+# The narration is a pure text call, so the cheap flash-lite tier is enough.
+DEFAULT_SCRIPT_MODEL = "gemini-3.1-flash-lite"
+
+# Narration length contract: the Scripter prompts for at least
+# ``MIN_SCRIPT_WORDS`` and hard-rejects anything over ``MAX_SCRIPT_WORDS``
+# (the over-long output bug class). ``MIN`` is a prompting target only —
+# never enforced; the adapter enforces ``MAX`` so every delivered script
+# stays voice-friendly.
+MIN_SCRIPT_WORDS = 60
+MAX_SCRIPT_WORDS = 90
+
 # The Converter's image call is slow: Flash Image routinely exceeds the 30 s
 # shared default, so the adapter gets its own longer timeout.
 DEFAULT_CONVERTER_TIMEOUT = 120.0
