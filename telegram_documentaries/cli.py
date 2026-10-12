@@ -26,6 +26,7 @@ from telegram_documentaries.config import (
     get_converter_model,
     get_converter_timeout,
     get_interview_model,
+    get_script_model,
     get_token,
     get_vision_model,
 )
@@ -33,6 +34,7 @@ from telegram_documentaries.converter import ConverterLLM, GeminiConverter
 from telegram_documentaries.interviewer import GeminiInterviewer, InterviewLLM
 from telegram_documentaries.logging_config import configure_logging
 from telegram_documentaries.polling import run_polling
+from telegram_documentaries.scripter import GeminiScripter, ScripterLLM
 from telegram_documentaries.session import SessionStore
 from telegram_documentaries.transport import (
     TelegramApiError,
@@ -50,6 +52,8 @@ GateFactory = Callable[[str, str], VisionGate]
 InterviewFactory = Callable[[str, str], InterviewLLM]
 # Builds the image Converter from the API key, model id and timeout (seconds).
 ConverterFactory = Callable[[str, str, float], ConverterLLM]
+# Builds the narration Scripter from the resolved API key and model id.
+ScripterFactory = Callable[[str, str], ScripterLLM]
 
 
 def _build_gate(api_key: str, model: str) -> VisionGate:
@@ -65,6 +69,11 @@ def _build_interviewer(api_key: str, model: str) -> InterviewLLM:
 def _build_converter(api_key: str, model: str, timeout: float) -> ConverterLLM:
     """Default converter factory: a Gemini REST image adapter."""
     return GeminiConverter(api_key, model=model, timeout=timeout)
+
+
+def _build_scripter(api_key: str, model: str) -> ScripterLLM:
+    """Default scripter factory: a Gemini REST text adapter."""
+    return GeminiScripter(api_key, model=model)
 
 
 def _probe_bot_username(transport: Transport) -> str | None:
@@ -153,6 +162,7 @@ def main(
     gate_factory: GateFactory = _build_gate,
     interview_factory: InterviewFactory = _build_interviewer,
     converter_factory: ConverterFactory = _build_converter,
+    scripter_factory: ScripterFactory = _build_scripter,
 ) -> int:
     """Run the gateway; return a process exit code instead of raising."""
     # Configure a sane level first so even an argparse usage error is emitted
@@ -197,6 +207,9 @@ def main(
         get_converter_model(environ=environ, env_file=env_file),
         get_converter_timeout(environ=environ, env_file=env_file),
     )
+    scripter = scripter_factory(
+        api_key, get_script_model(environ=environ, env_file=env_file)
+    )
 
     LOGGER.info(
         "gateway starting",
@@ -214,6 +227,7 @@ def main(
             gate=gate,
             llm=llm,
             converter=converter,
+            scripter=scripter,
             max_polls=args.max_polls,
         )
     except KeyboardInterrupt:

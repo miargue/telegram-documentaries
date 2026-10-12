@@ -24,13 +24,15 @@ def test_unknown_chat_yields_a_fresh_awaiting_photo_default() -> None:
 
     state = store.get(chat_id=42)
 
-    assert state.version == 3
+    assert state.version == 4
     assert state.phase is Phase.awaiting_photo
     assert state.photo is None
     assert state.interview == []
     assert state.dossier is None
     assert state.pending_question is None
     assert state.portrait_sent is False
+    assert state.script is None
+    assert state.script_sent is False
 
 
 def test_get_returns_the_same_state_for_the_same_chat() -> None:
@@ -99,11 +101,13 @@ def test_session_state_is_a_pydantic_model_with_a_stable_version() -> None:
     state = SessionState()
 
     assert isinstance(state, SessionState)
-    assert state.version == 3
+    assert state.version == 4
     assert state.phase is Phase.awaiting_photo
     assert state.interview == []
     assert state.dossier is None
     assert state.portrait_sent is False
+    assert state.script is None
+    assert state.script_sent is False
 
 
 def test_unknown_chat_has_no_remembered_media_group() -> None:
@@ -368,6 +372,79 @@ def test_portrait_flag_is_isolated_per_chat_id() -> None:
 
     assert store.get(1).portrait_sent is True
     assert store.get(2).portrait_sent is False
+
+
+def test_store_script_sets_the_script_and_leaves_the_flag_alone() -> None:
+    store = _dossier_store(chat_id=7)
+
+    state = store.store_script(chat_id=7, script="A dramatic narration.")
+
+    assert state.script == "A dramatic narration."
+    assert state.script_sent is False
+    # Only the script moves: the artifacts later phases consume survive.
+    assert state.phase is Phase.done
+    assert state.photo == b"portrait"
+    assert state.dossier is not None
+    assert store.get(7).script == "A dramatic narration."
+
+
+def test_mark_script_sent_sets_the_flag_without_touching_the_script() -> None:
+    store = _dossier_store(chat_id=7)
+    store.store_script(chat_id=7, script="A dramatic narration.")
+
+    state = store.mark_script_sent(chat_id=7)
+
+    assert state.script_sent is True
+    assert state.script == "A dramatic narration."
+    assert state.phase is Phase.done
+    assert state.photo == b"portrait"
+    assert len(state.interview) == 5
+    assert state.dossier is not None
+    assert store.get(7).script_sent is True
+
+
+def test_reset_clears_the_script_and_the_script_sent_flag() -> None:
+    store = _dossier_store(chat_id=7)
+    store.store_script(chat_id=7, script="A dramatic narration.")
+    store.mark_script_sent(chat_id=7)
+
+    state = store.reset(chat_id=7)
+
+    assert state.script is None
+    assert state.script_sent is False
+    assert store.get(7).script is None
+    assert store.get(7).script_sent is False
+    # The reset still purges everything else too.
+    assert state.photo is None
+    assert state.interview == []
+    assert state.dossier is None
+
+
+def test_script_rejects_a_non_string_value() -> None:
+    with pytest.raises(ValidationError):
+        SessionState(script=42)  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        SessionState.model_validate({"script": ["not", "a", "string"]})
+
+
+def test_script_sent_rejects_a_non_boolean_value() -> None:
+    with pytest.raises(ValidationError):
+        SessionState(script_sent="banana")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        SessionState.model_validate({"script_sent": 42})
+
+
+def test_scripts_are_isolated_per_chat_id() -> None:
+    store = _dossier_store(chat_id=1)
+    store.get(chat_id=2)  # a second chat, never scripted
+
+    store.store_script(chat_id=1, script="chat one narration")
+
+    assert store.get(1).script == "chat one narration"
+    assert store.get(2).script is None
+    assert store.get(2).script_sent is False
 
 
 def test_qa_pair_parses_and_validates() -> None:

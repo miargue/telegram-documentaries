@@ -16,6 +16,7 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeScripter,
     FakeTransport,
     _RecordingHandler,
     photo_update,
@@ -59,6 +60,7 @@ def _poll(
         gate=gate,
         llm=llm,
         converter=converter,
+        scripter=FakeScripter(),
     )
 
 
@@ -113,14 +115,18 @@ def test_full_pass_delivers_the_hybrid_portrait_exactly_once() -> None:
     assert "House cat" in portrait["caption"]
     assert converter.calls == [(PORTRAIT_BYTES, dossier, "image/jpeg")]
 
-    # The dossier report and the teaser precede the image; the follow-up turn
-    # gets the Interviewer's light completion reply and never a second photo.
+    # The dossier report and the teaser precede the image; the narration script
+    # follows in the same update (Phase 5 handoff), and the follow-up turn gets
+    # the Interviewer's light completion reply — never a second photo.
     texts = _texts(transport)
     assert texts[0] == SUCCESS_REPLY
     assert texts[1:6] == ["Q1", "Q2", "Q3", "Q4", "Q5"]
     assert "House cat" in texts[6]
     assert texts[7] == TEASER_REPLY
-    assert texts[8] == OBSERVATION_COMPLETE_REPLY
+    assert texts[8] == "A dramatic nature documentary script."
+    assert texts[9] == OBSERVATION_COMPLETE_REPLY
+    assert state.script == "A dramatic nature documentary script."
+    assert state.script_sent is True
 
 
 def test_failed_handoff_conversion_retries_on_the_next_update() -> None:

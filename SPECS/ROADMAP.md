@@ -93,6 +93,25 @@ deferred — see `SPECS/TECH.md`).
 **Acceptance:** narration reads as a documentary voice-over, uses the dossier,
 lands within 60–90 words. *Serves: the "documentary" voice before audio.*
 
+**Status: complete (verified 2026-10-12, branch `feature/2026-10-11-scripter`).**
+Delivered: typed `ScripterLLM` port + `GeminiScripter` Gemini REST text adapter
+over the shared `GeminiJsonClient` (persona only in `systemInstruction`, one
+`user` content citing the dossier, `responseSchema` `{"script": str}`,
+mechanical output contract — non-empty / single paragraph / ≤ 90 words);
+`SESSION_VERSION` 4 with stored `script` (raw, ready for Phase 6) and the
+`script_sent` flag; the Bouncer runs the Scripter in the **same update** after
+the portrait lands (fresh completion and retried-portrait paths), re-sends the
+stored script LLM-free on a failed delivery, and keeps the light reply after
+`script_sent`; optional `GEMINI_SCRIPT_MODEL`. `scripts/test` (**560 passed**,
+up from 483) and `scripts/hooks` green; no test touches the network (full suite
+re-run with every socket entry point patched to raise, patch sanity-checked).
+Live Gemini smoke: **not reached — the configured `GEMINI_API_KEY` is
+UUID-shaped (not an `AIza…` key) and provider-blocked, so no real narration was
+observed; not an adapter failure.** Full evidence in
+`SPECS/2026-10-11-scripter/validation.md`. Framework note: the shipped
+integration is a typed port over stdlib `urllib`, **not** Google ADK (still
+deferred — see `SPECS/TECH.md`).
+
 ## 6. The Narrator
 
 - Script routed directly to Gemini TTS (`gemini-3.1-flash-tts-preview`).

@@ -160,4 +160,42 @@ ready for voice synthesis; script captured in the state for the TTS stage.
 
 ## Delivered (filled at verification)
 
-_To be completed by the verifier._
+Filled 2026-10-12 by the Phase 5 verifier.
+
+- **`scripter.py` (new):** typed `ScripterLLM` port (`write_script(dossier) ->
+  str`) + `GeminiScripter` Gemini REST text adapter over the shared
+  `GeminiJsonClient` (persona only in `systemInstruction`; exactly one `user`
+  content citing `suggested_animal`/`summary`/`animal_reason`; JSON
+  `responseSchema` `{"script": str}`; default model `gemini-3.1-flash-lite`);
+  mechanical output contract (non-empty, single paragraph, ≤ 90 words, blank-
+  line/whitespace/CRLF-aware); `handle_scripting` routing — generate → store →
+  send → flag, stored-script re-send LLM-free (re-ask pattern), apology +
+  retry on failure, fail-loud + reset-and-reprompt on a missing dossier,
+  truncate-bounded `sendMessage`. Logs `script_started`, `script_ready` (word
+  count + suggested animal only), `script_sent`, `script_failed`,
+  `script_skipped` and the `script_resend` debug marker; **the script text is
+  never logged** and the API key stays redacted (plain + control-character
+  canaries).
+- **`session.py`:** `SESSION_VERSION = 4`; `SessionState.script: str | None`
+  (stored for Phase 6) + `script_sent: bool = False`; `store_script` /
+  `mark_script_sent` (flag moves only after a successful send); `reset` clears
+  both.
+- **`bouncer.py`:** Scripter threaded through dispatch; after the Converter's
+  same-update handoff succeeds, the **same** update continues into scripting
+  (fresh-completion and retried-portrait paths — scripter called exactly once);
+  `done && portrait_sent && !script_sent` routes to the Scripter; `done &&
+  script_sent` keeps the light reply; `/start` resets `script`/`script_sent`.
+- **`polling.py` / `cli.py`:** `scripter` threaded through `poll_once` /
+  `run_polling`; CLI builds one `GeminiScripter` (`ScripterFactory`) from the
+  API key and model.
+- **`config.py` / `defaults.py`:** `get_script_model()` (env-beats-file, blank
+  → default); `DEFAULT_SCRIPT_MODEL = "gemini-3.1-flash-lite"`,
+  `MAX_SCRIPT_WORDS = 90`, `MIN_SCRIPT_WORDS = 60` (prompting target, never
+  enforced).
+- **Tests:** `tests/unit/test_scripter.py` (55) + `tests/component/
+  test_scripter_flow.py` (4) + extensions (bouncer/session/config/cli/polling).
+  `scripts/test`: **560 passed** (483 pre-existing stay green). `scripts/hooks`
+  green (`compileall` + smoke import + `ruff` + `mypy`: no issues). Full suite
+  re-run with all four socket entry points patched to raise (throwaway plugin,
+  sanity-checked): **560 passed — no test touches the network.** Live Gemini
+  smoke: **not reached — key rejected by Google** (UUID-shaped, not `AIza…`).

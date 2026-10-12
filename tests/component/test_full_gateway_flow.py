@@ -14,7 +14,14 @@ import urllib.parse
 from typing import Any
 
 import pytest
-from conftest import FakeConverter, FakeGate, FakeLLM, messageless_update, text_update
+from conftest import (
+    FakeConverter,
+    FakeGate,
+    FakeLLM,
+    FakeScripter,
+    messageless_update,
+    text_update,
+)
 
 from telegram_documentaries.bouncer import PROMPT_PHOTO
 from telegram_documentaries.cli import main
@@ -81,6 +88,7 @@ def _run(transport: UrllibTransport, *, max_polls: int) -> int:
         gate=FakeGate(),
         llm=FakeLLM(),
         converter=FakeConverter(),
+        scripter=FakeScripter(),
         max_polls=max_polls,
     )
 

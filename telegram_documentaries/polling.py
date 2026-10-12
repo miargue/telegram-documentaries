@@ -22,6 +22,7 @@ from telegram_documentaries.converter import ConverterLLM
 from telegram_documentaries.interviewer import InterviewLLM
 from telegram_documentaries.logging_config import log_lifecycle
 from telegram_documentaries.models import Update
+from telegram_documentaries.scripter import ScripterLLM
 from telegram_documentaries.session import SessionStore
 from telegram_documentaries.transport import Transport
 from telegram_documentaries.vision import VisionGate
@@ -40,6 +41,7 @@ def poll_once(
     gate: VisionGate,
     llm: InterviewLLM,
     converter: ConverterLLM,
+    scripter: ScripterLLM,
     logger: logging.Logger | None = None,
 ) -> int:
     """Fetch one batch, handle every message in it, return the next offset."""
@@ -109,6 +111,7 @@ def poll_once(
             gate=gate,
             llm=llm,
             converter=converter,
+            scripter=scripter,
             logger=log,
         )
 
@@ -123,6 +126,7 @@ def run_polling(
     gate: VisionGate,
     llm: InterviewLLM,
     converter: ConverterLLM,
+    scripter: ScripterLLM,
     offset: int = -1,
     max_polls: int | None = None,
     logger: logging.Logger | None = None,
@@ -146,6 +150,7 @@ def run_polling(
             gate=gate,
             llm=llm,
             converter=converter,
+            scripter=scripter,
             logger=log,
         )
         polls += 1

@@ -140,4 +140,35 @@ Finish: `scripts/test` + `scripts/hooks` green; commit; push; open PR to
 
 ## Verification notes (filled at verification)
 
-_To be completed by the verifier._
+Filled 2026-10-12 by the Phase 5 verifier.
+
+- **Groups 1–5 all green.** `scripts/test`: **560 passed** (77 new — 55 in
+  `tests/unit/test_scripter.py`, 4 in `tests/component/test_scripter_flow.py`,
+  extensions in `test_bouncer.py`, `test_session.py`, `test_config.py`,
+  `test_cli.py`, `test_polling.py` + component flows). `scripts/hooks`: all
+  checks passed (`mypy`: no issues in 39 files).
+- **Network isolation proven:** throwaway plugin `/tmp/opencode/netblock.py`
+  patches `socket.socket.connect`, `connect_ex`, `socket.create_connection`,
+  `socket.getaddrinfo` to raise; sanity canary passed (all four fire); full
+  suite under the plugin: **560 passed**.
+- **Behaviour spot-checks against the plan's red-list, all pass:**
+  generate→store→send→flag order (`test_scripter.py:586`), flag-is-evidence
+  (`:612`), stored-script re-send with scripter NOT called (`:714`,
+  `test_bouncer.py:1283`, component `test_scripter_flow.py:234`), apology+no
+  flag on generation/send failure (`:688`, `:789`), missing dossier → loud
+  `script_failed` + reset-and-reprompt (`:889`), truncation at the send
+  chokepoint (`:912`), `/start` clears `script`/`script_sent`
+  (`test_bouncer.py:1370`, component `test_scripter_flow.py:285`), same-update
+  handoff after the portrait (component `test_scripter_flow.py:113`,
+  `test_bouncer.py:1101`, `:1136`).
+- **Docs reconciled with user approval** (typed-port + store-once +
+  component-test approach, locked 2026-10-11): README (Phase 5 status, scripter
+  behaviour, `GEMINI_SCRIPT_MODEL`, ≤90-word no-markdown contract, Phase 6
+  storage), `SPECS/TECH.md` (Scripter stage + `ScripterLLM` port, dossier →
+  portrait → script handoff, session v4), `SPECS/ROADMAP.md` (Phase 5 marked
+  complete). `SPECS/MISSION.md` still matches (step 5 = narration); no drift.
+- **Live smoke:** not reached — the configured `GEMINI_API_KEY` is UUID-shaped
+  (not an `AIza…` key) and provider-blocked; not an adapter failure. Open
+  manual step: full phone-side Telegram run with a working key.
+- Full evidence in `SPECS/2026-10-11-scripter/validation.md`. Not merged (user
+  merges).

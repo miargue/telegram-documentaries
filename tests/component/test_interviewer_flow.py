@@ -13,12 +13,14 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeScripter,
     FakeTransport,
     photo_update,
     text_update,
 )
 
 from telegram_documentaries.bouncer import PROMPT_PHOTO, SUCCESS_REPLY
+from telegram_documentaries.converter import TEASER_REPLY
 from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
 from telegram_documentaries.polling import poll_once
 from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
@@ -53,6 +55,7 @@ def _poll(
         gate=gate,
         llm=llm,
         converter=FakeConverter(),
+        scripter=FakeScripter(),
     )
 
 
@@ -88,19 +91,24 @@ def test_full_interview_delivers_and_stores_the_dossier() -> None:
 
     replies = _texts(transport)
     # The success line is followed by exactly one question; every later answer
-    # turn produces exactly one message (one question, or the final report),
-    # and the final turn also delivers the hybrid portrait (two messages: the
-    # dossier report plus the teaser, then a ``sendPhoto``).
+    # turn produces exactly one message (one question, or the final report).
+    # The final turn also completes the whole chain: the dossier report plus
+    # the teaser, then a ``sendPhoto``, then the narration script (Phase 5
+    # handoff) — three ``sendMessage`` calls in that one turn.
     assert replies[0] == SUCCESS_REPLY
-    assert sent_per_turn == [2, 1, 1, 1, 1, 2]
+    assert sent_per_turn == [2, 1, 1, 1, 1, 3]
     assert replies[1:6] == ["Q1", "Q2", "Q3", "Q4", "Q5"]
     assert "House cat" in replies[6]
     assert "Snores on the sofa" in replies[6]
+    assert replies[7] == TEASER_REPLY
+    assert replies[8] == "A dramatic nature documentary script."
     assert len(transport.photos) == 1
 
     state = store.get(1)
     assert state.phase is Phase.done
     assert state.dossier == dossier
+    assert state.script == "A dramatic nature documentary script."
+    assert state.script_sent is True
     assert state.interview == [
         QaPair(question=f"Q{number}", answer=f"a{number}")
         for number in range(1, 6)

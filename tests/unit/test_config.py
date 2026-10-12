@@ -14,6 +14,7 @@ from telegram_documentaries.config import (
     get_converter_model,
     get_converter_timeout,
     get_interview_model,
+    get_script_model,
     get_token,
     get_vision_model,
     parse_env_file,
@@ -319,6 +320,45 @@ def test_default_converter_model_lives_in_a_neutral_module() -> None:
     assert (
         get_converter_model(environ={}, env_file=None)
         == defaults.DEFAULT_CONVERTER_MODEL
+    )
+
+
+def test_get_script_model_defaults_to_flash_lite() -> None:
+    assert get_script_model(environ={}, env_file=None) == "gemini-3.1-flash-lite"
+
+
+def test_get_script_model_env_override_wins(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_SCRIPT_MODEL=from-file\n", encoding="utf-8")
+
+    model = get_script_model(
+        environ={"GEMINI_SCRIPT_MODEL": "from-env"}, env_file=env_file
+    )
+
+    assert model == "from-env"
+
+
+def test_get_script_model_falls_back_to_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_SCRIPT_MODEL=file-model\n", encoding="utf-8")
+
+    assert get_script_model(environ={}, env_file=env_file) == "file-model"
+
+
+def test_get_script_model_blank_override_falls_back_to_default() -> None:
+    model = get_script_model(
+        environ={"GEMINI_SCRIPT_MODEL": "   "}, env_file=None
+    )
+
+    assert model == "gemini-3.1-flash-lite"
+
+
+def test_default_script_model_lives_in_a_neutral_module() -> None:
+    from telegram_documentaries import defaults
+
+    assert (
+        get_script_model(environ={}, env_file=None)
+        == defaults.DEFAULT_SCRIPT_MODEL
     )
 
 
