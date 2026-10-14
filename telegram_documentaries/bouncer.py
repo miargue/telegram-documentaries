@@ -43,6 +43,7 @@ from telegram_documentaries.interviewer import (
 from telegram_documentaries.logging_config import SKIPPED, Skipped, log_lifecycle
 from telegram_documentaries.media import fetch_photo, largest_photo
 from telegram_documentaries.models import Message, Update
+from telegram_documentaries.narrator import NarratorLLM, handle_narrating
 from telegram_documentaries.scripter import ScripterLLM, handle_scripting
 from telegram_documentaries.session import Phase, SessionStore
 from telegram_documentaries.transport import Transport, truncate_message
@@ -79,24 +80,26 @@ def handle_update(
     llm: InterviewLLM,
     converter: ConverterLLM,
     scripter: ScripterLLM,
+    narrator: NarratorLLM | None = None,
     logger: logging.Logger | None = None,
 ) -> bool | Skipped:
     """Route one update; return whether a reply was sent.
 
-    ``session``, ``gate``, ``llm``, ``converter`` and ``scripter`` are injected
-    so the caller owns their lifetime (the CLI builds one store and one adapter
-    per process). A ``/start`` command always resets, whatever the phase. Once a
-    portrait has passed, the chat is delegated to the Interviewer for every
-    other update — except a ``done`` chat whose hybrid portrait was never
-    delivered, which is routed to the Converter (the retry path), and a ``done``
-    chat whose portrait arrived but whose narration script was never delivered,
-    which is routed to the Scripter. When an Interviewer turn *completes* the
-    interview, the Converter runs in the same update so the dossier report and
-    the hybrid portrait arrive together — and if the portrait then lands, the
-    Scripter runs in that same update so the narration follows immediately. A
-    deliberate, benign no-op returns :data:`SKIPPED` (so ``log_lifecycle`` logs
-    it as ``skipped`` rather than a false ``degraded`` warning); a genuine reply
-    failure returns ``False``.
+    ``session``, ``gate``, ``llm``, ``converter``, ``scripter`` and ``narrator``
+    are injected so the caller owns their lifetime (the CLI builds one store and
+    one adapter per process). A ``/start`` command always resets, whatever the
+    phase. Once a portrait has passed, the chat is delegated to the Interviewer
+    for every other update — except a ``done`` chat whose hybrid portrait was
+    never delivered, which is routed to the Converter (the retry path); a
+    ``done`` chat whose portrait arrived but whose narration script was never
+    delivered, which is routed to the Scripter; and, when a ``narrator`` is
+    injected, a ``done`` chat with a delivered script but no voice note, which
+    is routed to the Narrator. When an Interviewer turn *completes* the
+    interview, the Converter, Scripter and Narrator run in the same update so
+    the dossier report, hybrid portrait, narration script and voice note all
+    follow in a single pass. A deliberate, benign no-op returns
+    :data:`SKIPPED` (so ``log_lifecycle`` logs it as ``skipped`` rather than a
+    false ``degraded`` warning); a genuine reply failure returns ``False``.
     """
     log = LOGGER if logger is None else logger
     message = update.message
@@ -142,6 +145,7 @@ def handle_update(
             llm=llm,
             converter=converter,
             scripter=scripter,
+            narrator=narrator,
             log=log,
         )
 
@@ -164,19 +168,21 @@ def _route_after_gate(
     llm: InterviewLLM,
     converter: ConverterLLM,
     scripter: ScripterLLM,
+    narrator: NarratorLLM | None,
     log: logging.Logger,
 ) -> bool | Skipped:
-    """Delegate an already-gated chat and complete the Converter/Scripter handoff.
+    """Delegate an already-gated chat and complete the generation handoff.
 
     A ``done`` chat whose hybrid portrait was never delivered goes to the
     Converter (the retry path); if that retry lands, the Scripter runs in the
     same update so the narration follows the recovered portrait. A ``done`` chat
     whose portrait arrived but whose narration script never did goes straight
-    to the Scripter. Every other update goes to the Interviewer; if that turn
-    *completed* the interview, the Converter runs in the same update so the
-    dossier report and the hybrid portrait arrive together — and if the
-    portrait then landed, the Scripter runs in that same update so the
-    narration follows immediately.
+    to the Scripter. When a ``narrator`` is injected, a ``done`` chat whose
+    script landed but whose voice note never did continues into the Narrator in
+    the same update. Every other update goes to the Interviewer; if that turn
+    *completed* the interview, the Converter, Scripter and Narrator run in the
+    same update so the dossier report, hybrid portrait, narration script and
+    voice note all follow in a single pass.
     """
     state = session.get(chat_id)
     if state.phase is Phase.done and not state.portrait_sent:
@@ -192,14 +198,21 @@ def _route_after_gate(
             # short of the scripting stage until a later update retries.
             return converted
         state = session.get(chat_id)
-    if (
-        state.phase is Phase.done
-        and state.portrait_sent
-        and not state.script_sent
-    ):
-        return handle_scripting(
-            transport, chat_id, session=session, scripter=scripter, logger=log
-        )
+    if state.phase is Phase.done and state.portrait_sent:
+        if not state.script_sent:
+            scripted = handle_scripting(
+                transport, chat_id, session=session, scripter=scripter, logger=log
+            )
+            if scripted is not True:
+                return scripted
+            state = session.get(chat_id)
+            if narrator is None:
+                # No Narrator injected: the script is the end of this chain.
+                return scripted
+        if narrator is not None and not state.narrator_sent:
+            return handle_narrating(
+                transport, chat_id, session=session, narrator=narrator, logger=log
+            )
 
     sent = handle_interview_update(
         update, transport, session=session, llm=llm, logger=log
@@ -217,8 +230,22 @@ def _route_after_gate(
             return converted
         after = session.get(chat_id)
     if after.phase is Phase.done and not after.script_sent:
-        return handle_scripting(
+        scripted = handle_scripting(
             transport, chat_id, session=session, scripter=scripter, logger=log
+        )
+        if scripted is not True:
+            return scripted
+        after = session.get(chat_id)
+        if narrator is None:
+            return scripted
+    if (
+        narrator is not None
+        and after.phase is Phase.done
+        and after.script_sent
+        and not after.narrator_sent
+    ):
+        return handle_narrating(
+            transport, chat_id, session=session, narrator=narrator, logger=log
         )
     return sent
 

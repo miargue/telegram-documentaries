@@ -14,6 +14,9 @@ from telegram_documentaries.config import (
     get_converter_model,
     get_converter_timeout,
     get_interview_model,
+    get_narrator_model,
+    get_narrator_timeout,
+    get_narrator_voice,
     get_script_model,
     get_token,
     get_vision_model,
@@ -412,4 +415,138 @@ def test_get_converter_timeout_rejects_a_non_finite_value(raw: str) -> None:
     with pytest.raises(ConfigError, match="GEMINI_CONVERTER_TIMEOUT"):
         get_converter_timeout(
             environ={"GEMINI_CONVERTER_TIMEOUT": raw}, env_file=None
+        )
+
+
+def test_get_narrator_model_defaults_to_flash_tts_preview() -> None:
+    assert (
+        get_narrator_model(environ={}, env_file=None)
+        == "gemini-3.1-flash-tts-preview"
+    )
+
+
+def test_get_narrator_model_env_override_wins(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_NARRATOR_MODEL=from-file\n", encoding="utf-8")
+
+    model = get_narrator_model(
+        environ={"GEMINI_NARRATOR_MODEL": "from-env"}, env_file=env_file
+    )
+
+    assert model == "from-env"
+
+
+def test_get_narrator_model_falls_back_to_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_NARRATOR_MODEL=file-model\n", encoding="utf-8")
+
+    assert get_narrator_model(environ={}, env_file=env_file) == "file-model"
+
+
+def test_get_narrator_model_blank_override_falls_back_to_default() -> None:
+    model = get_narrator_model(
+        environ={"GEMINI_NARRATOR_MODEL": "   "}, env_file=None
+    )
+
+    assert model == "gemini-3.1-flash-tts-preview"
+
+
+def test_default_narrator_model_lives_in_a_neutral_module() -> None:
+    from telegram_documentaries import defaults
+
+    assert (
+        get_narrator_model(environ={}, env_file=None)
+        == defaults.DEFAULT_NARRATOR_MODEL
+    )
+
+
+def test_get_narrator_voice_defaults_to_the_documentary_persona() -> None:
+    from telegram_documentaries import defaults
+
+    assert (
+        get_narrator_voice(environ={}, env_file=None)
+        == defaults.DEFAULT_NARRATOR_VOICE
+    )
+    assert "British" in defaults.DEFAULT_NARRATOR_VOICE
+    assert "male" in defaults.DEFAULT_NARRATOR_VOICE
+
+
+def test_get_narrator_voice_env_override_wins(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_NARRATOR_VOICE=from-file\n", encoding="utf-8")
+
+    voice = get_narrator_voice(
+        environ={"GEMINI_NARRATOR_VOICE": "from-env"}, env_file=env_file
+    )
+
+    assert voice == "from-env"
+
+
+def test_get_narrator_voice_falls_back_to_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_NARRATOR_VOICE=file-voice\n", encoding="utf-8")
+
+    assert get_narrator_voice(environ={}, env_file=env_file) == "file-voice"
+
+
+def test_get_narrator_voice_blank_override_falls_back_to_default() -> None:
+    from telegram_documentaries import defaults
+
+    voice = get_narrator_voice(
+        environ={"GEMINI_NARRATOR_VOICE": "   "}, env_file=None
+    )
+
+    assert voice == defaults.DEFAULT_NARRATOR_VOICE
+
+
+def test_get_narrator_timeout_defaults_to_90_seconds() -> None:
+    assert get_narrator_timeout(environ={}, env_file=None) == 90.0
+
+
+def test_get_narrator_timeout_env_override_wins(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_NARRATOR_TIMEOUT=30\n", encoding="utf-8")
+
+    timeout = get_narrator_timeout(
+        environ={"GEMINI_NARRATOR_TIMEOUT": "45.5"}, env_file=env_file
+    )
+
+    assert timeout == 45.5
+
+
+def test_get_narrator_timeout_falls_back_to_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_NARRATOR_TIMEOUT=90\n", encoding="utf-8")
+
+    assert get_narrator_timeout(environ={}, env_file=env_file) == 90.0
+
+
+def test_get_narrator_timeout_blank_override_falls_back_to_default() -> None:
+    timeout = get_narrator_timeout(
+        environ={"GEMINI_NARRATOR_TIMEOUT": "   "}, env_file=None
+    )
+
+    assert timeout == 90.0
+
+
+def test_get_narrator_timeout_rejects_a_non_numeric_value() -> None:
+    with pytest.raises(ConfigError, match="GEMINI_NARRATOR_TIMEOUT"):
+        get_narrator_timeout(
+            environ={"GEMINI_NARRATOR_TIMEOUT": "soon"}, env_file=None
+        )
+
+
+@pytest.mark.parametrize("raw", ["0", "0.0", "-1", "-0.5"])
+def test_get_narrator_timeout_rejects_a_non_positive_value(raw: str) -> None:
+    with pytest.raises(ConfigError, match="GEMINI_NARRATOR_TIMEOUT"):
+        get_narrator_timeout(
+            environ={"GEMINI_NARRATOR_TIMEOUT": raw}, env_file=None
+        )
+
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "Infinity"])
+def test_get_narrator_timeout_rejects_a_non_finite_value(raw: str) -> None:
+    with pytest.raises(ConfigError, match="GEMINI_NARRATOR_TIMEOUT"):
+        get_narrator_timeout(
+            environ={"GEMINI_NARRATOR_TIMEOUT": raw}, env_file=None
         )

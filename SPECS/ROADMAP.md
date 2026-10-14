@@ -120,6 +120,30 @@ deferred — see `SPECS/TECH.md`).
 **Acceptance:** a playable voice note arrives in chat after the portrait,
 speaking the Scripter's words. *Serves: the final narrated deliverable.*
 
+**Status: complete (verified 2026-10-14, branch
+`feature/2026-10-12-narrator`).** Delivered: typed `NarratorLLM` port +
+`GeminiNarrator` Gemini TTS adapter over the shared `GeminiJsonClient` (new
+`generate_audio`: one `user` content with two text parts — the fixed
+posh-British voice guidance and the raw script **verbatim** — and
+`responseModalities: ["AUDIO"]`; the payload is validated mechanically —
+non-empty, `audio/ogg` (recorded deviation from the plan's `audio/*`, per the
+locked OGG decision), ≤ `MAX_NARRATION_BYTES`); multipart `sendVoice` in the
+transport (pure `_multipart` helper, file field `voice`, filename
+`narration.ogg`, shared token redaction); `SESSION_VERSION` 5 with the stored
+`narration` bytes and the `narrator_sent` flag; the Bouncer runs the Narrator in
+the **same update** after the script lands (fresh completion and retried path),
+re-sends the stored audio LLM-free on a failed delivery, and keeps the light
+reply after `narrator_sent`; optional `GEMINI_NARRATOR_MODEL` /
+`GEMINI_NARRATOR_VOICE` / `GEMINI_NARRATOR_TIMEOUT` (90 s default). `scripts/test`
+(**691 passed**, up from 560) and `scripts/hooks` green; no test touches the
+network (full suite re-run with every socket entry point patched to raise, patch
+sanity-checked). Live Gemini smoke: **not reached — the configured
+`GEMINI_API_KEY` is provider-blocked ("API key not valid", HTTP 400), so no real
+audio bytes were observed; not an adapter failure.** Full evidence in
+`SPECS/2026-10-12-narrator/validation.md`. Framework note: the shipped
+integration is a typed port over stdlib `urllib`, **not** Google ADK (still
+deferred — see `SPECS/TECH.md`).
+
 ## 7. Resilience
 
 - `/start` and `/restart`: purge session state **and** temporary media without

@@ -165,4 +165,28 @@ Finish: `scripts/test` + `scripts/hooks` green; commit; push; open PR to
 
 ## Verification notes (filled at verification)
 
-_To be completed by the verifier._
+**Verified 2026-10-14 (branch `feature/2026-10-12-narrator`, uncommitted).**
+
+- All 7 task groups are implemented as planned: `generate_audio` + typed
+  `AudioPayload`; `narrator.py` port/adapter/routing; multipart `send_voice`;
+  session v5; Bouncer same-update chain + re-drive; config getters + defaults;
+  component flow + throwaway socket blocker.
+- `scripts/test` → **691 passed** (`scripts/test`; 560 → 691, +131). 54 new
+  unit tests in `tests/unit/test_narrator.py`, 4 in
+  `tests/component/test_narrator_flow.py`, plus extensions across
+  `test_gemini.py`, `test_transport.py`, `test_session.py`, `test_bouncer.py`,
+  `test_config.py`, `test_cli.py`, `test_polling.py`, `conftest.py`.
+- `scripts/hooks` → all checks passed (`ruff`, `mypy` 42 files).
+- Network isolation: full suite green (`691 passed`) with
+  `socket.connect`/`connect_ex`/`create_connection`/`getaddrinfo` patched to
+  raise (`/tmp/opencode/socket_blocker.py`, sanity-checked with
+  `/tmp/opencode/test_socket_blocker_sanity.py`).
+- Live Gemini smoke: **not reached — key rejected by Google (HTTP 400)**, not
+  an adapter failure; recorded in `validation.md`.
+- **Deviation:** `validate_audio` requires the OGG subtype (`audio/ogg`),
+  stricter than the `audio/*` wording in this plan (Group 2) and
+  `requirements.md`; the send path normalises to clean `audio/ogg`. Recorded
+  with rationale in `validation.md`.
+- Docs reconciled: `README.md`, `SPECS/TECH.md` (NarratorLLM port, final chain,
+  session v5), `SPECS/ROADMAP.md` (Phase 6 complete); `SPECS/MISSION.md`
+  confirmed unchanged. See `validation.md` §4.

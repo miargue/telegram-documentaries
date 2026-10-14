@@ -16,6 +16,7 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeNarrator,
     FakeScripter,
     FakeTransport,
     _RecordingHandler,
@@ -34,9 +35,11 @@ from telegram_documentaries.bouncer import (
     handle_update,
 )
 from telegram_documentaries.converter import TEASER_REPLY, ConverterError
+from telegram_documentaries.gemini import AudioPayload
 from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
 from telegram_documentaries.logging_config import SKIPPED
 from telegram_documentaries.models import Update
+from telegram_documentaries.narrator import NARRATION_APOLOGY_REPLY, NarratorError
 from telegram_documentaries.scripter import SCRIPT_APOLOGY_REPLY, ScriptError
 from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
 from telegram_documentaries.transport import (
@@ -1401,9 +1404,247 @@ def test_start_clears_the_portrait_sent_flag() -> None:
         llm=FakeLLM(),
         converter=FakeConverter(),
         scripter=FakeScripter(),
+        narrator=FakeNarrator(),
     )
 
     assert sent is True
     state = store.get(50)
     assert state.phase is Phase.awaiting_photo
     assert state.portrait_sent is False
+
+
+# ------------------------------------------------------------ narrator dispatch
+#
+# Phase 6 hands the final stage to the Narrator. The same-update chain now ends
+# with ``sendVoice``: after the script lands the voice note follows with no
+# user input, and a ``done && script_sent && !narrator_sent`` update re-drives
+# narration (re-sending stored bytes, never re-synthesising).
+
+NARRATION_AUDIO = b"OggS\x00narration-audio-bytes"
+NARRATION_SCRIPT = "A dramatic nature documentary script."
+
+
+def _narrated_store(
+    chat_id: int,
+    *,
+    script_sent: bool = True,
+    narration: bytes | None = None,
+    narrator_sent: bool = False,
+) -> SessionStore:
+    """A store whose chat has a portrait and (by default) a delivered script."""
+    store = _completed_store(chat_id, portrait_sent=True)
+    store.store_script(chat_id, NARRATION_SCRIPT)
+    if script_sent:
+        store.mark_script_sent(chat_id)
+    if narration is not None:
+        store.store_narration(chat_id, narration)
+    if narrator_sent:
+        store.mark_narrator_sent(chat_id)
+    return store
+
+
+def test_done_with_a_script_but_no_voice_note_routes_to_the_narrator() -> None:
+    store = _narrated_store(200)
+    transport = FakeTransport()
+    narrator = FakeNarrator([AudioPayload(data=NARRATION_AUDIO, mime_type="audio/ogg")])
+
+    sent = handle_update(
+        _update(text_update(200, chat_id=200, text="hello again")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        narrator=narrator,
+    )
+
+    assert sent is True
+    assert narrator.calls == [NARRATION_SCRIPT]
+    assert len(transport.voices) == 1
+    assert transport.voices[0]["audio"] == NARRATION_AUDIO
+    assert store.get(200).narrator_sent is True
+
+
+def test_done_with_a_stored_voice_note_resends_it_without_resynthesising() -> None:
+    stored = b"OggS\x00stored-voice-verbatim"
+    store = _narrated_store(201, narration=stored)
+    transport = FakeTransport()
+    narrator = FakeNarrator([NarratorError("must never be called")])
+
+    sent = handle_update(
+        _update(text_update(201, chat_id=201, text="hello again")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        narrator=narrator,
+    )
+
+    assert sent is True
+    assert narrator.calls == []
+    assert len(transport.voices) == 1
+    assert transport.voices[0]["audio"] == stored
+    assert store.get(201).narrator_sent is True
+
+
+def test_same_update_chain_runs_the_narrator_after_the_script() -> None:
+    # The whole chain in one pass: a5 completes the interview, then the
+    # Converter, Scripter and Narrator all run in that same update so the voice
+    # note follows the script with no user input in between.
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=True)])
+    llm = FakeLLM(
+        dossiers=[Dossier(summary="S", suggested_animal="Capybara")]
+    )
+    converter = FakeConverter()
+    scripter = FakeScripter()
+    narrator = FakeNarrator()
+    transport = _photo_transport()
+
+    handle_update(
+        _update(photo_update(1, chat_id=210)),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+        scripter=scripter,
+        narrator=narrator,
+    )
+    for number in range(1, 5):
+        handle_update(
+            _update(text_update(10 + number, chat_id=210, text=f"a{number}")),
+            transport,
+            session=store,
+            gate=gate,
+            llm=llm,
+            converter=converter,
+            scripter=scripter,
+            narrator=narrator,
+        )
+    sent = handle_update(
+        _update(text_update(20, chat_id=210, text="a5")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+        scripter=scripter,
+        narrator=narrator,
+    )
+
+    assert sent is True
+    state = store.get(210)
+    assert state.script_sent is True
+    assert state.narrator_sent is True
+    assert len(scripter.calls) == 1
+    assert narrator.calls == [NARRATION_SCRIPT]
+    assert len(transport.voices) == 1
+
+
+def test_done_and_narrated_keeps_the_light_reply() -> None:
+    store = _narrated_store(202, narration=NARRATION_AUDIO, narrator_sent=True)
+    transport = FakeTransport()
+    narrator = FakeNarrator()
+
+    sent = handle_update(
+        _update(text_update(202, chat_id=202, text="hello again")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        narrator=narrator,
+    )
+
+    assert sent is True
+    assert [c["text"] for c in transport.calls_for("sendMessage")] == [
+        OBSERVATION_COMPLETE_REPLY
+    ]
+    assert narrator.calls == []
+    assert transport.voices == []
+
+
+def test_handoff_narrator_failure_leaves_the_chat_retryable() -> None:
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=True)])
+    llm = FakeLLM(
+        dossiers=[Dossier(summary="S", suggested_animal="Capybara")]
+    )
+    converter = FakeConverter()
+    scripter = FakeScripter()
+    narrator = FakeNarrator([NarratorError("boom")])
+    transport = _photo_transport()
+
+    handle_update(
+        _update(photo_update(1, chat_id=211)),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+        scripter=scripter,
+        narrator=narrator,
+    )
+    sent = None
+    for number in range(1, 6):
+        sent = handle_update(
+            _update(text_update(10 + number, chat_id=211, text=f"a{number}")),
+            transport,
+            session=store,
+            gate=gate,
+            llm=llm,
+            converter=converter,
+            scripter=scripter,
+            narrator=narrator,
+        )
+
+    assert sent is False
+    state = store.get(211)
+    assert state.script_sent is True
+    assert state.narrator_sent is False
+    assert state.narration is None
+    assert NARRATION_APOLOGY_REPLY in [
+        c["text"] for c in transport.calls_for("sendMessage")
+    ]
+
+    retried = handle_update(
+        _update(text_update(30, chat_id=211, text="go")),
+        transport,
+        session=store,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+        scripter=scripter,
+        narrator=narrator,
+    )
+
+    assert retried is True
+    assert store.get(211).narrator_sent is True
+    assert len(transport.voices) == 1
+
+
+def test_start_clears_the_narration_and_the_narrator_sent_flag() -> None:
+    store = _narrated_store(203, narration=NARRATION_AUDIO, narrator_sent=True)
+    transport = FakeTransport()
+
+    sent = handle_update(
+        _update(text_update(203, chat_id=203, text="/start")),
+        transport,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        narrator=FakeNarrator(),
+    )
+
+    assert sent is True
+    state = store.get(203)
+    assert state.phase is Phase.awaiting_photo
+    assert state.narration is None
+    assert state.narrator_sent is False

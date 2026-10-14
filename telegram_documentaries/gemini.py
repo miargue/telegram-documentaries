@@ -12,6 +12,9 @@ output: :meth:`GeminiJsonClient.generate_image` posts the request through the
 identical transport/normalisation/redaction path and decodes the candidate's
 first ``inlineData`` part instead of parsing JSON text.
 
+The Narrator (``narrator.py`` + ``GeminiNarrator``) reuses the same endpoint
+for *audio* output via :meth:`GeminiJsonClient.generate_audio`.
+
 Every failure — network, HTTP, Telegram-style error payload, malformed or
 schema-invalid model output, or a missing/undecodable image part — is
 normalised to :class:`GeminiError`, and the API key is redacted from any
@@ -23,7 +26,7 @@ chained cause/context — ever contains the API key. The key travels in
 :meth:`GeminiJsonClient._redact` and raises with ``from None`` to keep the raw,
 key-bearing cause out of a formatted traceback. Adapters wrap ``GeminiError``
 into their own domain error the same way (``VisionError``, ``InterviewError``,
-``ConverterError``).
+``ConverterError``, ``NarratorError``).
 """
 
 from __future__ import annotations
@@ -65,6 +68,19 @@ class InlineImagePayload(BaseModel):
     of the first candidate: ``data`` is the decoded image itself (never logged
     and never sent anywhere but ``sendPhoto``) and ``mime_type`` is the
     model-declared ``mimeType`` such as ``image/png``.
+    """
+
+    data: bytes
+    mime_type: str
+
+
+class AudioPayload(BaseModel):
+    """A model audio part, base64-decoded out of a ``generateContent`` candidate.
+
+    The Phase 6 Narrator asks Gemini for audio output
+    (``responseModalities: ["AUDIO"]``) and reads the first ``inlineData`` part
+    of the first candidate: ``data`` is the decoded audio (never logged) and
+    ``mime_type`` is the model-declared ``mimeType`` such as ``audio/ogg``.
     """
 
     data: bytes
@@ -133,6 +149,19 @@ class GeminiJsonClient:
         :class:`GeminiError`.
         """
         return self._candidate_image(
+            self._candidates(self._load(self._post(request_body)))[0]
+        )
+
+    def generate_audio(self, request_body: dict[str, Any]) -> AudioPayload:
+        """POST ``request_body`` and decode the first inline audio part.
+
+        Identical transport, normalisation and redaction path as
+        :meth:`generate_json`; only the candidate extraction differs — audio
+        bytes arrive base64-encoded in an ``inlineData`` part. A candidate with
+        no usable audio part, or one whose data is empty or not valid base64,
+        is a normalised redacted :class:`GeminiError`.
+        """
+        return self._candidate_audio(
             self._candidates(self._load(self._post(request_body)))[0]
         )
 
@@ -258,6 +287,38 @@ class GeminiJsonClient:
             return self._decode_image(inline)
         raise self._fail("candidate has no inlineData image part") from None
 
+    def _candidate_audio(self, candidate: Any) -> AudioPayload:
+        """Decode the first ``inlineData`` audio part of ``candidate``.
+
+        Text parts (a model may narrate alongside the audio) and inlineData
+        parts that declare a clearly non-audio ``mimeType`` (e.g. an image) are
+        skipped; the first ``inlineData`` part whose ``mimeType`` starts with
+        ``audio/`` is returned. A part with a missing or non-string
+        ``mimeType`` is *not* silently skipped — it falls through to
+        :meth:`_decode_audio`, which fails loudly, so a malformed part can never
+        masquerade as "no audio here".
+        """
+        content = candidate.get("content") if isinstance(candidate, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            raise self._fail("candidate has no content parts") from None
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            inline = part.get("inlineData")
+            if not isinstance(inline, dict):
+                continue
+            mime_type = inline.get("mimeType")
+            if (
+                isinstance(mime_type, str)
+                and mime_type
+                and not mime_type.startswith("audio/")
+            ):
+                # A clearly non-audio inline part (e.g. an image) is skipped.
+                continue
+            return self._decode_audio(inline)
+        raise self._fail("candidate has no inlineData audio part") from None
+
     def _decode_image(self, inline: dict[str, Any]) -> InlineImagePayload:
         mime_type = inline.get("mimeType")
         if not isinstance(mime_type, str) or not mime_type:
@@ -277,6 +338,26 @@ class GeminiJsonClient:
         if not decoded:
             raise self._fail("candidate image data is empty") from None
         return InlineImagePayload(data=decoded, mime_type=mime_type)
+
+    def _decode_audio(self, inline: dict[str, Any]) -> AudioPayload:
+        mime_type = inline.get("mimeType")
+        if not isinstance(mime_type, str) or not mime_type:
+            raise self._fail("candidate audio part has no mimeType") from None
+        data = inline.get("data")
+        if not isinstance(data, str):
+            raise self._fail("candidate audio part has no data") from None
+        try:
+            # ``validate=True`` rejects characters outside the base64 alphabet
+            # instead of silently discarding them (e.g. ``"AAAA!"``), so a
+            # corrupted audio surfaces as a failure rather than bad bytes.
+            decoded = base64.b64decode(data, validate=True)
+        except ValueError:  # binascii.Error is a ValueError subclass
+            raise self._fail(
+                "candidate audio data is not valid base64"
+            ) from None
+        if not decoded:
+            raise self._fail("candidate audio data is empty") from None
+        return AudioPayload(data=decoded, mime_type=mime_type)
 
     def _http_detail(self, exc: urllib_error.HTTPError) -> str:
         raw = self._read_error_body(exc)

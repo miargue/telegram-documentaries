@@ -15,6 +15,7 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeNarrator,
     FakeScripter,
     FakeTransport,
     _RecordingHandler,
@@ -47,6 +48,16 @@ class _NonDictTransport:
         *,
         media_type: str,
         caption: str | None = None,
+    ) -> Any:
+        return {"ok": True}
+
+    def send_voice(
+        self,
+        chat_id: int,
+        audio: bytes,
+        *,
+        media_type: str,
+        filename: str = "narration.ogg",
     ) -> Any:
         return {"ok": True}
 
@@ -484,3 +495,37 @@ def test_poll_once_threads_the_injected_converter_to_the_handler() -> None:
     assert len(transport.photos) == 1
     assert store.get(47).portrait_sent is True
     assert len(converter.calls) == 1
+
+
+def test_poll_once_threads_the_injected_narrator_to_the_handler() -> None:
+    # A finished chat with a delivered script and no voice note drives the
+    # Narrator through the loop: proof poll_once passes the injected narrator
+    # down rather than silently building its own.
+    store = SessionStore()
+    store.record_pass(chat_id=48, photo=b"portrait")
+    store.start_interview(48, question="Q1")
+    for number in range(1, 6):
+        store.record_interview_answer(48, f"Q{number}", f"a{number}")
+    store.appoint_dossier(
+        48, Dossier(summary="S", suggested_animal="Capybara")
+    )
+    store.mark_portrait_sent(48)
+    store.store_script(48, "A dramatic nature documentary script.")
+    store.mark_script_sent(48)
+    narrator = FakeNarrator()
+    transport = FakeTransport(batches=[[text_update(48, chat_id=48, text="hi")]])
+
+    poll_once(
+        transport,
+        offset=0,
+        session=store,
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        narrator=narrator,
+    )
+
+    assert narrator.calls == ["A dramatic nature documentary script."]
+    assert len(transport.voices) == 1
+    assert store.get(48).narrator_sent is True

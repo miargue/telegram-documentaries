@@ -20,6 +20,19 @@ DEFAULT_CONVERTER_MODEL = "gemini-3.1-flash-image"
 # The narration is a pure text call, so the cheap flash-lite tier is enough.
 DEFAULT_SCRIPT_MODEL = "gemini-3.1-flash-lite"
 
+# Gemini model used by the Phase 6 Narrator when no override is configured.
+DEFAULT_NARRATOR_MODEL = "gemini-3.1-flash-tts-preview"
+
+# Default narrator voice (deep, confident male voice, posh British accent,
+# measured warm wildlife-documentary delivery).
+DEFAULT_NARRATOR_VOICE = (
+    "deep, confident male voice; posh British accent; measured, warm "
+    "wildlife-documentary delivery"
+)
+
+# Narrator TTS call is slow, so it gets its own longer timeout.
+DEFAULT_NARRATOR_TIMEOUT = 90.0
+
 # Narration length contract: the Scripter prompts for at least
 # ``MIN_SCRIPT_WORDS`` and hard-rejects anything over ``MAX_SCRIPT_WORDS``
 # (the over-long output bug class). ``MIN`` is a prompting target only —
@@ -36,6 +49,11 @@ DEFAULT_CONVERTER_TIMEOUT = 120.0
 # cap). Checked before any ``sendPhoto`` so an oversized model output degrades
 # to a retry instead of a rejected upload.
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
+
+# Largest generated narration the bot will upload (Telegram's practical voice
+# note cap). Checked before any ``sendVoice`` so an oversized model output
+# degrades to a retry instead of a rejected upload.
+MAX_NARRATION_BYTES = 5 * 1024 * 1024
 
 # Number of interview questions asked before the dossier is synthesised.
 DEFAULT_QUESTION_COUNT = 5

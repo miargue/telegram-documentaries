@@ -24,7 +24,7 @@ def test_unknown_chat_yields_a_fresh_awaiting_photo_default() -> None:
 
     state = store.get(chat_id=42)
 
-    assert state.version == 4
+    assert state.version == 5
     assert state.phase is Phase.awaiting_photo
     assert state.photo is None
     assert state.interview == []
@@ -33,6 +33,8 @@ def test_unknown_chat_yields_a_fresh_awaiting_photo_default() -> None:
     assert state.portrait_sent is False
     assert state.script is None
     assert state.script_sent is False
+    assert state.narration is None
+    assert state.narrator_sent is False
 
 
 def test_get_returns_the_same_state_for_the_same_chat() -> None:
@@ -101,13 +103,15 @@ def test_session_state_is_a_pydantic_model_with_a_stable_version() -> None:
     state = SessionState()
 
     assert isinstance(state, SessionState)
-    assert state.version == 4
+    assert state.version == 5
     assert state.phase is Phase.awaiting_photo
     assert state.interview == []
     assert state.dossier is None
     assert state.portrait_sent is False
     assert state.script is None
     assert state.script_sent is False
+    assert state.narration is None
+    assert state.narrator_sent is False
 
 
 def test_unknown_chat_has_no_remembered_media_group() -> None:
@@ -445,6 +449,91 @@ def test_scripts_are_isolated_per_chat_id() -> None:
     assert store.get(1).script == "chat one narration"
     assert store.get(2).script is None
     assert store.get(2).script_sent is False
+
+
+def test_store_narration_sets_the_audio_and_leaves_the_flag_alone() -> None:
+    store = _dossier_store(chat_id=7)
+    audio = b"OggS\x00narration-audio-bytes"
+
+    state = store.store_narration(chat_id=7, audio=audio)
+
+    assert state.narration == audio
+    assert state.narrator_sent is False
+    # Only the audio moves: the artifacts later stages consume survive.
+    assert state.phase is Phase.done
+    assert state.photo == b"portrait"
+    assert state.dossier is not None
+    assert store.get(7).narration == audio
+
+
+def test_mark_narrator_sent_sets_the_flag_without_touching_the_audio() -> None:
+    store = _dossier_store(chat_id=7)
+    store.store_script(chat_id=7, script="A dramatic narration.")
+    store.mark_script_sent(chat_id=7)
+    audio = b"OggS\x00narration-audio-bytes"
+    store.store_narration(chat_id=7, audio=audio)
+
+    state = store.mark_narrator_sent(chat_id=7)
+
+    assert state.narrator_sent is True
+    assert state.narration == audio
+    assert state.script == "A dramatic narration."
+    assert state.script_sent is True
+    assert state.portrait_sent is False
+    assert state.phase is Phase.done
+    assert state.photo == b"portrait"
+    assert len(state.interview) == 5
+    assert state.dossier is not None
+    assert store.get(7).narrator_sent is True
+
+
+def test_reset_clears_the_narration_and_the_narrator_sent_flag() -> None:
+    store = _dossier_store(chat_id=7)
+    store.store_script(chat_id=7, script="A dramatic narration.")
+    store.mark_script_sent(chat_id=7)
+    store.store_narration(chat_id=7, audio=b"OggS\x00audio")
+    store.mark_narrator_sent(chat_id=7)
+
+    state = store.reset(chat_id=7)
+
+    assert state.narration is None
+    assert state.narrator_sent is False
+    assert store.get(7).narration is None
+    assert store.get(7).narrator_sent is False
+    # The reset still purges everything else too.
+    assert state.script is None
+    assert state.script_sent is False
+    assert state.portrait_sent is False
+    assert state.photo is None
+    assert state.interview == []
+    assert state.dossier is None
+
+
+def test_narration_rejects_a_non_bytes_value() -> None:
+    with pytest.raises(ValidationError):
+        SessionState(narration=42)  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        SessionState.model_validate({"narration": ["not", "bytes"]})
+
+
+def test_narrator_sent_rejects_a_non_boolean_value() -> None:
+    with pytest.raises(ValidationError):
+        SessionState(narrator_sent="banana")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        SessionState.model_validate({"narrator_sent": 42})
+
+
+def test_narrations_are_isolated_per_chat_id() -> None:
+    store = _dossier_store(chat_id=1)
+    store.get(chat_id=2)  # a second chat, never narrated
+
+    store.store_narration(chat_id=1, audio=b"chat one audio")
+
+    assert store.get(1).narration == b"chat one audio"
+    assert store.get(2).narration is None
+    assert store.get(2).narrator_sent is False
 
 
 def test_qa_pair_parses_and_validates() -> None:

@@ -3,24 +3,26 @@
 A Telegram bot that turns a portrait photo into a narrated, comedy-wildlife
 documentary about the person in it (see `SPECS/MISSION.md`).
 
-**Status: Phase 5 — the Scripter.** The bot long-polls the Telegram Bot API,
+**Status: Phase 6 — the Narrator.** The bot long-polls the Telegram Bot API,
 gates incoming portraits with a Gemini vision check, takes a passing portrait
 straight into a one-question-at-a-time behavioural interview, and — as soon as
 the interview finishes — fuses the original photo with the behavioural dossier
 in a single Gemini image call, delivers the hybrid animal portrait straight to
-the chat, and follows it immediately with a dramatic one-paragraph narration
-script narrated by a revered British wildlife documentary voice. The raw script
-is stored on the session, ready for Phase 6's audio narrator. Anything that is
-not a portrait is rejected with a reset. Phase 1's unconditional echo
-(`hey mate!`) is gone.
+the chat, follows it immediately with a dramatic one-paragraph narration
+script, and then renders that script as a **playable OGG voice note** via
+Gemini TTS (`gemini-3.1-flash-tts-preview`) in the same update, with no user
+input in between. The raw script and raw audio are stored on the session, ready
+for re-delivery. Anything that is not a portrait is rejected with a reset.
+Phase 1's unconditional echo (`hey mate!`) is gone.
 
-## What the bot does (Phase 5: the Bouncer + the Interviewer + the Converter + the Scripter)
+## What the bot does (Phase 6: the Bouncer + the Interviewer + the Converter + the Scripter + the Narrator)
 
 The gateway routes every incoming message with one rule set:
 
 - **`/start` / `/restart`** → reset the whole session (photo, interview log,
-  pending question, dossier, portrait + script deliver flags) and ask for a
-  portrait photo. No vision call is made.
+  pending question, dossier, portrait + script + narrator deliver flags, stored
+  script and narration audio) and ask for a portrait photo. No vision call is
+  made.
 - **A photo** → the largest resolution is downloaded and sent to Gemini's
   vision model with a structured prompt ("is a human clearly present?").
   - Human → a short success message, the photo bytes are kept, and the chat
@@ -69,9 +71,27 @@ The gateway routes every incoming message with one rule set:
   - A failed *send* re-sends the **stored** script on the next update — the
     Scripter is never called twice for the same subject (the Interviewer's
     re-ask pattern).
-- **After both are delivered** (`portrait_sent` + `script_sent`) → non-command
-  text gets the Interviewer's light "observation complete" reply; no further
-  model call, no re-conversion, no re-scripting, no state change.
+- **After the script is delivered** (`script_sent`) → the Narrator runs **in the
+  same update** (no user input): the stored script is sent to Gemini TTS
+  (`gemini-3.1-flash-tts-preview`) as **one `user` content with two text
+  parts** — the fixed posh-British documentary voice guidance (overridable via
+  `GEMINI_NARRATOR_VOICE`) and the raw script **verbatim** — with
+  `generationConfig: {"responseModalities": ["AUDIO"]}`, and the model returns
+  an **OGG (Opus)** audio payload. The payload is validated mechanically before
+  any send (non-empty, `audio/ogg`, ≤ 5 MB — `MAX_NARRATION_BYTES`) and
+  delivered as a Telegram **`sendVoice`** voice note (`multipart/form-data`,
+  file field `voice`, filename `narration.ogg`). The raw audio bytes are
+  **stored on the session** (`SessionState.narration`), and `narrator_sent` is
+  set only once the voice note actually reached the chat — so the narration is
+  synthesised once and delivered **exactly once**.
+  - A failed synthesis (or an unusable payload) logs `narrator_failed` loudly
+    and sends an apology; the next update retries.
+  - A failed *send* re-sends the **stored** audio bytes on the next update — the
+    Narrator is never called a second time (no re-synthesis).
+- **After the voice note is delivered** (`portrait_sent` + `script_sent` +
+  `narrator_sent`) → non-command text gets the Interviewer's light "observation
+  complete" reply; no further model call, no re-conversion, no re-scripting, no
+  re-narration, no state change.
 - **Plain text** or any non-photo content (document / sticker / voice) while a
   portrait is expected → the photo prompt again; the session is never lost or
   corrupted.
@@ -81,8 +101,9 @@ The gateway routes every incoming message with one rule set:
 - **Everything degrades gracefully**: a failed download, a Gemini/vision
   error, an interview `InterviewError`, a conversion `ConverterError` (image
   generation or `sendPhoto` upload), a scripting `ScriptError` (generation or
-  delivery), or a `sendMessage` failure is logged loudly with a traceback, the
-  user gets an apology/re-prompt, and nothing crashes the polling loop.
+  delivery), a narration `NarratorError` (TTS generation or `sendVoice` upload),
+  or a `sendMessage` failure is logged loudly with a traceback, the user gets an
+  apology/re-prompt, and nothing crashes the polling loop.
 - Updates that carry no `message` at all (edited messages, callback queries,
   ...) are acknowledged and ignored without crashing.
 
@@ -127,9 +148,11 @@ pip install -r requirements-dev.txt   # runtime + test/lint/type deps
 
 Runtime-only install: `pip install -r requirements.txt`.
 
-> `pydantic` is the only runtime dependency — for Phases 1–5.
+> `pydantic` is the only runtime dependency — for Phases 1–6.
 > The Telegram transport *and* the Gemini adapter speak plain stdlib
-> `urllib`, so no third-party HTTP client library is pinned.
+> `urllib`, so no third-party HTTP client library is pinned. Phase 6's voice
+> note needs no audio encoder: Gemini TTS returns **OGG (Opus)** directly, the
+> format Telegram's `sendVoice` accepts natively.
 
 ## Configure
 
@@ -144,16 +167,16 @@ Two secrets are **required** to start the bot:
 
 - `TELEGRAM_BOT_TOKEN` — the Bot API token.
 - `GEMINI_API_KEY` — the Google AI Studio key used by the Bouncer's vision
-  gate, the Interviewer, the Converter **and** the Scripter. A missing/blank
-  key is a hard startup error (exit code `2`) — the bot refuses to run
-  keyless.
+  gate, the Interviewer, the Converter, the Scripter **and** the Narrator. A
+  missing/blank key is a hard startup error (exit code `2`) — the bot refuses to
+  run keyless.
 
 Both are read by a minimal built-in `.env` loader
 (`telegram_documentaries/config.py`): the process environment wins over the
 file, and a missing/empty value is a hard error — the bot never falls back to
 a hardcoded value.
 
-Five optional variables, all following the same env-beats-file precedence (a
+Eight optional variables, all following the same env-beats-file precedence (a
 blank value falls back to the default):
 
 - `GEMINI_VISION_MODEL` — overrides the Bouncer's vision model; defaults to
@@ -168,6 +191,14 @@ blank value falls back to the default):
   defaults to `120.0` (Flash Image routinely exceeds the shared 30 s default).
   A value that is not a positive, finite number of seconds is a hard startup
   error.
+- `GEMINI_NARRATOR_MODEL` — overrides the Narrator's TTS model; defaults to
+  `gemini-3.1-flash-tts-preview`.
+- `GEMINI_NARRATOR_VOICE` — overrides the fixed voice-over guidance prepended to
+  the script (the default is a deep, confident male voice with a posh British
+  accent, in a measured, warm wildlife-documentary delivery).
+- `GEMINI_NARRATOR_TIMEOUT` — the Narrator's TTS-call timeout in seconds;
+  defaults to `90.0` (TTS is slow, like image generation). A value that is not a
+  positive, finite number of seconds is a hard startup error.
 
 ## Run
 
@@ -214,11 +245,13 @@ type — never photo bytes, base64 payloads or dossier text). The Scripter adds
 `script_started`, `script_ready` (word count and the suggested animal — never
 the script text), `script_sent`, `script_failed`, `script_skipped` and a
 `script_resend` debug marker; **the raw script is never written to a log**
-(user-derived content that can echo the dossier's secrets). Secrets never
-appear in any log line — the Telegram transport redacts the token and the
-shared Gemini client (`gemini.py`) redacts the API key for **all four**
-adapters (vision, interview, converter, scripter), from every message, log
-line and formatted traceback.
+(user-derived content that can echo the dossier's secrets). The Narrator adds
+`narration_started`, `narrator_ready` (byte count and mime type **only** — never
+the audio bytes, never the script text), `narration_sent`, `narrator_failed`
+and `narration_skipped`. Secrets never appear in any log line — the Telegram
+transport redacts the token and the shared Gemini client (`gemini.py`) redacts
+the API key for **all five** adapters (vision, interview, converter, scripter,
+narrator), from every message, log line and formatted traceback.
 
 ## Test
 
@@ -228,16 +261,18 @@ scripts/test -k offset       # extra pytest args are forwarded
 ```
 
 The suite is Red/Green TDD and uses fake transports / fake `urlopen` /
-`FakeGate` / `FakeLLM` / `FakeConverter` / `FakeScripter` throughout — **no
-test contacts Telegram or Gemini** (the full suite passes with every socket
-entry point patched to raise). The Gemini adapter tests (`test_gemini`,
-`test_vision`, `test_interviewer`, `test_converter`, `test_scripter`) assert
-on the outgoing request body (base64 `inline_data`, JSON `responseSchema` /
-`responseModalities`, model id, transcript role alternation) without a socket.
-New in Phase 5: `test_scripter.py` (55) and the component
-`test_scripter_flow.py` (4); the shared client's image path (`generate_image`)
-and the multipart `sendPhoto` upload are covered by `test_gemini.py` and
-`test_transport.py`.
+`FakeGate` / `FakeLLM` / `FakeConverter` / `FakeScripter` / `FakeNarrator`
+throughout — **no test contacts Telegram or Gemini** (the full suite passes with
+every socket entry point patched to raise). The Gemini adapter tests
+(`test_gemini`, `test_vision`, `test_interviewer`, `test_converter`,
+`test_scripter`, `test_narrator`) assert on the outgoing request body (base64
+`inline_data`, JSON `responseSchema` / `responseModalities`, model id, transcript
+role alternation, the two-part TTS body) without a socket. New in Phase 6:
+`test_narrator.py` (54) and the component `test_narrator_flow.py` (4), plus
+narrator cases across `test_gemini.py`, `test_transport.py`, `test_session.py`,
+`test_bouncer.py`, `test_config.py`, `test_cli.py` and `test_polling.py` — the
+shared client's audio path (`generate_audio`) and the multipart `sendVoice`
+upload are covered by `test_gemini.py` and `test_transport.py`.
 
 ## Pre-commit checks
 
@@ -269,13 +304,14 @@ telegram_documentaries/
   logging_config.py   # JSON-lines formatter + log_lifecycle decorator
   media.py            # photo intake: largest PhotoSize + safe getFile/download
   models.py           # Pydantic boundary models (Update/Message/PhotoSize/FileRef)
+  narrator.py         # typed NarratorLLM port + Gemini TTS adapter + routing
   polling.py          # getUpdates loop + offset acking
   scripter.py         # typed ScripterLLM port + Gemini narration adapter + routing
-  session.py          # per-chat_id state driver (v4: phases, photo, dossier, script)
+  session.py          # per-chat_id state driver (v5: phases, photo, dossier, script, narration)
   transport.py        # stdlib urllib transport (injectable urlopen)
   vision.py           # typed VisionGate port + Gemini REST adapter (shared client)
 tests/
-  conftest.py         # FakeTransport + FakeGate + FakeLLM + FakeConverter + FakeScripter
+  conftest.py         # FakeTransport + FakeGate + FakeLLM + FakeConverter + FakeScripter + FakeNarrator
   unit/               # isolated logic, no I/O (session, media, gemini, vision, ...)
   component/          # whole gateway over faked seams (transport + gate + LLM)
 scripts/
@@ -287,7 +323,8 @@ SPECS/                # MISSION.md, TECH.md, ROADMAP.md (the contract)
 
 ## Roadmap
 
-Phase 5 of `SPECS/ROADMAP.md` (the Scripter) is implemented on branch
-`feature/2026-10-11-scripter` and verified. Phases 1–4 (gateway, Bouncer,
-Interviewer, Converter) are on `main`. Next: the Phase 6 Narrator (TTS reads
-the stored script aloud).
+Phase 6 of `SPECS/ROADMAP.md` (the Narrator) is implemented on branch
+`feature/2026-10-12-narrator` and verified. Phases 1–5 (gateway, Bouncer,
+Interviewer, Converter, Scripter) are on `main`. The five-stage pipeline is
+complete: a playable OGG voice note now follows the narration script in the
+same update, speaking the Scripter's words.

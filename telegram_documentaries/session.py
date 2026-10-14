@@ -30,7 +30,9 @@ from pydantic import BaseModel
 # portrait has actually reached the chat.
 # v4 (Phase 5): the raw narration ``script`` (ready for Phase 6 audio
 # synthesis) and the ``script_sent`` flag marking that it reached the chat.
-SESSION_VERSION = 4
+# v5 (Phase 6): the raw narration audio (``narration``) and the
+# ``narrator_sent`` flag marking that the voice note reached the chat.
+SESSION_VERSION = 5
 
 
 class Phase(str, Enum):
@@ -81,6 +83,12 @@ class SessionState(BaseModel):
     # inferred) so a failed *send* re-sends the stored script LLM-free while a
     # failed *generation* (nothing stored yet) retries on the next update.
     script_sent: bool = False
+    # Phase 6: the raw narration audio payload (OGG), kept like the photo bytes.
+    narration: bytes | None = None
+    # Phase 6: True once the narration voice note reached this chat. Stored
+    # (never inferred) so a failed *send* re-sends the stored audio with no
+    # re-synthesis.
+    narrator_sent: bool = False
 
 
 class SessionStore:
@@ -88,12 +96,14 @@ class SessionStore:
 
     ``get`` never fails: an unknown chat starts from a clean default. ``reset``
     always produces a fresh default (purging any retained photo, interview log,
-    dossier, portrait flag, script and script flag); ``record_pass`` retains the
-    accepted portrait for later pipeline stages; the interview methods are the
-    only writers of the question/answer log, the pending question and the final
-    ``Dossier``; ``mark_portrait_sent`` is the only writer of the Phase 4
-    portrait flag; ``store_script``/``mark_script_sent`` are the only writers
-    of the Phase 5 script and its delivered flag.
+    dossier, portrait flag, script and script flag, narration and narrator flag);
+    ``record_pass`` retains the accepted portrait for later pipeline stages; the
+    interview methods are the only writers of the question/answer log, the pending
+    question and the final ``Dossier``; ``mark_portrait_sent`` is the only writer of
+    the Phase 4 portrait flag; ``store_script``/``mark_script_sent`` are the only
+    writers of the Phase 5 script and its delivered flag;
+    ``store_narration``/``mark_narrator_sent`` are the only writers of the Phase 6
+    narration and its delivered flag.
     """
 
     def __init__(self) -> None:
@@ -112,7 +122,8 @@ class SessionStore:
 
         A fresh default clears everything the previous subject left behind —
         photo, interview log, dossier, media-group dedupe, the
-        ``portrait_sent`` flag and the Phase 5 ``script``/``script_sent``.
+        ``portrait_sent`` flag, the Phase 5 ``script``/``script_sent`` and the
+        Phase 6 ``narration``/``narrator_sent``.
         """
         state = SessionState()
         self._sessions[chat_id] = state
@@ -217,4 +228,28 @@ class SessionStore:
         """
         state = self.get(chat_id)
         state.script_sent = True
+        return state
+
+    def store_narration(self, chat_id: int, audio: bytes) -> SessionState:
+        """Store the raw narration audio for this chat (Phase 6).
+
+        The bytes are captured *before* the send attempt so a failed delivery
+        re-sends the exact stored audio on the next update (the re-ask pattern —
+        no re-synthesis). ``narrator_sent`` is left untouched: that flag only
+        moves after the voice note actually reached the chat.
+        """
+        state = self.get(chat_id)
+        state.narration = audio
+        return state
+
+    def mark_narrator_sent(self, chat_id: int) -> SessionState:
+        """Record that the narration voice note reached this chat.
+
+        Called only *after* a successful ``sendVoice`` (the flag is evidence,
+        not intent): ``done && script_sent && !narrator_sent`` stays retryable
+        while ``narrator_sent`` makes the narration terminal. Only the flag
+        moves — the stored audio survives if a later stage ever needs it.
+        """
+        state = self.get(chat_id)
+        state.narrator_sent = True
         return state

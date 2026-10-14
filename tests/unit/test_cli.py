@@ -18,17 +18,20 @@ from conftest import (
     FakeConverter,
     FakeGate,
     FakeLLM,
+    FakeNarrator,
     FakeScripter,
     FakeTransport,
     photo_update,
     text_update,
 )
 
+from telegram_documentaries import defaults
 from telegram_documentaries.bouncer import PROMPT_PHOTO, SUCCESS_REPLY
 from telegram_documentaries.cli import main, positive_int
 from telegram_documentaries.converter import ConverterLLM
 from telegram_documentaries.interviewer import InterviewLLM
 from telegram_documentaries.logging_config import JsonFormatter
+from telegram_documentaries.narrator import NarratorLLM
 from telegram_documentaries.scripter import ScripterLLM
 from telegram_documentaries.session import Dossier
 from telegram_documentaries.transport import TelegramApiError
@@ -546,6 +549,66 @@ def test_main_uses_the_script_model_override(tmp_path: Path) -> None:
     assert built == [(API_KEY, "gemini-script-custom")]
 
 
+def test_main_builds_the_narrator_from_the_api_key_model_voice_and_timeout(
+    tmp_path: Path,
+) -> None:
+    built: list[tuple[str, str, str, float]] = []
+
+    def narrator_factory(
+        api_key: str, model: str, voice: str, timeout: float
+    ) -> NarratorLLM:
+        built.append((api_key, model, voice, timeout))
+        return FakeNarrator()
+
+    exit_code = main(
+        ["--max-polls", "1"],
+        environ={"TELEGRAM_BOT_TOKEN": "token", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        narrator_factory=narrator_factory,
+    )
+
+    assert exit_code == 0
+    assert built == [
+        (
+            API_KEY,
+            defaults.DEFAULT_NARRATOR_MODEL,
+            defaults.DEFAULT_NARRATOR_VOICE,
+            90.0,
+        )
+    ]
+
+
+def test_main_uses_the_narrator_model_voice_and_timeout_overrides(
+    tmp_path: Path,
+) -> None:
+    built: list[tuple[str, str, str, float]] = []
+
+    def narrator_factory(
+        api_key: str, model: str, voice: str, timeout: float
+    ) -> NarratorLLM:
+        built.append((api_key, model, voice, timeout))
+        return FakeNarrator()
+
+    main(
+        ["--max-polls", "1"],
+        environ={
+            "TELEGRAM_BOT_TOKEN": "token",
+            "GEMINI_API_KEY": API_KEY,
+            "GEMINI_NARRATOR_MODEL": "gemini-tts-custom",
+            "GEMINI_NARRATOR_VOICE": "A custom narrator voice",
+            "GEMINI_NARRATOR_TIMEOUT": "45",
+        },
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: FakeTransport(batches=[[]]),
+        gate_factory=lambda api_key, model: FakeGate(),
+        narrator_factory=narrator_factory,
+    )
+
+    assert built == [(API_KEY, "gemini-tts-custom", "A custom narrator voice", 45.0)]
+
+
 def test_main_delivers_the_portrait_and_script_end_to_end(tmp_path: Path) -> None:
     # One chat walks the whole pipeline in the poll loop: photo → gate → five
     # answers → dossier → hybrid portrait → narration script. The injected
@@ -553,6 +616,7 @@ def test_main_delivers_the_portrait_and_script_end_to_end(tmp_path: Path) -> Non
     # exactly once, and the script is generated and delivered in the same update.
     converter = FakeConverter()
     scripter = FakeScripter()
+    narrator = FakeNarrator()
     transport = FakeTransport(
         batches=[
             [photo_update(1, chat_id=5)],
@@ -578,6 +642,7 @@ def test_main_delivers_the_portrait_and_script_end_to_end(tmp_path: Path) -> Non
         ),
         converter_factory=lambda api_key, model, timeout: converter,
         scripter_factory=lambda api_key, model: scripter,
+        narrator_factory=lambda api_key, model, voice, timeout: narrator,
     )
 
     assert exit_code == 0
@@ -585,5 +650,7 @@ def test_main_delivers_the_portrait_and_script_end_to_end(tmp_path: Path) -> Non
     assert transport.photos[0]["image"] == converter.default.data
     assert len(converter.calls) == 1
     assert len(scripter.calls) == 1
+    assert len(narrator.calls) == 1
+    assert len(transport.voices) == 1
     texts = [message["text"] for message in transport.calls_for("sendMessage")]
     assert texts[-1] == "A dramatic nature documentary script."

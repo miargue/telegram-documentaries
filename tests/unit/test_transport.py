@@ -631,3 +631,136 @@ def test_send_photo_redacts_a_control_character_token() -> None:
     assert error.__suppress_context__ is True
     # The escaped form (``\n`` spelled out) must be redacted too.
     assert "CANARY" not in error.description.encode("unicode_escape").decode()
+
+
+# ------------------------------------------------------------ voice upload
+#
+# ``sendVoice`` is the Phase 6 delivery call: the raw OGG synthesised by Gemini
+# is uploaded as a file part (field ``voice``). It reuses the pure
+# ``_multipart`` helper and the same ``_read``/``_decode`` normalisation (and
+# token redaction) as ``send_photo``.
+
+VOICE_BYTES = b"OggS\x00\x02narration-voice-bytes"
+
+
+def test_send_voice_posts_a_multipart_body_to_sendvoice() -> None:
+    transport, opener = make_transport(
+        [FakeResponse(b'{"ok": true, "result": {"message_id": 11}}')]
+    )
+
+    result = transport.send_voice(5, VOICE_BYTES, media_type="audio/ogg")
+
+    url, body, _timeout = opener.requests[0]
+    assert url == "https://api.telegram.org/botTEST-TOKEN/sendVoice"
+    assert opener.methods[0] == "POST"
+    assert body is not None
+    boundary = multipart_boundary(opener.headers[0])
+
+    parts = parse_multipart(body, boundary)
+    assert len(parts) == 2
+    fields = {
+        headers["content-disposition"]: content for headers, content in parts[:1]
+    }
+    assert fields['form-data; name="chat_id"'] == b"5"
+
+    voice_headers, voice_content = parts[1]
+    assert disposition_param(voice_headers["content-disposition"], "name") == "voice"
+    assert (
+        disposition_param(voice_headers["content-disposition"], "filename")
+        == "narration.ogg"
+    )
+    assert voice_headers["content-type"] == "audio/ogg"
+    assert voice_content == VOICE_BYTES
+    assert result == {"ok": True, "result": {"message_id": 11}}
+
+
+def test_send_voice_uses_a_custom_filename_and_content_type() -> None:
+    transport, opener = make_transport([FakeResponse(b'{"ok": true}')])
+
+    transport.send_voice(
+        7, VOICE_BYTES, media_type="audio/ogg; codecs=opus", filename="story.ogg"
+    )
+
+    _url, body, _timeout = opener.requests[0]
+    assert body is not None
+    boundary = multipart_boundary(opener.headers[0])
+    voice_headers, _ = parse_multipart(body, boundary)[-1]
+
+    assert (
+        disposition_param(voice_headers["content-disposition"], "filename")
+        == "story.ogg"
+    )
+    assert voice_headers["content-type"] == "audio/ogg; codecs=opus"
+
+
+def test_send_voice_raises_when_the_api_reports_not_ok() -> None:
+    body = json.dumps(
+        {"ok": False, "error_code": 400, "description": "VOICE_MESSAGES_FORBIDDEN"}
+    ).encode()
+    transport, _ = make_transport([FakeResponse(body)])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_voice(1, VOICE_BYTES, media_type="audio/ogg")
+
+    error = exc_info.value
+    assert error.method == "sendVoice"
+    assert error.description == "VOICE_MESSAGES_FORBIDDEN"
+    assert error.error_code == 400
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("connection refused"),
+        urllib.error.HTTPError(
+            "https://api.telegram.org/botTEST-TOKEN/sendVoice",
+            502,
+            "Bad Gateway",
+            cast(Any, None),
+            io.BytesIO(b'{"ok": false, "description": "bad gateway"}'),
+        ),
+        http.client.IncompleteRead(b"half a body"),
+        TimeoutError("timed out"),
+    ],
+)
+def test_send_voice_normalises_every_transport_failure(
+    failure: BaseException,
+) -> None:
+    transport, _ = make_transport([failure])
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_voice(1, VOICE_BYTES, media_type="audio/ogg")
+
+    error = exc_info.value
+    assert error.method == "sendVoice"
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+
+
+def test_send_voice_never_leaks_the_token_in_a_failure() -> None:
+    endpoint = "https://api.telegram.org/botTEST-TOKEN/sendVoice"
+    transport, _ = make_transport(
+        [urllib.error.URLError(f"connection refused: {endpoint}")]
+    )
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_voice(1, VOICE_BYTES, media_type="audio/ogg")
+
+    error = exc_info.value
+    assert "TEST-TOKEN" not in str(error)
+    assert "***" in str(error)
+
+
+def test_send_voice_redacts_a_control_character_token() -> None:
+    token = "TEST-TOKEN-\nCANARY"
+    opener = RecordingUrlopen([real_invalid_url(f"/bot{token}/sendVoice")])
+    transport = UrllibTransport(token, urlopen=opener)
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        transport.send_voice(1, VOICE_BYTES, media_type="audio/ogg")
+
+    error = exc_info.value
+    assert "CANARY" not in str(error)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert "CANARY" not in error.description.encode("unicode_escape").decode()

@@ -168,4 +168,35 @@ sent once** (`narrator_sent` set only after a successful `sendVoice`).
 
 ## Delivered (filled at verification)
 
-_To be completed by the verifier._
+**Delivered (verified 2026-10-14, branch `feature/2026-10-12-narrator`).**
+
+- `gemini.py`: `AudioPayload` (`data: bytes`, `mime_type: str`) and
+  `GeminiJsonClient.generate_audio` — same POST/normalisation/redaction path as
+  `generate_image`, reading the first audio `inlineData` part; strict base64
+  decode, model-declared mime. `NarratorError` on unusable output.
+- `narrator.py`: `NarratorError`, `NarratorLLM.synthesize(script) -> AudioPayload`,
+  `GeminiNarrator(api_key, *, model, voice, base_url, timeout, urlopen)` over
+  `generate_audio`; `validate_audio` enforcing non-empty `audio/ogg` ≤
+  `MAX_NARRATION_BYTES`; `handle_narrating` with store-once / send-once,
+  stored-audio re-send (no re-synthesis), missing-script reset, apology + retry.
+  **Deviation:** validation requires the OGG subtype (`audio/ogg`), stricter
+  than the `audio/*` wording in Scope — see `validation.md`.
+- `defaults.py`: `DEFAULT_NARRATOR_MODEL = "gemini-3.1-flash-tts-preview"`,
+  `DEFAULT_NARRATOR_VOICE` (posh-British deep-voice persona),
+  `DEFAULT_NARRATOR_TIMEOUT = 90.0`, `MAX_NARRATION_BYTES = 5 * 1024 * 1024`.
+- `session.py`: `SESSION_VERSION = 5`; `narration: bytes | None`,
+  `narrator_sent: bool`; `store_narration` / `mark_narrator_sent`; `reset`
+  clears both.
+- `transport.py`: `Transport.send_voice` + `UrllibTransport.send_voice`
+  (multipart, file field `voice`, filename `narration.ogg`, shared token
+  redaction).
+- `bouncer.py` / `polling.py` / `cli.py` / `config.py`: Narrator runs in the
+  same update after the script lands; `done && script_sent && !narrator_sent`
+  re-drives narration; `GEMINI_NARRATOR_MODEL` / `GEMINI_NARRATOR_VOICE` /
+  `GEMINI_NARRATOR_TIMEOUT` getters (env-beats-file; timeout validated).
+- Structured logging: `narration_started`, `narrator_ready` (byte count + mime
+  only), `narration_sent`, `narrator_failed`, `narration_skipped`.
+- `scripts/test`: **691 passed** (was 560); `scripts/hooks` green; full suite
+  green with every socket entry point patched to raise. Live Gemini smoke: not
+  reached — key rejected by Google (HTTP 400). Full evidence in
+  `validation.md`.
