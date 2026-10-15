@@ -6,7 +6,7 @@
 photo into a narrated, comedy-wildlife documentary about the person in it. A
 user uploads a photo of themselves to **@MiargueBot** and, after a short
 interview, receives a hybrid animal portrait and a dramatic British-narrated
-voice note describing their "natural habitat."
+MP3 audio message describing their "natural habitat."
 
 ## The end-to-end experience
 
@@ -19,7 +19,7 @@ voice note describing their "natural habitat."
    a hybrid animal portrait, sent directly to the chat.
 5. **The Scripter** writes a 60–90 word dramatic documentary narration.
 6. **The Narrator** (TTS, not an agent) reads the script aloud and delivers an
-   OGG/MP3 voice note.
+   MP3 audio message via the Gemini Interactions API.
 
 ## In scope
 
@@ -33,7 +33,7 @@ voice note describing their "natural habitat."
 
 ## Out of scope (YAGNI)
 
-- **No video, animation, or sound effects** — photo + voice note only.
+- **No video, animation, or sound effects** — photo + audio message only.
 - **No deployment target** — local development via long polling; no webhooks,
   no public URL, no hosting.
 - **No long-term storage** — photos, dossiers, and media live in memory only
@@ -44,8 +44,8 @@ voice note describing their "natural habitat."
 
 ## Success criteria
 
-- Happy path: photo → interview → hybrid portrait → narrated voice note, all
-  delivered as Telegram messages.
+- Happy path: photo → interview → hybrid portrait → narrated MP3 audio
+  message, all delivered as Telegram messages.
 - `/restart` (and `/start`) resets state and clears temporary media correctly.
 - Out-of-order text/media at any stage is handled without a crash or a leaked
   session.

@@ -1416,11 +1416,11 @@ def test_start_clears_the_portrait_sent_flag() -> None:
 # ------------------------------------------------------------ narrator dispatch
 #
 # Phase 6 hands the final stage to the Narrator. The same-update chain now ends
-# with ``sendVoice``: after the script lands the voice note follows with no
+# with ``sendAudio``: after the script lands the audio message follows with no
 # user input, and a ``done && script_sent && !narrator_sent`` update re-drives
 # narration (re-sending stored bytes, never re-synthesising).
 
-NARRATION_AUDIO = b"OggS\x00narration-audio-bytes"
+NARRATION_AUDIO = b"ID3\x03\x00\x00\x00narration-audio-bytes"
 NARRATION_SCRIPT = "A dramatic nature documentary script."
 
 
@@ -1443,10 +1443,12 @@ def _narrated_store(
     return store
 
 
-def test_done_with_a_script_but_no_voice_note_routes_to_the_narrator() -> None:
+def test_done_with_a_script_but_no_audio_routes_to_the_narrator() -> None:
     store = _narrated_store(200)
     transport = FakeTransport()
-    narrator = FakeNarrator([AudioPayload(data=NARRATION_AUDIO, mime_type="audio/ogg")])
+    narrator = FakeNarrator(
+        [AudioPayload(data=NARRATION_AUDIO, mime_type="audio/mpeg")]
+    )
 
     sent = handle_update(
         _update(text_update(200, chat_id=200, text="hello again")),
@@ -1461,13 +1463,15 @@ def test_done_with_a_script_but_no_voice_note_routes_to_the_narrator() -> None:
 
     assert sent is True
     assert narrator.calls == [NARRATION_SCRIPT]
-    assert len(transport.voices) == 1
-    assert transport.voices[0]["audio"] == NARRATION_AUDIO
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["audio"] == NARRATION_AUDIO
+    assert transport.audios[0]["media_type"] == "audio/mpeg"
+    assert transport.audios[0]["filename"] == "narration.mp3"
     assert store.get(200).narrator_sent is True
 
 
-def test_done_with_a_stored_voice_note_resends_it_without_resynthesising() -> None:
-    stored = b"OggS\x00stored-voice-verbatim"
+def test_done_with_stored_audio_resends_it_without_resynthesising() -> None:
+    stored = b"ID3\x03\x00\x00\x00stored-audio-verbatim"
     store = _narrated_store(201, narration=stored)
     transport = FakeTransport()
     narrator = FakeNarrator([NarratorError("must never be called")])
@@ -1485,15 +1489,16 @@ def test_done_with_a_stored_voice_note_resends_it_without_resynthesising() -> No
 
     assert sent is True
     assert narrator.calls == []
-    assert len(transport.voices) == 1
-    assert transport.voices[0]["audio"] == stored
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["audio"] == stored
+    assert transport.audios[0]["media_type"] == "audio/mpeg"
     assert store.get(201).narrator_sent is True
 
 
 def test_same_update_chain_runs_the_narrator_after_the_script() -> None:
     # The whole chain in one pass: a5 completes the interview, then the
-    # Converter, Scripter and Narrator all run in that same update so the voice
-    # note follows the script with no user input in between.
+    # Converter, Scripter and Narrator all run in that same update so the audio
+    # message follows the script with no user input in between.
     store = SessionStore()
     gate = FakeGate([HumanVerdict(is_human=True)])
     llm = FakeLLM(
@@ -1542,7 +1547,8 @@ def test_same_update_chain_runs_the_narrator_after_the_script() -> None:
     assert state.narrator_sent is True
     assert len(scripter.calls) == 1
     assert narrator.calls == [NARRATION_SCRIPT]
-    assert len(transport.voices) == 1
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["media_type"] == "audio/mpeg"
 
 
 def test_done_and_narrated_keeps_the_light_reply() -> None:
@@ -1566,7 +1572,7 @@ def test_done_and_narrated_keeps_the_light_reply() -> None:
         OBSERVATION_COMPLETE_REPLY
     ]
     assert narrator.calls == []
-    assert transport.voices == []
+    assert transport.audios == []
 
 
 def test_handoff_narrator_failure_leaves_the_chat_retryable() -> None:
@@ -1625,7 +1631,7 @@ def test_handoff_narrator_failure_leaves_the_chat_retryable() -> None:
 
     assert retried is True
     assert store.get(211).narrator_sent is True
-    assert len(transport.voices) == 1
+    assert len(transport.audios) == 1
 
 
 def test_start_clears_the_narration_and_the_narrator_sent_flag() -> None:

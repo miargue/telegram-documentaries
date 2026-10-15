@@ -1,16 +1,17 @@
 """Behaviour of the Phase 6 Narrator: typed port + Gemini TTS adapter + routing.
 
 ``urlopen`` is injected, so every case runs without a live API or a socket and
-the tests assert on the outgoing request body: exactly one ``user`` content
-holding two text parts — the voice-over guidance (the posh-British deep-voice
-persona) and the raw script verbatim — and ``responseModalities: ["AUDIO"]``.
-The adapter mechanically enforces the output contract — non-empty ``audio/*``
-payload, ≤ ``MAX_NARRATION_BYTES`` — and every failure comes back as a redacted
-:class:`NarratorError` (the fifth adapter honouring the single-redaction
-guarantee).
+the tests assert on the outgoing request body: a single ``user_input`` content
+whose text is the raw script verbatim, with the fixed delivery style carried as
+a ``speech_metadata`` annotation (never prepended text), audio output requested
+at ``audio/mp3`` and the prebuilt voice id in ``speech_config``. The adapter
+mechanically enforces the output contract — non-empty ``audio/mp3*`` or
+``audio/mpeg*`` payload, ≤ ``MAX_NARRATION_BYTES`` — and every failure comes
+back as a redacted :class:`NarratorError` (the fifth adapter honouring the
+single-redaction guarantee).
 
 ``handle_narrating`` is the Narrator's whole turn: for a ``done`` chat whose
-script already reached it, synthesise the audio, send it via ``sendVoice``,
+script already reached it, synthesise the audio, send it via ``sendAudio``,
 then set the terminal flag; a failed *send* re-sends the *stored* bytes with no
 re-synthesis, and nothing ever raises into the polling loop.
 """
@@ -36,12 +37,14 @@ from conftest import (
 
 from telegram_documentaries.defaults import (
     DEFAULT_NARRATOR_MODEL,
+    DEFAULT_NARRATOR_STYLE,
     DEFAULT_NARRATOR_TIMEOUT,
     DEFAULT_NARRATOR_VOICE,
     MAX_NARRATION_BYTES,
 )
 from telegram_documentaries.gemini import DEFAULT_BASE_URL, AudioPayload
 from telegram_documentaries.narrator import (
+    AUDIO_MEDIA_TYPE,
     NARRATION_APOLOGY_REPLY,
     NARRATION_RESET_REPLY,
     GeminiNarrator,
@@ -100,26 +103,21 @@ def make_narrator(
     return narrator, opener
 
 
-def audio_body(
-    data: bytes = b"OggS\x00opus-audio",
-    mime_type: str = "audio/ogg; codecs=opus",
+def audio_response(
+    data: bytes = b"ID3\x03\x00\x00\x00narration-audio",
+    mime_type: str = "audio/mp3; rate=24000; channels=1",
 ) -> bytes:
-    """A ``generateContent`` response whose candidate is one inline audio part."""
+    """An Interactions response whose first step content is one audio block."""
     payload = {
-        "candidates": [
+        "steps": [
             {
-                "content": {
-                    "role": "model",
-                    "parts": [
-                        {
-                            "inlineData": {
-                                "mimeType": mime_type,
-                                "data": base64.b64encode(data).decode("ascii"),
-                            }
-                        }
-                    ],
-                },
-                "finishReason": "STOP",
+                "content": [
+                    {
+                        "type": "audio",
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    }
+                ]
             }
         ]
     }
@@ -134,109 +132,133 @@ def sent_body(opener: RecordingUrlopen) -> dict[str, Any]:
 
 
 SCRIPT = "The caffeinated badger claims its territory and hoards the silver."
-AUDIO = b"OggS\x00narration-audio-bytes"
+AUDIO = b"ID3\x03\x00\x00\x00narration-audio-bytes"
 
 
 # --------------------------------------------------------- request body
 
-def test_synthesize_posts_a_single_user_turn_with_two_text_parts() -> None:
-    narrator, opener = make_narrator([FakeResponse(audio_body())])
+def test_synthesize_posts_the_locked_interactions_request_body() -> None:
+    narrator, opener = make_narrator([FakeResponse(audio_response())])
 
     narrator.synthesize(SCRIPT)
 
-    body = sent_body(opener)
-    contents = body["contents"]
-    assert len(contents) == 1
-    assert contents[0]["role"] == "user"
-    parts = contents[0]["parts"]
-    assert len(parts) == 2
-    # Part 0 is the voice-over guidance; part 1 is the raw script verbatim.
-    assert parts[0]["text"] == DEFAULT_NARRATOR_VOICE
-    assert parts[1]["text"] == SCRIPT
+    assert sent_body(opener) == {
+        "model": DEFAULT_NARRATOR_MODEL,
+        "input": [
+            {
+                "type": "user_input",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": SCRIPT,
+                        "annotations": [
+                            {
+                                "type": "speech_metadata",
+                                "style": DEFAULT_NARRATOR_STYLE,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        "response_format": {"type": "audio", "mime_type": "audio/mp3"},
+        "generation_config": {
+            "speech_config": [{"voice": DEFAULT_NARRATOR_VOICE}]
+        },
+    }
 
 
 def test_synthesize_uses_the_configured_voice() -> None:
     narrator, opener = make_narrator(
-        [FakeResponse(audio_body())], voice="a gravelly auntie"
+        [FakeResponse(audio_response())], voice="en-us-narrator-1"
     )
 
     narrator.synthesize(SCRIPT)
 
-    assert sent_body(opener)["contents"][0]["parts"][0]["text"] == (
-        "a gravelly auntie"
+    config = sent_body(opener)["generation_config"]
+    assert config["speech_config"][0]["voice"] == "en-us-narrator-1"
+
+
+def test_synthesize_uses_the_configured_style() -> None:
+    narrator, opener = make_narrator(
+        [FakeResponse(audio_response())], style="whispered and tense"
     )
-
-
-def test_synthesize_asks_for_audio_modalities_only() -> None:
-    narrator, opener = make_narrator([FakeResponse(audio_body())])
 
     narrator.synthesize(SCRIPT)
 
-    config = sent_body(opener)["generationConfig"]
-    assert config == {"responseModalities": ["AUDIO"]}
+    content = sent_body(opener)["input"][0]["content"][0]
+    assert content["annotations"] == [
+        {"type": "speech_metadata", "style": "whispered and tense"}
+    ]
 
 
-def test_synthesize_posts_to_the_generate_content_endpoint() -> None:
-    narrator, opener = make_narrator([FakeResponse(audio_body())])
+def test_synthesize_keeps_the_raw_script_only_in_the_content_text() -> None:
+    narrator, opener = make_narrator([FakeResponse(audio_response())])
+
+    narrator.synthesize(SCRIPT)
+
+    content = sent_body(opener)["input"][0]["content"][0]
+    # The script is the payload; the style travels as metadata and the script is
+    # never duplicated into an annotation (Gemini would read it aloud).
+    assert content["text"] == SCRIPT
+    assert SCRIPT not in json.dumps(content["annotations"])
+    assert len(content["annotations"]) == 1
+
+
+def test_synthesize_posts_to_the_interactions_endpoint() -> None:
+    narrator, opener = make_narrator([FakeResponse(audio_response())])
 
     narrator.synthesize(SCRIPT)
 
     url, data, timeout = opener.requests[0]
     assert opener.methods[0] == "POST"
-    assert url == (
-        f"{DEFAULT_BASE_URL}/v1beta/models/{DEFAULT_NARRATOR_MODEL}:"
-        f"generateContent?key={SECRET_KEY}"
-    )
+    assert url == f"{DEFAULT_BASE_URL}/v1beta/interactions?key={SECRET_KEY}"
     assert data is not None
     assert timeout == pytest.approx(DEFAULT_NARRATOR_TIMEOUT)
 
 
 def test_synthesize_uses_the_default_narrator_model() -> None:
-    assert DEFAULT_NARRATOR_MODEL == "gemini-3.1-flash-tts-preview"
-    narrator, opener = make_narrator([FakeResponse(audio_body())])
+    assert DEFAULT_NARRATOR_MODEL == "gemini-3.8-flash-lite-tts"
+    narrator, opener = make_narrator([FakeResponse(audio_response())])
 
     narrator.synthesize(SCRIPT)
 
-    assert (
-        f"/v1beta/models/{DEFAULT_NARRATOR_MODEL}:generateContent"
-        in opener.requests[0][0]
-    )
+    url, data, _timeout = opener.requests[0]
+    assert data is not None
+    assert json.loads(data)["model"] == DEFAULT_NARRATOR_MODEL
+    # The model travels in the body, never the URL.
+    assert DEFAULT_NARRATOR_MODEL not in url
 
 
 def test_synthesize_returns_the_decoded_audio_payload() -> None:
     narrator, _ = make_narrator(
-        [FakeResponse(audio_body(b"OGG-BYTES", "audio/ogg"))]
+        [FakeResponse(audio_response(b"MP3-BYTES", "audio/mpeg"))]
     )
 
     payload = narrator.synthesize(SCRIPT)
 
     assert isinstance(payload, AudioPayload)
-    assert payload.data == b"OGG-BYTES"
-    assert payload.mime_type == "audio/ogg"
+    assert payload.data == b"MP3-BYTES"
+    assert payload.mime_type == "audio/mpeg"
 
 
-def test_synthesize_skips_text_parts_and_takes_the_first_audio_part() -> None:
+def test_synthesize_skips_non_audio_blocks_and_takes_the_first_audio_block() -> None:
     payload = {
-        "candidates": [
+        "steps": [
             {
-                "content": {
-                    "role": "model",
-                    "parts": [
-                        {"text": "here is your narration"},
-                        {
-                            "inlineData": {
-                                "mimeType": "audio/ogg",
-                                "data": base64.b64encode(b"FIRST").decode("ascii"),
-                            }
-                        },
-                        {
-                            "inlineData": {
-                                "mimeType": "audio/mpeg",
-                                "data": base64.b64encode(b"SECOND").decode("ascii"),
-                            }
-                        },
-                    ],
-                }
+                "content": [
+                    {"type": "text", "text": "here is your narration"},
+                    {
+                        "type": "audio",
+                        "mime_type": "audio/mp3",
+                        "data": base64.b64encode(b"FIRST").decode("ascii"),
+                    },
+                    {
+                        "type": "audio",
+                        "mime_type": "audio/mpeg",
+                        "data": base64.b64encode(b"SECOND").decode("ascii"),
+                    },
+                ]
             }
         ]
     }
@@ -245,14 +267,14 @@ def test_synthesize_skips_text_parts_and_takes_the_first_audio_part() -> None:
     result = narrator.synthesize(SCRIPT)
 
     assert result.data == b"FIRST"
-    assert result.mime_type == "audio/ogg"
+    assert result.mime_type == "audio/mp3"
 
 
 # ---------------------------------------------------- unusable model output
 
 def test_synthesize_rejects_a_non_audio_mime_type() -> None:
     narrator, _ = make_narrator(
-        [FakeResponse(audio_body(b"IMG", "image/png"))]
+        [FakeResponse(audio_response(b"IMG", "image/png"))]
     )
 
     with pytest.raises(NarratorError) as exc_info:
@@ -261,10 +283,14 @@ def test_synthesize_rejects_a_non_audio_mime_type() -> None:
     assert exc_info.value.__cause__ is None
 
 
-@pytest.mark.parametrize("mime", ["audio/wav", "audio/mpeg", "text/plain", ""])
-def test_validate_audio_rejects_a_non_ogg_payload(mime: str) -> None:
-    # The locked format is OGG, so a valid-looking non-OGG audio payload must
-    # not be relabelled as ``audio/ogg`` downstream.
+@pytest.mark.parametrize(
+    "mime", ["audio/ogg", "audio/wav", "text/plain", ""]
+)
+def test_validate_audio_rejects_a_payload_outside_the_mp3_family(
+    mime: str,
+) -> None:
+    # The locked format is MP3, so a valid-looking non-MP3 audio payload must
+    # not be relabelled as ``audio/mpeg`` downstream.
     with pytest.raises(NarratorError) as exc_info:
         validate_audio(AudioPayload(data=AUDIO, mime_type=mime))
 
@@ -272,9 +298,17 @@ def test_validate_audio_rejects_a_non_ogg_payload(mime: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "mime", ["audio/ogg", "audio/ogg; codecs=opus", "AUDIO/OGG"]
+    "mime",
+    [
+        "audio/mp3",
+        "audio/mp3; rate=24000; channels=1",
+        "audio/mpeg",
+        "audio/mpeg; rate=24000",
+        "AUDIO/MP3",
+        "Audio/Mpeg",
+    ],
 )
-def test_validate_audio_accepts_the_locked_ogg_format(mime: str) -> None:
+def test_validate_audio_accepts_the_mp3_family(mime: str) -> None:
     payload = AudioPayload(data=AUDIO, mime_type=mime)
 
     assert validate_audio(payload) is payload
@@ -282,7 +316,7 @@ def test_validate_audio_accepts_the_locked_ogg_format(mime: str) -> None:
 
 def test_synthesize_rejects_an_oversized_audio_payload() -> None:
     too_big = b"x" * (MAX_NARRATION_BYTES + 1)
-    narrator, _ = make_narrator([FakeResponse(audio_body(too_big, "audio/ogg"))])
+    narrator, _ = make_narrator([FakeResponse(audio_response(too_big, "audio/mp3"))])
 
     with pytest.raises(NarratorError):
         narrator.synthesize(SCRIPT)
@@ -290,13 +324,13 @@ def test_synthesize_rejects_an_oversized_audio_payload() -> None:
 
 def test_synthesize_accepts_a_payload_exactly_at_the_size_limit() -> None:
     at_limit = b"x" * MAX_NARRATION_BYTES
-    narrator, _ = make_narrator([FakeResponse(audio_body(at_limit, "audio/ogg"))])
+    narrator, _ = make_narrator([FakeResponse(audio_response(at_limit, "audio/mp3"))])
 
     assert len(narrator.synthesize(SCRIPT).data) == MAX_NARRATION_BYTES
 
 
 def test_synthesize_rejects_an_empty_audio_payload() -> None:
-    narrator, _ = make_narrator([FakeResponse(audio_body(b"", "audio/ogg"))])
+    narrator, _ = make_narrator([FakeResponse(audio_response(b"", "audio/mp3"))])
 
     with pytest.raises(NarratorError):
         narrator.synthesize(SCRIPT)
@@ -305,12 +339,11 @@ def test_synthesize_rejects_an_empty_audio_payload() -> None:
 @pytest.mark.parametrize("junk", ["not base64!!", "AAAA!"])
 def test_synthesize_rejects_non_base64_audio_data(junk: str) -> None:
     payload = {
-        "candidates": [
+        "steps": [
             {
-                "content": {
-                    "role": "model",
-                    "parts": [{"inlineData": {"mimeType": "audio/ogg", "data": junk}}],
-                }
+                "content": [
+                    {"type": "audio", "mime_type": "audio/mp3", "data": junk}
+                ]
             }
         ]
     }
@@ -320,12 +353,8 @@ def test_synthesize_rejects_non_base64_audio_data(junk: str) -> None:
         narrator.synthesize(SCRIPT)
 
 
-def test_synthesize_rejects_a_candidate_without_an_audio_part() -> None:
-    payload = {
-        "candidates": [
-            {"content": {"role": "model", "parts": [{"text": "all done"}]}}
-        ]
-    }
+def test_synthesize_rejects_a_response_without_an_audio_block() -> None:
+    payload = {"steps": [{"content": [{"type": "text", "text": "all done"}]}]}
     narrator, _ = make_narrator([FakeResponse(json.dumps(payload).encode())])
 
     with pytest.raises(NarratorError):
@@ -337,17 +366,16 @@ def test_synthesize_rejects_a_candidate_without_an_audio_part() -> None:
     [
         urllib.error.URLError("connection refused"),
         urllib.error.HTTPError(
-            "https://generativelanguage.googleapis.com/v1beta/models/x:"
-            "generateContent",
-            500,
-            "Server Error",
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+            400,
+            "Bad Request",
             cast(Any, None),
             io.BytesIO(b'{"error": {"message": "backend exploded"}}'),
         ),
         http.client.IncompleteRead(b"half"),
         TimeoutError("timed out"),
         b"not json at all",
-        json.dumps({"candidates": []}).encode(),
+        json.dumps({"steps": []}).encode(),
         json.dumps({"error": {"message": "API key not valid"}}).encode(),
     ],
 )
@@ -365,10 +393,10 @@ def test_synthesize_normalises_every_failure(failure: Any) -> None:
 
 def _narrator_failures() -> dict[str, Callable[[], BaseException]]:
     """One fresh, key-bearing failure per normalised narrator branch."""
-    endpoint = f"https://x/v1beta/models/m:generateContent?key={SECRET_KEY}"
+    endpoint = f"https://x/v1beta/interactions?key={SECRET_KEY}"
     return {
         "invalid_url": lambda: _real_invalid_url(
-            f"/v1beta/models/m:generateContent?key={SECRET_KEY}\ncontrol"
+            f"/v1beta/interactions?key={SECRET_KEY}\ncontrol"
         ),
         "url_error": lambda: urllib.error.URLError(
             f"connection refused: {endpoint}"
@@ -376,8 +404,8 @@ def _narrator_failures() -> dict[str, Callable[[], BaseException]]:
         "os_error": lambda: OSError(f"timed out talking to {endpoint}"),
         "http_error": lambda: urllib.error.HTTPError(
             endpoint,
-            500,
-            f"Server Error {SECRET_KEY}",
+            400,
+            f"Bad Request {SECRET_KEY}",
             cast(Any, None),
             io.BytesIO(
                 json.dumps({"error": {"message": f"backend {SECRET_KEY}"}}).encode()
@@ -434,7 +462,7 @@ def test_every_narrator_failure_redacts_the_api_key(label: str) -> None:
 def test_narrator_redacts_a_control_character_key() -> None:
     key = "SECRET-NARRATOR-KEY-\nCANARY"
     narrator, _ = make_narrator(
-        [_real_invalid_url(f"/v1beta/models/m:generateContent?key={key}")],
+        [_real_invalid_url(f"/v1beta/interactions?key={key}")],
         api_key=key,
     )
 
@@ -519,10 +547,10 @@ def _events(records: list[logging.LogRecord]) -> list[str]:
     return [str(getattr(record, "event", "")) for record in records]
 
 
-def test_handle_narrating_synthesises_and_sends_the_voice_note() -> None:
+def test_handle_narrating_synthesises_and_sends_the_audio() -> None:
     session = narrating_store(script=SCRIPT)
     transport = FakeTransport()
-    narrator = FakeNarrator([AudioPayload(data=AUDIO, mime_type="audio/ogg")])
+    narrator = FakeNarrator([AudioPayload(data=AUDIO, mime_type="audio/mp3")])
     capture = _Capture("narrator.flow")
     try:
         delivered = handle_narrating(
@@ -534,10 +562,10 @@ def test_handle_narrating_synthesises_and_sends_the_voice_note() -> None:
 
     assert delivered is True
     assert narrator.calls == [SCRIPT]
-    assert len(transport.voices) == 1
-    assert transport.voices[0]["audio"] == AUDIO
-    assert transport.voices[0]["media_type"] == "audio/ogg"
-    assert transport.voices[0]["filename"] == "narration.ogg"
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["audio"] == AUDIO
+    assert transport.audios[0]["media_type"] == AUDIO_MEDIA_TYPE
+    assert transport.audios[0]["filename"] == "narration.mp3"
     state = session.get(1)
     assert state.narration == AUDIO
     assert state.narrator_sent is True
@@ -548,11 +576,11 @@ def test_handle_narrating_synthesises_and_sends_the_voice_note() -> None:
     ]
 
 
-def test_handle_narrating_normalises_the_model_mime_before_send_voice() -> None:
+def test_handle_narrating_normalises_the_model_mime_before_send_audio() -> None:
     session = narrating_store(script=SCRIPT)
     transport = FakeTransport()
     narrator = FakeNarrator(
-        [AudioPayload(data=AUDIO, mime_type="audio/ogg; codecs=opus")]
+        [AudioPayload(data=AUDIO, mime_type="audio/mp3; rate=24000; channels=1")]
     )
 
     delivered = handle_narrating(
@@ -560,12 +588,12 @@ def test_handle_narrating_normalises_the_model_mime_before_send_voice() -> None:
     )
 
     assert delivered is True
-    assert len(transport.voices) == 1
-    assert transport.voices[0]["audio"] == AUDIO
-    # The locked format is a clean OGG voice note, never the model's decorated
-    # ``audio/ogg; codecs=opus`` value.
-    assert transport.voices[0]["media_type"] == "audio/ogg"
-    assert transport.voices[0]["filename"] == "narration.ogg"
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["audio"] == AUDIO
+    # The locked format is a clean MP3, never the model's decorated
+    # ``audio/mp3; rate=24000; channels=1`` value.
+    assert transport.audios[0]["media_type"] == "audio/mpeg"
+    assert transport.audios[0]["filename"] == "narration.mp3"
     assert session.get(1).narrator_sent is True
 
 
@@ -574,19 +602,19 @@ def test_handle_narrating_flag_is_evidence_not_intent(
 ) -> None:
     session = narrating_store(script=SCRIPT)
     transport = FakeTransport()
-    narrator = FakeNarrator([AudioPayload(data=AUDIO, mime_type="audio/ogg")])
+    narrator = FakeNarrator([AudioPayload(data=AUDIO, mime_type="audio/mp3")])
     flag_at_send: list[bool] = []
-    original = transport.send_voice
+    original = transport.send_audio
 
-    def spy_send_voice(
-        chat_id: int, audio: bytes, *, media_type: str, filename: str = "narration.ogg"
+    def spy_send_audio(
+        chat_id: int, audio: bytes, *, media_type: str, filename: str = "narration.mp3"
     ) -> dict[str, Any]:
         flag_at_send.append(session.get(1).narrator_sent)
         return original(
             chat_id, audio, media_type=media_type, filename=filename
         )
 
-    monkeypatch.setattr(transport, "send_voice", spy_send_voice)
+    monkeypatch.setattr(transport, "send_audio", spy_send_audio)
     try:
         delivered = handle_narrating(
             transport, 1, session=session, narrator=narrator
@@ -601,10 +629,10 @@ def test_handle_narrating_flag_is_evidence_not_intent(
 
 def test_handle_narrating_never_logs_the_script_or_audio() -> None:
     distinctive = "RINGWORM-BADGER-NARRATION-CANARY inkwell cutlery"
-    audio = b"OggS\x00DISTINCTIVE-AUDIO-CANARY"
+    audio = b"ID3\x03\x00\x00\x00DISTINCTIVE-AUDIO-CANARY"
     session = narrating_store(script=distinctive)
     transport = FakeTransport()
-    narrator = FakeNarrator([AudioPayload(data=audio, mime_type="audio/ogg")])
+    narrator = FakeNarrator([AudioPayload(data=audio, mime_type="audio/mp3")])
     capture = _Capture("narrator.quiet")
     try:
         handle_narrating(
@@ -626,7 +654,7 @@ def test_handle_narrating_ready_event_reports_only_byte_count_and_mime() -> None
     session = narrating_store(script=SCRIPT)
     transport = FakeTransport()
     narrator = FakeNarrator(
-        [AudioPayload(data=AUDIO, mime_type="audio/ogg; codecs=opus")]
+        [AudioPayload(data=AUDIO, mime_type="audio/mp3; rate=24000; channels=1")]
     )
     capture = _Capture("narrator.ready")
     try:
@@ -646,7 +674,7 @@ def test_handle_narrating_ready_event_reports_only_byte_count_and_mime() -> None
     assert extra["byte_count"] == len(AUDIO)
     # The ready log reports the clean locked-format media type, not the
     # model's decorated value (the drift the send path already normalised).
-    assert extra["mime"] == "audio/ogg"
+    assert extra["mime"] == "audio/mpeg"
     assert SCRIPT not in str(extra)
     assert "DISTINCTIVE" not in str(extra)
 
@@ -654,9 +682,9 @@ def test_handle_narrating_ready_event_reports_only_byte_count_and_mime() -> None
 def test_handle_narrating_stores_the_audio_even_when_the_send_fails() -> None:
     session = narrating_store(script=SCRIPT)
     transport = FakeTransport(
-        fail_on={"sendVoice": TelegramApiError("sendVoice", "blocked")}
+        fail_on={"sendAudio": TelegramApiError("sendAudio", "blocked")}
     )
-    narrator = FakeNarrator([AudioPayload(data=AUDIO, mime_type="audio/ogg")])
+    narrator = FakeNarrator([AudioPayload(data=AUDIO, mime_type="audio/mp3")])
     capture = _Capture("narrator.sendfail")
     try:
         delivered = handle_narrating(
@@ -676,7 +704,7 @@ def test_handle_narrating_stores_the_audio_even_when_the_send_fails() -> None:
 
 
 def test_handle_narrating_resends_the_stored_audio_without_resynthesising() -> None:
-    stored = b"OggS\x00stored-audio-verbatim"
+    stored = b"ID3\x03\x00\x00\x00stored-audio-verbatim"
     session = narrating_store(script=SCRIPT, narration=stored)
     transport = FakeTransport()
     # Any call would be a bug: a failed delivery must not re-synthesise.
@@ -692,8 +720,8 @@ def test_handle_narrating_resends_the_stored_audio_without_resynthesising() -> N
 
     assert delivered is True
     assert narrator.calls == []
-    assert len(transport.voices) == 1
-    assert transport.voices[0]["audio"] == stored
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["audio"] == stored
     state = session.get(1)
     assert state.narration == stored
     assert state.narrator_sent is True
@@ -703,8 +731,8 @@ def test_handle_narrating_resends_the_stored_audio_without_resynthesising() -> N
     assert "narration_sent" in _events(capture.records)
 
 
-def test_handle_narrating_stored_resend_uses_the_clean_ogg_media_type() -> None:
-    stored = b"OggS\x00stored-audio-verbatim"
+def test_handle_narrating_stored_resend_uses_the_clean_audio_media_type() -> None:
+    stored = b"ID3\x03\x00\x00\x00stored-audio-verbatim"
     session = narrating_store(script=SCRIPT, narration=stored)
     transport = FakeTransport()
     narrator = FakeNarrator([NarratorError("must never be called")])
@@ -715,13 +743,14 @@ def test_handle_narrating_stored_resend_uses_the_clean_ogg_media_type() -> None:
 
     assert delivered is True
     assert narrator.calls == []  # stored bytes re-sent, never re-synthesised
-    assert len(transport.voices) == 1
-    assert transport.voices[0]["audio"] == stored
-    assert transport.voices[0]["media_type"] == "audio/ogg"
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["audio"] == stored
+    assert transport.audios[0]["media_type"] == "audio/mpeg"
+    assert transport.audios[0]["filename"] == "narration.mp3"
 
 
 def test_handle_narrating_stored_resend_never_logs_the_audio() -> None:
-    stored = b"OggS\x00stored-audio-verbatim-CANARY"
+    stored = b"ID3\x03\x00\x00\x00stored-audio-verbatim-CANARY"
     session = narrating_store(script=SCRIPT, narration=stored)
     transport = FakeTransport()
     narrator = FakeNarrator([])
@@ -740,10 +769,10 @@ def test_handle_narrating_stored_resend_never_logs_the_audio() -> None:
 
 
 def test_handle_narrating_apologises_when_a_resend_fails_too() -> None:
-    stored = b"OggS\x00stored-audio"
+    stored = b"ID3\x03\x00\x00\x00stored-audio"
     session = narrating_store(script=SCRIPT, narration=stored)
     transport = FakeTransport(
-        fail_on={"sendVoice": TelegramApiError("sendVoice", "blocked")}
+        fail_on={"sendAudio": TelegramApiError("sendAudio", "blocked")}
     )
     narrator = FakeNarrator([])
     capture = _Capture("narrator.resendfail")
@@ -886,7 +915,7 @@ def test_handle_narrating_skips_a_chat_whose_narration_was_already_sent() -> Non
 
     assert delivered is False
     assert transport.calls == []
-    assert transport.voices == []
+    assert transport.audios == []
     assert narrator.calls == []
     assert "narration_skipped" in _events(capture.records)
 

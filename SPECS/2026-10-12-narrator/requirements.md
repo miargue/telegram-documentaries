@@ -217,4 +217,59 @@ sent once** (`narrator_sent` set only after a successful `sendAudio`).
 
 ## Delivered (filled at verification)
 
-_To be completed by the verifier for Revision R1._
+**Verified 2026-10-15 by the verifier agent (Revision R1).**
+
+- **MP3 audio message via `sendAudio`.** `transport.send_audio(chat_id, audio,
+  *, media_type, filename="narration.mp3")` POSTs a multipart body (file field
+  `audio`) to Telegram `sendAudio`, through the same `_multipart` /
+  `_read` / `_decode` normalisation and token-redaction path as `send_photo`.
+  `send_voice`/`VOICE_FILENAME`/`narration.ogg` are gone; `AUDIO_FILENAME =
+  "narration.mp3"`.
+- **Gemini Interactions API audio path.** `GeminiJsonClient.generate_interaction_audio(
+  request_body) -> AudioPayload` POSTs to `<base>/v1beta/interactions?key=…`
+  (model in the body, not the URL) and decodes the first `type == "audio"`
+  block of `steps[0].content[]` (strict base64). The endpoint was parameterised
+  (`_post_to`) so the single POST/normalisation/`_redact`/`from None` machinery
+  is shared with `generate_json`/`generate_image`.
+- **Request body (exact, as specified).** `{"model": …, "input": [{"type":
+  "user_input", "content": [{"type": "text", "text": <script>, "annotations":
+  [{"type": "speech_metadata", "style": <style>}]}]}], "response_format":
+  {"type": "audio", "mime_type": "audio/mp3"}, "generation_config":
+  {"speech_config": [{"voice": <voice>}]}}` — the script is payload, the style
+  is metadata only (never prepended), the script is never duplicated.
+- **Defaults.** `DEFAULT_NARRATOR_MODEL = "gemini-3.8-flash-lite-tts"`,
+  `DEFAULT_NARRATOR_VOICE = "en-gb-storyteller-4"`,
+  `DEFAULT_NARRATOR_STYLE = "measured, dramatic wildlife documentary
+  narration"`, `DEFAULT_NARRATOR_TIMEOUT = 90.0`, `MAX_NARRATION_BYTES = 5 MiB`.
+  `get_narrator_model` / `_voice` / `_timeout` keep their names and precedence
+  (env-beats-file; blank → default; timeout validated loudly). `voice` now
+  resolves a **prebuilt voice id**.
+- **Validation & delivery.** `validate_audio` accepts non-empty `audio/mp3*` /
+  `audio/mpeg*` (case-insensitive) ≤ `MAX_NARRATION_BYTES`, else a redacted
+  `NarratorError`. `AUDIO_MEDIA_TYPE = "audio/mpeg"` is used for every outbound
+  and logged mime. `handle_narrating` stores before send, delivers exactly once,
+  re-sends the stored bytes with no re-synthesis on a failed send, apologises
+  and retries next update on synthesis failure, and fail-loud resets/re-prompts
+  on a `done` chat missing its script. `narrator_ready` logs only byte count +
+  mime.
+- **Bouncer / wiring.** The Bouncer runs the Narrator in the **same update**
+  after the script lands (fresh completion and retried paths) and routes
+  `done && script_sent && !narrator_sent` to `handle_narrating`; `polling.py` /
+  `cli.py` threading unchanged (`NarratorFactory = (api_key, model, voice,
+  timeout)`).
+- **Session.** `SESSION_VERSION == 5`, `narration: bytes | None`,
+  `narrator_sent: bool`; `store_narration`/`mark_narrator_sent`; reset purges
+  both. `session.py` docstrings say "audio payload (MP3)".
+- **No OGG path, no encoder, no new dependency.** `pydantic` is still the only
+  runtime dependency.
+- **Evidence.** `scripts/test` → 697 passed; `scripts/hooks` → all green; full
+  suite re-run with `connect`/`connect_ex`/`create_connection`/`getaddrinfo`
+  patched to raise → 697 passed (patch sanity-checked to fire); live
+  `GeminiNarrator.synthesize` smoke → **PASS** (`audio/mp3; rate=24000;
+  channels=1`, 339235 bytes, valid ID3v2, written to
+  `/tmp/opencode/narration_smoke.mp3`). Full checklist in `validation.md`.
+- **Deviations.** None from the R1 functional contract. One cosmetic note: the
+  existing `test_session.py` tests were kept unchanged as the plan required, so
+  three narration fixtures still use OGG-shaped opaque bytes
+  (`b"OggS\x00…"`); `session.py`'s comment was updated to "audio payload
+  (MP3)". See `validation.md` §Deviations.

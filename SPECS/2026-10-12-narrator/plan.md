@@ -75,8 +75,9 @@ Green:
 - `GeminiNarrator(api_key, *, model=DEFAULT_NARRATOR_MODEL,
   voice=DEFAULT_NARRATOR_VOICE, style=DEFAULT_NARRATOR_STYLE, base_url=…,
   timeout=…, urlopen=…)` wrapping `generate_interaction_audio`; the revised
-  `_request_body`; `validate_audio` accepting the MP3/M4A MIME family; a module
-  constant `AUDIO_MEDIA_TYPE = "audio/mpeg"` used for every outbound/log mime.
+  `_request_body`; `validate_audio` accepting `audio/mp3` / `audio/mpeg`; a
+  module constant `AUDIO_MEDIA_TYPE = "audio/mpeg"` used for every outbound/log
+  mime.
 
 Run `scripts/test` + `scripts/hooks`.
 
@@ -197,4 +198,58 @@ Finish: `scripts/test` + `scripts/hooks` green; commit; push; update PR #7.
 
 ## Verification notes (filled at verification)
 
-_To be completed by the verifier for Revision R1._
+**Verified 2026-10-15 (Revision R1).** Every task group below was checked
+against the working tree, not the plan.
+
+- **§1 Interactions audio extraction (`gemini.py`)** — implemented as planned:
+  `generate_interaction_audio` POSTs to `<base>/v1beta/interactions?key=…` with
+  the model in the body; it decodes the first `type == "audio"` block of
+  `steps[0].content[]` with strict base64; the model-declared mime passes
+  through verbatim; failures reuse the shared `_redact`/`from None` machinery
+  (HTTP/network/protocol/malformed/missing-steps/no-audio-block all normalised).
+  `_post_to(endpoint, body)` was extracted and `_interactions_endpoint()` added,
+  so one `_post` serves both shapes. Covered by `test_gemini.py`.
+- **§2 Narrator port + adapter (`narrator.py`)** — `GeminiNarrator` wraps
+  `generate_interaction_audio`; `_request_body` matches the locked body exactly;
+  `validate_audio` accepts `audio/mp3`/`audio/mpeg` (case-insensitive) and
+  rejects OGG/WAV/text/empty/oversized; `AUDIO_MEDIA_TYPE = "audio/mpeg"`.
+  `NarratorError` is raised `from None` on every failure; canary tests prove no
+  key leak (plain + control-character).
+- **§3 Transport `sendAudio` (`transport.py`)** — `send_audio` POSTs multipart
+  (field `audio`, filename `narration.mp3`) via `_multipart`; the `Transport`
+  protocol exposes `send_audio` and no longer `send_voice`; `AUDIO_FILENAME` is
+  set. Covered by `test_transport.py`.
+- **§4 Session (`session.py`) — wording only** — `SESSION_VERSION == 5`,
+  `narration: bytes | None`, `narrator_sent: bool`, `store_narration` /
+  `mark_narrator_sent` unchanged in behaviour; the `session.py` comment was
+  updated to "audio payload (MP3)". The existing `test_session.py` tests were
+  kept unchanged exactly as this section required — three narration fixtures
+  therefore still use an OGG-shaped opaque literal (`b"OggS\x00…"`), which is
+  **as planned**, not a deviation (the bytes are opaque to the store).
+- **§5 Narrating routing (`narrator.py`)** — `handle_narrating` guards
+  (not done / `!script_sent` / already sent) → `narration_skipped`, `False`;
+  stored bytes re-sent without calling the narrator; otherwise
+  `narration_started` → `synthesize` → `validate_audio` → `store_narration` →
+  `send_audio` → `mark_narrator_sent`, exact order asserted; `synthesize`
+  failure / invalid payload → apology + `narrator_failed`, no flag, no raise;
+  missing script on a `done` chat → fail loud + reset-and-reprompt; every send
+  uses `media_type="audio/mpeg"`, filename `narration.mp3`; audio and script
+  never logged. Covered by `test_narrator.py`.
+- **§6 Bouncer dispatch + wiring** — the Bouncer runs narrating in the same
+  update after the script lands; `done && script_sent && !narrator_sent`
+  re-drives it (stored-bytes re-send); `done && narrator_sent` keeps the light
+  reply; `/start` resets `narration`/`narrator_sent`. Defaults/config/CLI
+  threading match the plan. Covered by `test_bouncer.py`, `test_config.py`,
+  `test_cli.py`, `test_polling.py`, `tests/conftest.py`.
+- **§7 Component flow + docs + verification** — component flow passes: full
+  pass → `sendPhoto` → script → one `sendAudio` in the same pass with no user
+  input; payload stored; `narrator_sent` set; failed synthesis apologises and
+  retries; failed send re-sends stored bytes (`FakeNarrator` not re-called);
+  text after → light reply; `/start` clears. Socket-blocked re-run stays green
+  with the patch sanity-checked. **Live smoke PASSED** (see `validation.md`).
+  Docs reconciled: README, `SPECS/TECH.md`, `SPECS/ROADMAP.md`,
+  `SPECS/MISSION.md`.
+
+**Results:** `scripts/test` → 697 passed; `scripts/hooks` → all green; socket
+entry points patched to raise → 697 passed; live Gemini smoke → PASS
+(`audio/mp3; rate=24000; channels=1`, 339235 bytes, ID3v2, exit 0).

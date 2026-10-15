@@ -418,10 +418,10 @@ def test_get_converter_timeout_rejects_a_non_finite_value(raw: str) -> None:
         )
 
 
-def test_get_narrator_model_defaults_to_flash_tts_preview() -> None:
+def test_get_narrator_model_defaults_to_flash_lite_tts() -> None:
     assert (
         get_narrator_model(environ={}, env_file=None)
-        == "gemini-3.1-flash-tts-preview"
+        == "gemini-3.8-flash-lite-tts"
     )
 
 
@@ -448,7 +448,7 @@ def test_get_narrator_model_blank_override_falls_back_to_default() -> None:
         environ={"GEMINI_NARRATOR_MODEL": "   "}, env_file=None
     )
 
-    assert model == "gemini-3.1-flash-tts-preview"
+    assert model == "gemini-3.8-flash-lite-tts"
 
 
 def test_default_narrator_model_lives_in_a_neutral_module() -> None:
@@ -460,15 +460,16 @@ def test_default_narrator_model_lives_in_a_neutral_module() -> None:
     )
 
 
-def test_get_narrator_voice_defaults_to_the_documentary_persona() -> None:
+def test_get_narrator_voice_defaults_to_the_prebuilt_narrator_voice_id() -> None:
     from telegram_documentaries import defaults
 
     assert (
         get_narrator_voice(environ={}, env_file=None)
         == defaults.DEFAULT_NARRATOR_VOICE
     )
-    assert "British" in defaults.DEFAULT_NARRATOR_VOICE
-    assert "male" in defaults.DEFAULT_NARRATOR_VOICE
+    # A prebuilt voice *id*, not free-text delivery guidance: Gemini 3.8 TTS
+    # expects an id such as ``en-gb-storyteller-4``.
+    assert defaults.DEFAULT_NARRATOR_VOICE == "en-gb-storyteller-4"
 
 
 def test_get_narrator_voice_env_override_wins(tmp_path: Path) -> None:

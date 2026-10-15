@@ -192,9 +192,9 @@ class FakeTransport:
         # Every attempted ``sendPhoto`` upload, in order. Recorded before any
         # scripted failure (like ``calls``) so tests can assert the attempt.
         self.photos: list[dict[str, Any]] = []
-        # Every attempted ``sendVoice`` upload, in order. Recorded before any
+        # Every attempted ``sendAudio`` upload, in order. Recorded before any
         # scripted failure so tests can assert the attempt.
-        self.voices: list[dict[str, Any]] = []
+        self.audios: list[dict[str, Any]] = []
 
     def call(
         self, method: str, params: Mapping[str, Any] | None = None
@@ -246,16 +246,16 @@ class FakeTransport:
             "result": {"message_id": 1, "chat": {"id": chat_id}},
         }
 
-    def send_voice(
+    def send_audio(
         self,
         chat_id: int,
         audio: bytes,
         *,
         media_type: str,
-        filename: str = "narration.ogg",
+        filename: str = "narration.mp3",
     ) -> dict[str, Any]:
-        """Record an attempted narration voice-note upload and (unless scripted) ok."""
-        self.voices.append(
+        """Record an attempted narration audio upload and (unless scripted) ok."""
+        self.audios.append(
             {
                 "chat_id": chat_id,
                 "audio": audio,
@@ -263,8 +263,8 @@ class FakeTransport:
                 "filename": filename,
             }
         )
-        if "sendVoice" in self.fail_on:
-            raise self.fail_on["sendVoice"]
+        if "sendAudio" in self.fail_on:
+            raise self.fail_on["sendAudio"]
         return {
             "ok": True,
             "result": {"message_id": 1, "chat": {"id": chat_id}},
@@ -451,7 +451,10 @@ class FakeNarrator:
     ) -> None:
         self.results: list[Any] = list(results or [])
         self.default: AudioPayload = (
-            AudioPayload(data=b"OggS\x00fake-narration", mime_type="audio/ogg")
+            AudioPayload(
+                data=b"ID3\x03\x00\x00\x00fake-narration-mp3",
+                mime_type="audio/mpeg",
+            )
             if default is None
             else default
         )

@@ -51,13 +51,13 @@ class _NonDictTransport:
     ) -> Any:
         return {"ok": True}
 
-    def send_voice(
+    def send_audio(
         self,
         chat_id: int,
         audio: bytes,
         *,
         media_type: str,
-        filename: str = "narration.ogg",
+        filename: str = "narration.mp3",
     ) -> Any:
         return {"ok": True}
 
@@ -498,7 +498,7 @@ def test_poll_once_threads_the_injected_converter_to_the_handler() -> None:
 
 
 def test_poll_once_threads_the_injected_narrator_to_the_handler() -> None:
-    # A finished chat with a delivered script and no voice note drives the
+    # A finished chat with a delivered script and no audio message drives the
     # Narrator through the loop: proof poll_once passes the injected narrator
     # down rather than silently building its own.
     store = SessionStore()
@@ -527,5 +527,7 @@ def test_poll_once_threads_the_injected_narrator_to_the_handler() -> None:
     )
 
     assert narrator.calls == ["A dramatic nature documentary script."]
-    assert len(transport.voices) == 1
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["media_type"] == "audio/mpeg"
+    assert transport.audios[0]["filename"] == "narration.mp3"
     assert store.get(48).narrator_sent is True

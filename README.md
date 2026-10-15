@@ -9,11 +9,11 @@ straight into a one-question-at-a-time behavioural interview, and — as soon as
 the interview finishes — fuses the original photo with the behavioural dossier
 in a single Gemini image call, delivers the hybrid animal portrait straight to
 the chat, follows it immediately with a dramatic one-paragraph narration
-script, and then renders that script as a **playable OGG voice note** via
-Gemini TTS (`gemini-3.1-flash-tts-preview`) in the same update, with no user
-input in between. The raw script and raw audio are stored on the session, ready
-for re-delivery. Anything that is not a portrait is rejected with a reset.
-Phase 1's unconditional echo (`hey mate!`) is gone.
+script, and then renders that script as a **playable MP3 audio message** via
+the Gemini **Interactions API** TTS (`gemini-3.8-flash-lite-tts`) in the same
+update, with no user input in between. The raw script and raw audio are stored
+on the session, ready for re-delivery. Anything that is not a portrait is
+rejected with a reset. Phase 1's unconditional echo (`hey mate!`) is gone.
 
 ## What the bot does (Phase 6: the Bouncer + the Interviewer + the Converter + the Scripter + the Narrator)
 
@@ -72,23 +72,27 @@ The gateway routes every incoming message with one rule set:
     Scripter is never called twice for the same subject (the Interviewer's
     re-ask pattern).
 - **After the script is delivered** (`script_sent`) → the Narrator runs **in the
-  same update** (no user input): the stored script is sent to Gemini TTS
-  (`gemini-3.1-flash-tts-preview`) as **one `user` content with two text
-  parts** — the fixed posh-British documentary voice guidance (overridable via
-  `GEMINI_NARRATOR_VOICE`) and the raw script **verbatim** — with
-  `generationConfig: {"responseModalities": ["AUDIO"]}`, and the model returns
-  an **OGG (Opus)** audio payload. The payload is validated mechanically before
-  any send (non-empty, `audio/ogg`, ≤ 5 MB — `MAX_NARRATION_BYTES`) and
-  delivered as a Telegram **`sendVoice`** voice note (`multipart/form-data`,
-  file field `voice`, filename `narration.ogg`). The raw audio bytes are
-  **stored on the session** (`SessionState.narration`), and `narrator_sent` is
-  set only once the voice note actually reached the chat — so the narration is
-  synthesised once and delivered **exactly once**.
+  same update** (no user input): the stored script is sent to the Gemini
+  **Interactions API** (`POST /v1beta/interactions`,
+  `gemini-3.8-flash-lite-tts` by default) as a single `user_input` text content
+  — the raw script **verbatim** — with the fixed delivery **style**
+  (`DEFAULT_NARRATOR_STYLE`) carried as a `speech_metadata` annotation (never
+  prepended text, which the TTS would read aloud) and the prebuilt voice id
+  (`en-gb-storyteller-4`, overridable via `GEMINI_NARRATOR_VOICE`) in
+  `generation_config.speech_config`. The model returns an **MP3** audio payload
+  (`response_format: {"type": "audio", "mime_type": "audio/mp3"}`). The payload
+  is validated mechanically before any send (non-empty, `audio/mp3*` or
+  `audio/mpeg*`, ≤ 5 MB — `MAX_NARRATION_BYTES`) and delivered as a Telegram
+  **`sendAudio`** audio message (`multipart/form-data`, file field `audio`,
+  filename `narration.mp3`). The raw audio bytes are **stored on the session**
+  (`SessionState.narration`), and `narrator_sent` is set only once the audio
+  message actually reached the chat — so the narration is synthesised once and
+  delivered **exactly once**.
   - A failed synthesis (or an unusable payload) logs `narrator_failed` loudly
     and sends an apology; the next update retries.
   - A failed *send* re-sends the **stored** audio bytes on the next update — the
     Narrator is never called a second time (no re-synthesis).
-- **After the voice note is delivered** (`portrait_sent` + `script_sent` +
+- **After the audio message is delivered** (`portrait_sent` + `script_sent` +
   `narrator_sent`) → non-command text gets the Interviewer's light "observation
   complete" reply; no further model call, no re-conversion, no re-scripting, no
   re-narration, no state change.
@@ -101,7 +105,7 @@ The gateway routes every incoming message with one rule set:
 - **Everything degrades gracefully**: a failed download, a Gemini/vision
   error, an interview `InterviewError`, a conversion `ConverterError` (image
   generation or `sendPhoto` upload), a scripting `ScriptError` (generation or
-  delivery), a narration `NarratorError` (TTS generation or `sendVoice` upload),
+  delivery), a narration `NarratorError` (TTS generation or `sendAudio` upload),
   or a `sendMessage` failure is logged loudly with a traceback, the user gets an
   apology/re-prompt, and nothing crashes the polling loop.
 - Updates that carry no `message` at all (edited messages, callback queries,
@@ -149,10 +153,11 @@ pip install -r requirements-dev.txt   # runtime + test/lint/type deps
 Runtime-only install: `pip install -r requirements.txt`.
 
 > `pydantic` is the only runtime dependency — for Phases 1–6.
-> The Telegram transport *and* the Gemini adapter speak plain stdlib
-> `urllib`, so no third-party HTTP client library is pinned. Phase 6's voice
-> note needs no audio encoder: Gemini TTS returns **OGG (Opus)** directly, the
-> format Telegram's `sendVoice` accepts natively.
+> The Telegram transport *and* the Gemini adapters speak plain stdlib
+> `urllib`, so no third-party HTTP client library is pinned. Phase 6's audio
+> message needs no audio encoder: the Gemini **Interactions API** TTS returns
+> **MP3** directly for `gemini-3.8-flash-lite-tts`, a format Telegram's
+> `sendAudio` accepts natively.
 
 ## Configure
 
@@ -192,10 +197,12 @@ blank value falls back to the default):
   A value that is not a positive, finite number of seconds is a hard startup
   error.
 - `GEMINI_NARRATOR_MODEL` — overrides the Narrator's TTS model; defaults to
-  `gemini-3.1-flash-tts-preview`.
-- `GEMINI_NARRATOR_VOICE` — overrides the fixed voice-over guidance prepended to
-  the script (the default is a deep, confident male voice with a posh British
-  accent, in a measured, warm wildlife-documentary delivery).
+  `gemini-3.8-flash-lite-tts` (the Interactions API's lite TTS tier).
+- `GEMINI_NARRATOR_VOICE` — overrides the Narrator's prebuilt voice id; defaults
+  to `en-gb-storyteller-4` (the built-in "Nature Documentary Narrator": a
+  56-year-old male, low/deep pitch, British). The delivery *style* is a fixed
+  constant (`DEFAULT_NARRATOR_STYLE`), sent as `speech_metadata.style` rather
+  than prepended to the script.
 - `GEMINI_NARRATOR_TIMEOUT` — the Narrator's TTS-call timeout in seconds;
   defaults to `90.0` (TTS is slow, like image generation). A value that is not a
   positive, finite number of seconds is a hard startup error.
@@ -266,13 +273,14 @@ throughout — **no test contacts Telegram or Gemini** (the full suite passes wi
 every socket entry point patched to raise). The Gemini adapter tests
 (`test_gemini`, `test_vision`, `test_interviewer`, `test_converter`,
 `test_scripter`, `test_narrator`) assert on the outgoing request body (base64
-`inline_data`, JSON `responseSchema` / `responseModalities`, model id, transcript
-role alternation, the two-part TTS body) without a socket. New in Phase 6:
-`test_narrator.py` (54) and the component `test_narrator_flow.py` (4), plus
-narrator cases across `test_gemini.py`, `test_transport.py`, `test_session.py`,
-`test_bouncer.py`, `test_config.py`, `test_cli.py` and `test_polling.py` — the
-shared client's audio path (`generate_audio`) and the multipart `sendVoice`
-upload are covered by `test_gemini.py` and `test_transport.py`.
+`inline_data`, JSON `responseSchema` / `responseModalities`, the Interactions
+`input` / `response_format` / `generation_config` body, model id, transcript
+role alternation) without a socket. New in Phase 6: `test_narrator.py` (58) and
+the component `test_narrator_flow.py` (4), plus narrator cases across
+`test_gemini.py`, `test_transport.py`, `test_session.py`, `test_bouncer.py`,
+`test_config.py`, `test_cli.py` and `test_polling.py` — the shared client's
+Interactions audio path (`generate_interaction_audio`) and the multipart
+`sendAudio` upload are covered by `test_gemini.py` and `test_transport.py`.
 
 ## Pre-commit checks
 
@@ -299,7 +307,7 @@ telegram_documentaries/
   config.py           # minimal .env loader + secret resolution + model defaults
   converter.py        # typed ConverterLLM port + Gemini image adapter + routing
   defaults.py         # shared constant home (models, question count, limits)
-  gemini.py           # shared Gemini generateContent JSON client + redaction
+  gemini.py           # shared Gemini generateContent/Interactions client + redaction
   interviewer.py      # typed InterviewLLM port + Gemini adapter + interview routing
   logging_config.py   # JSON-lines formatter + log_lifecycle decorator
   media.py            # photo intake: largest PhotoSize + safe getFile/download
@@ -326,5 +334,8 @@ SPECS/                # MISSION.md, TECH.md, ROADMAP.md (the contract)
 Phase 6 of `SPECS/ROADMAP.md` (the Narrator) is implemented on branch
 `feature/2026-10-12-narrator` and verified. Phases 1–5 (gateway, Bouncer,
 Interviewer, Converter, Scripter) are on `main`. The five-stage pipeline is
-complete: a playable OGG voice note now follows the narration script in the
-same update, speaking the Scripter's words.
+complete: a playable **MP3 audio message** now follows the narration script in
+the same update, speaking the Scripter's words. Revision R1 (2026-10-14)
+replaced the impossible OGG/`sendVoice` design (no Gemini endpoint produces
+OGG/Opus without an encoder) with an MP3 audio file via `sendAudio`, synthesised
+through the Gemini Interactions API.

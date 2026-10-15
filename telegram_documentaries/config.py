@@ -277,12 +277,12 @@ def get_narrator_voice(
     environ: Mapping[str, str] | None = None,
     env_file: Path | None = DEFAULT_ENV_FILE,
 ) -> str:
-    """Resolve the voice-over guidance passed to the Narrator TTS call.
+    """Resolve the prebuilt voice id passed to the Narrator TTS call.
 
     An optional ``GEMINI_NARRATOR_VOICE`` override follows the same
     env-beats-file precedence as the models; a blank override falls back to
-    :data:`DEFAULT_NARRATOR_VOICE` (the posh-British documentary persona), so
-    the user can experiment with voices without editing code.
+    :data:`DEFAULT_NARRATOR_VOICE` (the built-in documentary narrator voice id),
+    so the user can pick another prebuilt voice without editing code.
     """
     env = os.environ if environ is None else environ
     voice = env.get(_NARRATOR_VOICE_KEY, "").strip()

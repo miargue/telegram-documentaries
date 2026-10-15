@@ -3,24 +3,27 @@
 The Bouncer gates a portrait, the Interviewer builds the behavioural dossier,
 the Converter fuses them into a hybrid portrait, the Scripter writes the
 narration script, and the Narrator renders it as audio — turning the stored
-script into a playable voice note in the chat. The port (:class:`NarratorLLM`)
-is deliberately narrow and typed so the rest of the pipeline never depends on
-a vendor SDK; the Gemini adapter is a ``generateContent`` JSON call over
-stdlib ``urllib`` with an injectable ``urlopen`` seam, exactly like the other
-adapters.
+script into a playable MP3 audio message in the chat. The port
+(:class:`NarratorLLM`) is deliberately narrow and typed so the rest of the
+pipeline never depends on a vendor SDK; the Gemini adapter is a Gemini
+**Interactions API** JSON call over stdlib ``urllib`` with an injectable
+``urlopen`` seam, exactly like the other adapters.
 
-The request body follows the spec: one ``user`` content holding two text parts
-— the voice-over guidance (the posh-British deep-voice persona) and the raw
-script verbatim — and ``generationConfig: {"responseModalities": ["AUDIO"]}``.
+The request body follows the spec: the model travels in the body, the raw
+script is a single ``user_input`` text content, and the fixed delivery style
+is carried as a ``speech_metadata`` annotation — never prepended text, which
+Gemini's TTS would read aloud. Audio is requested at ``audio/mp3`` with the
+prebuilt ``speech_config`` voice.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Protocol
+from typing import Any, Protocol
 
 from telegram_documentaries.defaults import (
     DEFAULT_NARRATOR_MODEL,
+    DEFAULT_NARRATOR_STYLE,
     DEFAULT_NARRATOR_TIMEOUT,
     DEFAULT_NARRATOR_VOICE,
     MAX_NARRATION_BYTES,
@@ -33,7 +36,7 @@ from telegram_documentaries.gemini import (
     UrlopenFn,
 )
 from telegram_documentaries.session import Phase, SessionStore
-from telegram_documentaries.transport import Transport
+from telegram_documentaries.transport import AUDIO_FILENAME, Transport
 
 LOGGER = logging.getLogger(__name__)
 
@@ -56,7 +59,7 @@ class NarratorLLM(Protocol):
 
 
 class GeminiNarrator:
-    """A Gemini ``generateContent`` adapter for :class:`NarratorLLM`.
+    """A Gemini Interactions API adapter for :class:`NarratorLLM`.
 
     ``urlopen`` is injectable so tests never contact Gemini. All failure
     normalisation and API-key redaction is delegated to the shared
@@ -70,11 +73,14 @@ class GeminiNarrator:
         *,
         model: str = DEFAULT_NARRATOR_MODEL,
         voice: str = DEFAULT_NARRATOR_VOICE,
+        style: str = DEFAULT_NARRATOR_STYLE,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_NARRATOR_TIMEOUT,
         urlopen: UrlopenFn | None = None,
     ) -> None:
+        self._model = model
         self._voice = voice
+        self._style = style
         self._gemini = GeminiJsonClient(
             api_key,
             model=model,
@@ -87,49 +93,64 @@ class GeminiNarrator:
     def synthesize(self, script: str) -> AudioPayload:
         """Synthesise audio for the script, enforcing output contract."""
         try:
-            audio = self._gemini.generate_audio(self._request_body(script))
+            audio = self._gemini.generate_interaction_audio(
+                self._request_body(script)
+            )
         except GeminiError as exc:
             raise NarratorError(str(exc)) from None
         return validate_audio(audio)
 
-    def _request_body(self, script: str) -> dict:
+    def _request_body(self, script: str) -> dict[str, Any]:
         return {
-            "contents": [
+            "model": self._model,
+            "input": [
                 {
-                    "role": "user",
-                    "parts": [
-                        {"text": self._voice},
-                        {"text": script},
+                    "type": "user_input",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": script,
+                            "annotations": [
+                                {"type": "speech_metadata", "style": self._style}
+                            ],
+                        }
                     ],
                 }
             ],
-            "generationConfig": {"responseModalities": ["AUDIO"]},
+            "response_format": {"type": "audio", "mime_type": "audio/mp3"},
+            "generation_config": {
+                "speech_config": [{"voice": self._voice}]
+            },
         }
+
+
+# The locked output format for a narration: a clean MP3 media type, never the
+# model's decorated value (e.g. ``audio/mp3; rate=24000; channels=1``).
+AUDIO_MEDIA_TYPE = "audio/mpeg"
+
+# Accepted model-declared MP3-family mime prefixes (case-insensitive). Both
+# spellings are in the wild; anything else (OGG, WAV, ...) is unusable output.
+_MP3_MIME_PREFIXES = ("audio/mp3", "audio/mpeg")
 
 
 def validate_audio(audio: AudioPayload) -> AudioPayload:
     """Enforce the model-output contract on a synthesised payload.
 
-    The audio must be a non-empty ``audio/ogg`` payload (case-insensitively)
-    no larger than :data:`MAX_NARRATION_BYTES`; any violation is an unusable
-    output, raised as a redacted :class:`NarratorError` (``from None``). Used by
-    the adapter and re-checked by the routing so a port that returns junk still
+    The audio must be a non-empty payload whose media type is in the MP3 family
+    — ``audio/mp3*`` or ``audio/mpeg*`` (case-insensitively) — and no larger
+    than :data:`MAX_NARRATION_BYTES`; any violation is an unusable output,
+    raised as a redacted :class:`NarratorError` (``from None``). Used by the
+    adapter and re-checked by the routing so a port that returns junk still
     degrades.
-
-    Deviation from spec (recorded): the plan states ``audio/*``; the locked
-    format decision is OGG, so we require the OGG subtype explicitly.
     """
-    mime = audio.mime_type or ""
+    mime = (audio.mime_type or "").lower()
     if (
-        not mime.lower().startswith("audio/ogg")
+        not mime.startswith(_MP3_MIME_PREFIXES)
         or not audio.data
         or len(audio.data) > MAX_NARRATION_BYTES
     ):
         raise NarratorError("model returned an unusable audio payload") from None
     return audio
-
-
-_OGG_MEDIA_TYPE = "audio/ogg"
 
 # --------------------------------------------------------------------------- routing
 
@@ -223,11 +244,11 @@ def handle_narrating(
     if state.narration is not None:
         # Re-send stored bytes
         try:
-            transport.send_voice(
+            transport.send_audio(
                 chat_id,
                 state.narration,
-                media_type=_OGG_MEDIA_TYPE,
-                filename="narration.ogg",
+                media_type=AUDIO_MEDIA_TYPE,
+                filename=AUDIO_FILENAME,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -244,7 +265,7 @@ def handle_narrating(
                 "event": "narration_sent",
                 "chat_id": chat_id,
                 "byte_count": len(state.narration),
-                "mime": _OGG_MEDIA_TYPE,
+                "mime": AUDIO_MEDIA_TYPE,
             },
         )
         return True
@@ -276,8 +297,8 @@ def handle_narrating(
         return False
 
     # Every send and every log reports the clean locked-format media type, never
-    # the model's decorated value (e.g. ``audio/ogg; codecs=opus``).
-    normalised_mime = _OGG_MEDIA_TYPE
+    # the model's decorated value (e.g. ``audio/mp3; rate=24000; channels=1``).
+    normalised_mime = AUDIO_MEDIA_TYPE
     log.info(
         "narrator ready",
         extra={
@@ -291,11 +312,11 @@ def handle_narrating(
     session.store_narration(chat_id, audio.data)
 
     try:
-        transport.send_voice(
+        transport.send_audio(
             chat_id,
             audio.data,
             media_type=normalised_mime,
-            filename="narration.ogg",
+            filename=AUDIO_FILENAME,
         )
     except (KeyboardInterrupt, SystemExit):
         raise

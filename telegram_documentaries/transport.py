@@ -40,10 +40,10 @@ DEFAULT_TIMEOUT = 30.0
 # media type, so one constant keeps the multipart body deterministic.
 PHOTO_FILENAME = "portrait"
 
-# Stable filename for the generated narration voice note part. OGG is the format
-# ``gemini-3.1-flash-tts-preview`` returns natively and the format Telegram
-# accepts for ``sendVoice``; the extension keeps the upload conventional.
-VOICE_FILENAME = "narration.ogg"
+# Stable filename for the generated narration audio part. MP3 is the format the
+# Gemini Interactions TTS returns natively and a format Telegram accepts for
+# ``sendAudio``; the extension keeps the upload conventional.
+AUDIO_FILENAME = "narration.mp3"
 
 # ------------------------------------------------------------- outbound length
 #
@@ -168,13 +168,13 @@ class Transport(Protocol):
         caption: str | None = None,
     ) -> dict[str, Any]: ...
 
-    def send_voice(
+    def send_audio(
         self,
         chat_id: int,
         audio: bytes,
         *,
         media_type: str,
-        filename: str = "narration.ogg",
+        filename: str = "narration.mp3",
     ) -> dict[str, Any]: ...
 
 
@@ -267,18 +267,18 @@ class UrllibTransport:
         raw = self._read("sendPhoto", request)
         return self._decode("sendPhoto", raw)
 
-    def send_voice(
+    def send_audio(
         self,
         chat_id: int,
         audio: bytes,
         *,
         media_type: str,
-        filename: str = VOICE_FILENAME,
+        filename: str = AUDIO_FILENAME,
     ) -> dict[str, Any]:
-        """Upload ``audio`` to ``sendVoice`` as ``multipart/form-data``.
+        """Upload ``audio`` to ``sendAudio`` as ``multipart/form-data``.
 
         The body is built by the pure :func:`_multipart` helper (file field
-        ``voice``) and sent through the same :meth:`_read`/:meth:`_decode`
+        ``audio``) and sent through the same :meth:`_read`/:meth:`_decode`
         normalisation as :meth:`send_photo`, so failures and token redaction
         behave identically.
         """
@@ -287,12 +287,12 @@ class UrllibTransport:
         body = _multipart(
             boundary=boundary,
             fields=fields,
-            file_field="voice",
+            file_field="audio",
             filename=filename,
             content_type=media_type,
             content=audio,
         )
-        url = f"{self._base_url}/bot{self._token}/sendVoice"
+        url = f"{self._base_url}/bot{self._token}/sendAudio"
         request = urllib_request.Request(
             url,
             data=body,
@@ -301,8 +301,8 @@ class UrllibTransport:
             },
             method="POST",
         )
-        raw = self._read("sendVoice", request)
-        return self._decode("sendVoice", raw)
+        raw = self._read("sendAudio", request)
+        return self._decode("sendAudio", raw)
 
     def _read(self, method: str, request: urllib_request.Request) -> bytes:
         """Run a request and normalise every failure into ``TelegramApiError``.

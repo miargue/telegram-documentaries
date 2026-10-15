@@ -651,6 +651,8 @@ def test_main_delivers_the_portrait_and_script_end_to_end(tmp_path: Path) -> Non
     assert len(converter.calls) == 1
     assert len(scripter.calls) == 1
     assert len(narrator.calls) == 1
-    assert len(transport.voices) == 1
+    assert len(transport.audios) == 1
+    assert transport.audios[0]["media_type"] == "audio/mpeg"
+    assert transport.audios[0]["filename"] == "narration.mp3"
     texts = [message["text"] for message in transport.calls_for("sendMessage")]
     assert texts[-1] == "A dramatic nature documentary script."

@@ -93,10 +93,10 @@ def handle_update(
     never delivered, which is routed to the Converter (the retry path); a
     ``done`` chat whose portrait arrived but whose narration script was never
     delivered, which is routed to the Scripter; and, when a ``narrator`` is
-    injected, a ``done`` chat with a delivered script but no voice note, which
-    is routed to the Narrator. When an Interviewer turn *completes* the
+    injected, a ``done`` chat with a delivered script but no audio message,
+    which is routed to the Narrator. When an Interviewer turn *completes* the
     interview, the Converter, Scripter and Narrator run in the same update so
-    the dossier report, hybrid portrait, narration script and voice note all
+    the dossier report, hybrid portrait, narration script and audio message all
     follow in a single pass. A deliberate, benign no-op returns
     :data:`SKIPPED` (so ``log_lifecycle`` logs it as ``skipped`` rather than a
     false ``degraded`` warning); a genuine reply failure returns ``False``.
@@ -178,11 +178,11 @@ def _route_after_gate(
     same update so the narration follows the recovered portrait. A ``done`` chat
     whose portrait arrived but whose narration script never did goes straight
     to the Scripter. When a ``narrator`` is injected, a ``done`` chat whose
-    script landed but whose voice note never did continues into the Narrator in
-    the same update. Every other update goes to the Interviewer; if that turn
+    script landed but whose audio message never did continues into the Narrator
+    in the same update. Every other update goes to the Interviewer; if that turn
     *completed* the interview, the Converter, Scripter and Narrator run in the
     same update so the dossier report, hybrid portrait, narration script and
-    voice note all follow in a single pass.
+    audio message all follow in a single pass.
     """
     state = session.get(chat_id)
     if state.phase is Phase.done and not state.portrait_sent:

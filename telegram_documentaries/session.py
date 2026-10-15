@@ -31,7 +31,7 @@ from pydantic import BaseModel
 # v4 (Phase 5): the raw narration ``script`` (ready for Phase 6 audio
 # synthesis) and the ``script_sent`` flag marking that it reached the chat.
 # v5 (Phase 6): the raw narration audio (``narration``) and the
-# ``narrator_sent`` flag marking that the voice note reached the chat.
+# ``narrator_sent`` flag marking that the audio message reached the chat.
 SESSION_VERSION = 5
 
 
@@ -83,9 +83,9 @@ class SessionState(BaseModel):
     # inferred) so a failed *send* re-sends the stored script LLM-free while a
     # failed *generation* (nothing stored yet) retries on the next update.
     script_sent: bool = False
-    # Phase 6: the raw narration audio payload (OGG), kept like the photo bytes.
+    # Phase 6: the raw narration audio payload (MP3), kept like the photo bytes.
     narration: bytes | None = None
-    # Phase 6: True once the narration voice note reached this chat. Stored
+    # Phase 6: True once the narration audio message reached this chat. Stored
     # (never inferred) so a failed *send* re-sends the stored audio with no
     # re-synthesis.
     narrator_sent: bool = False
@@ -236,16 +236,16 @@ class SessionStore:
         The bytes are captured *before* the send attempt so a failed delivery
         re-sends the exact stored audio on the next update (the re-ask pattern —
         no re-synthesis). ``narrator_sent`` is left untouched: that flag only
-        moves after the voice note actually reached the chat.
+        moves after the audio message actually reached the chat.
         """
         state = self.get(chat_id)
         state.narration = audio
         return state
 
     def mark_narrator_sent(self, chat_id: int) -> SessionState:
-        """Record that the narration voice note reached this chat.
+        """Record that the narration audio message reached this chat.
 
-        Called only *after* a successful ``sendVoice`` (the flag is evidence,
+        Called only *after* a successful ``sendAudio`` (the flag is evidence,
         not intent): ``done && script_sent && !narrator_sent`` stays retryable
         while ``narrator_sent`` makes the narration terminal. Only the flag
         moves — the stored audio survives if a later stage ever needs it.
