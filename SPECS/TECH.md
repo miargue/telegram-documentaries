@@ -8,23 +8,29 @@ agent and every review is judged against it.
 - **Language:** Python 3.
 - **Transport:** Telegram Bot API over **long polling** (`getUpdates`). No
   webhooks, no public URL.
-- **Framework:** **No vendor agent framework as of Phase 5.** Each pipeline
+- **Framework:** **No vendor agent framework as of Phase 6.** Each pipeline
   stage is a discrete module behind a narrow typed port. The Bouncer exposes a
   typed `VisionGate` port, the Interviewer a typed `InterviewLLM` port
   (`next_question` / `summarize`), the Converter a typed `ConverterLLM`
-  port (`hybridize(photo, dossier) -> GeneratedImage`), and the Scripter a
-  typed `ScripterLLM` port (`write_script(dossier) -> str`); all four adapters
-  are direct **Gemini REST** callers (`generateContent`) over stdlib `urllib`
-  with an injectable `urlopen` seam — the same no-third-party-HTTP pattern as
-  the Phase 1 transport. The shared REST plumbing (endpoint build, POST,
-  failure normalisation, candidate extraction, schema validation, image-part
-  decoding and the **single** API-key redaction implementation) lives once in
-  `gemini.py` (`GeminiJsonClient` — `generate_json` for the JSON output of
-  `vision.py`/`interviewer.py`/`scripter.py`, `generate_image` for the image
-  output of Phase 4's `converter.py`) and is reused by `vision.py`,
-  `interviewer.py`, `converter.py` and `scripter.py`. The Telegram transport
-  owns a multipart `sendPhoto` (`transport.py`) for delivering the generated
-  portrait.
+  port (`hybridize(photo, dossier) -> GeneratedImage`), the Scripter a
+  typed `ScripterLLM` port (`write_script(dossier) -> str`), and the Narrator a
+  typed `NarratorLLM` port (`synthesize(script) -> AudioPayload`); all five
+  adapters are direct **Gemini REST** callers over stdlib `urllib` with an
+  injectable `urlopen` seam — the same no-third-party-HTTP pattern as the
+  Phase 1 transport. Four are `generateContent` callers; the Narrator is a
+  **Gemini Interactions API** caller (`POST /v1beta/interactions`, model named
+  in the body, audio block decoded from `steps[0].content[]`). The shared REST
+  plumbing (endpoint build, POST, failure normalisation, candidate extraction,
+  schema validation, inline-part decoding and the **single** API-key redaction
+  implementation) lives once in `gemini.py` (`GeminiJsonClient` — `generate_json`
+  for the JSON output of `vision.py`/`interviewer.py`/`scripter.py`,
+  `generate_image` for the image output of Phase 4's `converter.py`,
+  `generate_interaction_audio` for the audio output of Phase 6's `narrator.py`)
+  and is reused by `vision.py`, `interviewer.py`, `converter.py`, `scripter.py`
+  and `narrator.py`. The Telegram transport owns a multipart `sendPhoto`
+  (`transport.py`) for delivering the generated portrait and a multipart
+  `sendAudio` for delivering the MP3 audio message (file field `audio`,
+  filename `narration.mp3`).
   **Google Agent Development Kit (ADK) is deferred**; if a later phase adopts
   it, it will wrap these same ports.
 - **Models:**
@@ -32,9 +38,11 @@ agent and every review is judged against it.
   - The Interviewer — sequential Q&A + orchestrator — **Gemini 3.1 Flash Lite**.
   - The Converter — hybrid portrait — **Gemini 3.1 Flash Image**.
   - The Scripter — narration prose — **Gemini 3.1 Flash Lite**.
-  - The Narrator — **not an agent** — Gemini TTS
-    (`gemini-3.1-flash-tts-preview`), output rendered to a
-    Telegram-compatible audio format (OGG/MP3).
+  - The Narrator — **not an agent** — Gemini TTS via the **Interactions API**
+    (`gemini-3.8-flash-lite-tts`), which returns **MP3** natively — the format
+    Telegram `sendAudio` accepts. Voice is a prebuilt id
+    (`en-gb-storyteller-4`); delivery style is sent as `speech_metadata.style`,
+    never prepended to the script.
 - **Secrets:** `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY` from `.env`. The
   `.env` file is gitignored and must never be committed.
 
@@ -46,24 +54,27 @@ agent and every review is judged against it.
   Interviewer turn *completes* the interview the Bouncer runs the same-update
   Converter handoff itself (hub-and-spoke: neither the Interviewer nor the
   Converter knows the other). The handoff chain is **dossier → portrait →
-  script in one update**: once the converted portrait lands, the same update
-  continues into the Scripter, so the narration script follows the portrait
-  with **no user input** in between; the raw script is stored on the session
-  for the Phase 6 Narrator. Each pipeline stage is a discrete module (Bouncer,
-  Interviewer, Converter, Scripter) plus the non-agent TTS renderer.
+  script → audio message in one update**: once the converted portrait lands, the
+  same update continues into the Scripter, and once the script lands it
+  continues into the Narrator, so the narration script and the playable audio
+  message follow the portrait with **no user input** in between; the raw script
+  and the raw MP3 audio are stored on the session. Each pipeline stage is a
+  discrete module (Bouncer, Interviewer, Converter, Scripter, Narrator).
   Stage boundaries are **typed ports**, not vendor SDKs: the Bouncer is
   `VisionGate.classify(image) -> HumanVerdict`, the Interviewer is
   `InterviewLLM.next_question(...) -> str` / `summarize(...) -> Dossier`, the
-  Converter is `ConverterLLM.hybridize(photo, dossier) -> GeneratedImage`, and
-  the Scripter is `ScripterLLM.write_script(dossier) -> str`, so the Gemini
+  Converter is `ConverterLLM.hybridize(photo, dossier) -> GeneratedImage`, the
+  Scripter is `ScripterLLM.write_script(dossier) -> str`, and the Narrator is
+  `NarratorLLM.synthesize(script) -> AudioPayload`, so the Gemini
   REST adapters can later be swapped for ADK agents without touching the
   routing code. The Interviewer owns its own turn-taking (the
   phase machine, the exactly-5 cap and the one-question-per-message rule);
   `InterviewLLM` merely supplies one validated question or the final dossier at
   a time, the Converter's routing owns its teaser, validation guards and
-  caption, and the Scripter's routing owns the apology/retry and stored-script
-  re-send (the re-ask pattern: a failed *delivery* re-sends the stored script
-  LLM-free, so one subject always gets one narration).
+  caption, the Scripter's routing owns the apology/retry and stored-script
+  re-send, and the Narrator's routing owns its output validation, apology/retry
+  and stored-audio re-send (the re-ask pattern: a failed *delivery* re-sends the
+  stored MP3 bytes LLM-free, so one script always yields one audio message).
 - **Explicit state machine:** one well-defined phase per pipeline stage, with
   explicit transitions and a single shared state driver. Phase is stored in the
   session state, never inferred implicitly.
@@ -99,6 +110,10 @@ agent and every review is judged against it.
   generated hybrid portrait actually reached the chat. **Version 4** (Phase 5)
   adds the raw narration `script` (stored for the Phase 6 Narrator) and the
   `script_sent` flag — set only after the script actually reached the chat.
+  **Version 5** (Phase 6) adds the raw narration audio `narration` (the MP3
+  payload, kept like the photo bytes so a failed delivery re-sends it) and the
+  `narrator_sent` flag — set only after the audio message actually reached the
+  chat.
   In-memory only — the version bump is the schema contract, not a migration.
 - Phases: `awaiting_photo` → `gate_passed` → `interviewing` → `done`. A
   `gate_passed` chat only survives a degraded interview start and is retried on
@@ -106,11 +121,15 @@ agent and every review is judged against it.
   finished, portrait pending" — the Converter retries on the next update; a
   `done` chat with `portrait_sent == True` and `script_sent == False` is
   "portrait delivered, narration pending" — the Scripter retries on the next
-  update; `portrait_sent` and `script_sent` are stored, never inferred.
+  update; a `done` chat with `script_sent == True` and `narrator_sent == False`
+  is "script delivered, audio message pending" — the Narrator retries (or
+  re-sends the stored audio) on the next update; `portrait_sent`, `script_sent`
+  and `narrator_sent` are stored, never inferred.
 - One shared state driver (single module owns read/write/reset).
 - Reset semantics: `/start` and `/restart` clear state, the interview log, the
-  pending question, the dossier, the `portrait_sent` and `script_sent` flags,
-  the stored `script`, and temp media without restarting the process.
+  pending question, the dossier, the `portrait_sent`, `script_sent` and
+  `narrator_sent` flags, the stored `script` and `narration`, and temp media
+  without restarting the process.
 
 ## Testing
 

@@ -26,6 +26,9 @@ from telegram_documentaries.config import (
     get_converter_model,
     get_converter_timeout,
     get_interview_model,
+    get_narrator_model,
+    get_narrator_timeout,
+    get_narrator_voice,
     get_script_model,
     get_token,
     get_vision_model,
@@ -33,6 +36,7 @@ from telegram_documentaries.config import (
 from telegram_documentaries.converter import ConverterLLM, GeminiConverter
 from telegram_documentaries.interviewer import GeminiInterviewer, InterviewLLM
 from telegram_documentaries.logging_config import configure_logging
+from telegram_documentaries.narrator import GeminiNarrator, NarratorLLM
 from telegram_documentaries.polling import run_polling
 from telegram_documentaries.scripter import GeminiScripter, ScripterLLM
 from telegram_documentaries.session import SessionStore
@@ -54,6 +58,8 @@ InterviewFactory = Callable[[str, str], InterviewLLM]
 ConverterFactory = Callable[[str, str, float], ConverterLLM]
 # Builds the narration Scripter from the resolved API key and model id.
 ScripterFactory = Callable[[str, str], ScripterLLM]
+# Builds the narrator from the API key, model id, voice and timeout (seconds).
+NarratorFactory = Callable[[str, str, str, float], NarratorLLM]
 
 
 def _build_gate(api_key: str, model: str) -> VisionGate:
@@ -74,6 +80,13 @@ def _build_converter(api_key: str, model: str, timeout: float) -> ConverterLLM:
 def _build_scripter(api_key: str, model: str) -> ScripterLLM:
     """Default scripter factory: a Gemini REST text adapter."""
     return GeminiScripter(api_key, model=model)
+
+
+def _build_narrator(
+    api_key: str, model: str, voice: str, timeout: float
+) -> NarratorLLM:
+    """Default narrator factory: a Gemini REST text-to-speech adapter."""
+    return GeminiNarrator(api_key, model=model, voice=voice, timeout=timeout)
 
 
 def _probe_bot_username(transport: Transport) -> str | None:
@@ -163,6 +176,7 @@ def main(
     interview_factory: InterviewFactory = _build_interviewer,
     converter_factory: ConverterFactory = _build_converter,
     scripter_factory: ScripterFactory = _build_scripter,
+    narrator_factory: NarratorFactory = _build_narrator,
 ) -> int:
     """Run the gateway; return a process exit code instead of raising."""
     # Configure a sane level first so even an argparse usage error is emitted
@@ -210,6 +224,12 @@ def main(
     scripter = scripter_factory(
         api_key, get_script_model(environ=environ, env_file=env_file)
     )
+    narrator = narrator_factory(
+        api_key,
+        get_narrator_model(environ=environ, env_file=env_file),
+        get_narrator_voice(environ=environ, env_file=env_file),
+        get_narrator_timeout(environ=environ, env_file=env_file),
+    )
 
     LOGGER.info(
         "gateway starting",
@@ -228,6 +248,7 @@ def main(
             llm=llm,
             converter=converter,
             scripter=scripter,
+            narrator=narrator,
             max_polls=args.max_polls,
         )
     except KeyboardInterrupt:

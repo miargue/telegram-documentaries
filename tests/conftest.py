@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from telegram_documentaries.converter import GeneratedImage
+from telegram_documentaries.gemini import AudioPayload
 from telegram_documentaries.session import Dossier, QaPair
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict
@@ -191,6 +192,9 @@ class FakeTransport:
         # Every attempted ``sendPhoto`` upload, in order. Recorded before any
         # scripted failure (like ``calls``) so tests can assert the attempt.
         self.photos: list[dict[str, Any]] = []
+        # Every attempted ``sendAudio`` upload, in order. Recorded before any
+        # scripted failure so tests can assert the attempt.
+        self.audios: list[dict[str, Any]] = []
 
     def call(
         self, method: str, params: Mapping[str, Any] | None = None
@@ -237,6 +241,30 @@ class FakeTransport:
         )
         if "sendPhoto" in self.fail_on:
             raise self.fail_on["sendPhoto"]
+        return {
+            "ok": True,
+            "result": {"message_id": 1, "chat": {"id": chat_id}},
+        }
+
+    def send_audio(
+        self,
+        chat_id: int,
+        audio: bytes,
+        *,
+        media_type: str,
+        filename: str = "narration.mp3",
+    ) -> dict[str, Any]:
+        """Record an attempted narration audio upload and (unless scripted) ok."""
+        self.audios.append(
+            {
+                "chat_id": chat_id,
+                "audio": audio,
+                "media_type": media_type,
+                "filename": filename,
+            }
+        )
+        if "sendAudio" in self.fail_on:
+            raise self.fail_on["sendAudio"]
         return {
             "ok": True,
             "result": {"message_id": 1, "chat": {"id": chat_id}},
@@ -401,6 +429,40 @@ class FakeScripter:
     def write_script(self, dossier: Dossier) -> str:
         self.calls.append(dossier)
         result = self.scripts.pop(0) if self.scripts else self.default
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+class FakeNarrator:
+    """Scripted ``NarratorLLM`` double.
+
+    ``results`` is a FIFO queue of :class:`AudioPayload` values or exceptions to
+    raise; once exhausted the ``default`` payload is returned, so tests only
+    script the calls they care about. Every call records the raw script it was
+    handed for assertions (so tests can prove synthesis wasn't re-run).
+    """
+
+    def __init__(
+        self,
+        results: list[Any] | None = None,
+        *,
+        default: AudioPayload | None = None,
+    ) -> None:
+        self.results: list[Any] = list(results or [])
+        self.default: AudioPayload = (
+            AudioPayload(
+                data=b"ID3\x03\x00\x00\x00fake-narration-mp3",
+                mime_type="audio/mpeg",
+            )
+            if default is None
+            else default
+        )
+        self.calls: list[str] = []
+
+    def synthesize(self, script: str) -> AudioPayload:
+        self.calls.append(script)
+        result = self.results.pop(0) if self.results else self.default
         if isinstance(result, BaseException):
             raise result
         return result

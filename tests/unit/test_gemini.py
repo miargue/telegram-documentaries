@@ -28,6 +28,7 @@ from pydantic import BaseModel
 
 from telegram_documentaries.gemini import (
     DEFAULT_TIMEOUT,
+    AudioPayload,
     GeminiError,
     GeminiJsonClient,
     InlineImagePayload,
@@ -297,17 +298,21 @@ def test_api_key_is_redacted_from_a_raised_error_message() -> None:
     assert "***" in str(exc_info.value)
 
 
-def _gemini_failures() -> dict[str, Callable[[], BaseException]]:
+def _gemini_failures(
+    path: str = "v1beta/models/m:generateContent",
+) -> dict[str, Callable[[], BaseException]]:
     """One fresh, key-bearing failure per normalised client branch.
 
     The API key travels in ``?key=<key>`` on the request URL, so every error
     whose text embeds the URL/selector — a real path-validation ``InvalidURL``,
     a ``URLError``/``OSError`` reason, or an ``HTTPError`` body — carries it.
+    ``path`` names the endpoint the failures embed, so the Interactions test
+    exercises its own endpoint rather than ``generateContent``.
     """
-    endpoint = f"https://x/v1beta/models/m:generateContent?key={SECRET_KEY}"
+    endpoint = f"https://x/{path}?key={SECRET_KEY}"
     return {
         "invalid_url": lambda: real_invalid_url(
-            f"/v1beta/models/m:generateContent?key={SECRET_KEY}\ncontrol"
+            f"/{path}?key={SECRET_KEY}\ncontrol"
         ),
         "url_error": lambda: urllib.error.URLError(
             f"connection refused: {endpoint}"
@@ -697,6 +702,331 @@ def test_generate_image_redacts_a_control_character_key() -> None:
 
     with pytest.raises(GeminiError) as exc_info:
         client.generate_image(image_request())
+
+    error = exc_info.value
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+
+    assert "CANARY" not in str(error)
+    assert "CANARY" not in formatted
+    assert error.__cause__ is None
+
+
+# ------------------------------------------------- generate_interaction_audio
+#
+# The Phase 6 Narrator needs audio *output* from the Gemini **Interactions
+# API** (``POST /v1beta/interactions``): the model travels in the request body
+# (never the URL) and the audio is the first block of the first step's content
+# whose ``type`` is ``"audio"``. The POST, failure normalisation and single
+# API-key redaction implementation are shared with ``generate_json`` (only the
+# endpoint differs), so the redaction guarantee is literally the same code.
+
+AUDIO_BYTES = b"ID3\x03\x00\x00\x00narration-mp3-bytes"
+
+
+def audio_block(
+    data: bytes = AUDIO_BYTES,
+    mime_type: str = "audio/mp3; rate=24000; channels=1",
+) -> dict[str, Any]:
+    """One Interactions audio block shaped exactly as the API serialises it."""
+    return {
+        "type": "audio",
+        "mime_type": mime_type,
+        "data": base64.b64encode(data).decode("ascii"),
+    }
+
+
+def interactions_body(
+    blocks: list[dict[str, Any]] | None = None,
+    *,
+    steps: list[dict[str, Any]] | None = None,
+) -> bytes:
+    """An Interactions response carrying blocks in its first step."""
+    if steps is None:
+        steps = [{"content": [audio_block()] if blocks is None else blocks}]
+    return json.dumps({"steps": steps}).encode("utf-8")
+
+
+def interactions_request() -> dict[str, Any]:
+    return {
+        "model": "gemini-3.8-flash-lite-tts",
+        "input": [
+            {
+                "type": "user_input",
+                "content": [{"type": "text", "text": "narrate"}],
+            }
+        ],
+        "response_format": {"type": "audio", "mime_type": "audio/mp3"},
+        "generation_config": {"speech_config": [{"voice": "en-gb-storyteller-4"}]},
+    }
+
+
+def test_generate_interaction_audio_posts_to_the_interactions_endpoint() -> None:
+    client, opener = make_client([FakeResponse(interactions_body())])
+
+    client.generate_interaction_audio(interactions_request())
+
+    url, data, timeout = opener.requests[0]
+    assert opener.methods[0] == "POST"
+    assert url == (
+        f"https://generativelanguage.googleapis.com/v1beta/interactions"
+        f"?key={SECRET_KEY}"
+    )
+    assert data is not None
+    assert json.loads(data) == interactions_request()
+    assert timeout == pytest.approx(DEFAULT_TIMEOUT)
+
+
+def test_generate_interaction_audio_keeps_the_model_in_the_body_not_the_url() -> None:
+    client, opener = make_client([FakeResponse(interactions_body())])
+
+    client.generate_interaction_audio(interactions_request())
+
+    url, data, _timeout = opener.requests[0]
+    assert "gemini-test-model" not in url
+    assert data is not None
+    assert json.loads(data)["model"] == interactions_request()["model"]
+
+
+def test_generate_interaction_audio_passes_the_request_body_through_untouched() -> None:
+    client, opener = make_client([FakeResponse(interactions_body())])
+
+    client.generate_interaction_audio(interactions_request())
+
+    _url, data, _timeout = opener.requests[0]
+    assert data is not None
+    assert json.loads(data) == interactions_request()
+
+
+def test_generate_interaction_audio_returns_the_decoded_bytes_and_mime_type() -> None:
+    client, _ = make_client(
+        [FakeResponse(interactions_body([audio_block(b"MP3-DATA", "audio/mp3")]))]
+    )
+
+    payload = client.generate_interaction_audio(interactions_request())
+
+    assert isinstance(payload, AudioPayload)
+    assert payload.data == b"MP3-DATA"
+    assert payload.mime_type == "audio/mp3"
+
+
+def test_generate_interaction_audio_passes_a_decorated_mime_through_verbatim() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                interactions_body(
+                    [audio_block(b"MP3", "audio/mp3; rate=24000; channels=1")]
+                )
+            )
+        ]
+    )
+
+    payload = client.generate_interaction_audio(interactions_request())
+
+    assert payload.mime_type == "audio/mp3; rate=24000; channels=1"
+
+
+def test_generate_interaction_audio_skips_non_audio_blocks_first() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                interactions_body(
+                    [
+                        {"type": "text", "text": "here you go"},
+                        audio_block(b"AUDIO", "audio/mpeg"),
+                    ]
+                )
+            )
+        ]
+    )
+
+    payload = client.generate_interaction_audio(interactions_request())
+
+    assert payload.data == b"AUDIO"
+    assert payload.mime_type == "audio/mpeg"
+
+
+def test_generate_interaction_audio_uses_the_first_step_only() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                interactions_body(
+                    steps=[
+                        {"content": [audio_block(b"ONE")]},
+                        {"content": [audio_block(b"TWO")]},
+                    ]
+                )
+            )
+        ]
+    )
+
+    payload = client.generate_interaction_audio(interactions_request())
+
+    assert payload.data == b"ONE"
+
+
+def test_generate_interaction_audio_rejects_a_response_without_steps() -> None:
+    client, _ = make_client([FakeResponse(json.dumps({"steps": []}).encode())])
+
+    with pytest.raises(GeminiError, match="steps"):
+        client.generate_interaction_audio(interactions_request())
+
+
+def test_generate_interaction_audio_rejects_a_step_without_content() -> None:
+    client, _ = make_client(
+        [FakeResponse(interactions_body(steps=[{"content": {}}]))]
+    )
+
+    with pytest.raises(GeminiError, match="content"):
+        client.generate_interaction_audio(interactions_request())
+
+
+def test_generate_interaction_audio_rejects_a_response_without_an_audio_block() -> None:
+    client, _ = make_client(
+        [FakeResponse(interactions_body([{"type": "text", "text": "all done"}]))]
+    )
+
+    with pytest.raises(GeminiError, match="audio block"):
+        client.generate_interaction_audio(interactions_request())
+
+
+def test_generate_interaction_audio_rejects_empty_audio_data() -> None:
+    client, _ = make_client([FakeResponse(interactions_body([audio_block(b"")]))])
+
+    with pytest.raises(GeminiError, match="empty"):
+        client.generate_interaction_audio(interactions_request())
+
+
+@pytest.mark.parametrize("junk", ["not base64!!", "AAAA!"])
+def test_generate_interaction_audio_rejects_non_base64_audio_data(
+    junk: str,
+) -> None:
+    # ``AAAA!`` decodes silently under ``b64decode``'s default lenient mode;
+    # strict validation must reject it, exactly as for images.
+    block = {"type": "audio", "mime_type": "audio/mp3", "data": junk}
+    client, _ = make_client([FakeResponse(interactions_body([block]))])
+
+    with pytest.raises(GeminiError, match="base64"):
+        client.generate_interaction_audio(interactions_request())
+
+
+def test_generate_interaction_audio_rejects_a_block_without_data_or_mime() -> None:
+    missing_data, _ = make_client(
+        [
+            FakeResponse(
+                interactions_body([{"type": "audio", "mime_type": "audio/mp3"}])
+            )
+        ]
+    )
+    with pytest.raises(GeminiError, match="data"):
+        missing_data.generate_interaction_audio(interactions_request())
+
+    missing_mime, _ = make_client(
+        [FakeResponse(interactions_body([{"type": "audio", "data": "AAAA"}]))]
+    )
+    with pytest.raises(GeminiError, match="mime_type"):
+        missing_mime.generate_interaction_audio(interactions_request())
+
+    wrong_mime, _ = make_client(
+        [
+            FakeResponse(
+                interactions_body(
+                    [{"type": "audio", "mime_type": 7, "data": "AAAA"}]
+                )
+            )
+        ]
+    )
+    with pytest.raises(GeminiError, match="mime_type"):
+        wrong_mime.generate_interaction_audio(interactions_request())
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (b"not json at all", "JSON"),
+        (b"[1, 2, 3]", "JSON object"),
+        (json.dumps({"steps": "nope"}).encode(), "steps"),
+    ],
+)
+def test_generate_interaction_audio_normalises_malformed_responses(
+    raw: bytes, match: str
+) -> None:
+    client, _ = make_client([FakeResponse(raw)])
+
+    with pytest.raises(GeminiError, match=match):
+        client.generate_interaction_audio(interactions_request())
+
+
+def test_generate_interaction_audio_normalises_an_error_payload() -> None:
+    body = json.dumps(
+        {"error": {"code": 400, "message": "API key not valid", "status": "BAD"}}
+    ).encode()
+    client, _ = make_client([FakeResponse(body)])
+
+    with pytest.raises(GeminiError, match="API key not valid"):
+        client.generate_interaction_audio(interactions_request())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError(
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+            400,
+            "Bad Request",
+            cast(Any, None),
+            io.BytesIO(b'{"error": {"code": 400, "message": "backend exploded"}}'),
+        ),
+        urllib.error.URLError("connection refused"),
+        http.client.IncompleteRead(b"half"),
+        TimeoutError("timed out"),
+    ],
+)
+def test_generate_interaction_audio_normalises_transport_failures(
+    error: BaseException,
+) -> None:
+    client, _ = make_client([error])
+
+    with pytest.raises(GeminiError):
+        client.generate_interaction_audio(interactions_request())
+
+
+@pytest.mark.parametrize(
+    "label", sorted(_gemini_failures("v1beta/interactions"))
+)
+def test_every_generate_interaction_failure_redacts_the_api_key(
+    label: str,
+) -> None:
+    client, _ = make_client(
+        [_gemini_failures("v1beta/interactions")[label]()]
+    )
+
+    with pytest.raises(GeminiError) as exc_info:
+        client.generate_interaction_audio(interactions_request())
+
+    error = exc_info.value
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    json_line = _format_exception((type(error), error, error.__traceback__))
+
+    assert SECRET_KEY not in str(error), f"{label} leaked in str(exc)"
+    assert SECRET_KEY not in formatted, f"{label} leaked via traceback"
+    assert SECRET_KEY not in json_line, f"{label} leaked via JsonFormatter"
+    assert error.__cause__ is None, f"{label} leaked via __cause__"
+    assert error.__suppress_context__ is True, f"{label} leaked via __context__"
+
+
+def test_generate_interaction_audio_redacts_a_control_character_key() -> None:
+    key = "SECRET-GEMINI-KEY-\nCANARY"
+    client, _ = make_client(
+        [real_invalid_url(f"/v1beta/interactions?key={key}")],
+        api_key=key,
+    )
+
+    with pytest.raises(GeminiError) as exc_info:
+        client.generate_interaction_audio(interactions_request())
 
     error = exc_info.value
     formatted = "".join(

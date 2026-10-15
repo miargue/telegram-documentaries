@@ -40,6 +40,11 @@ DEFAULT_TIMEOUT = 30.0
 # media type, so one constant keeps the multipart body deterministic.
 PHOTO_FILENAME = "portrait"
 
+# Stable filename for the generated narration audio part. MP3 is the format the
+# Gemini Interactions TTS returns natively and a format Telegram accepts for
+# ``sendAudio``; the extension keeps the upload conventional.
+AUDIO_FILENAME = "narration.mp3"
+
 # ------------------------------------------------------------- outbound length
 #
 # Telegram rejects ``sendMessage`` text longer than 4096 *UTF-16 code units*
@@ -163,6 +168,15 @@ class Transport(Protocol):
         caption: str | None = None,
     ) -> dict[str, Any]: ...
 
+    def send_audio(
+        self,
+        chat_id: int,
+        audio: bytes,
+        *,
+        media_type: str,
+        filename: str = "narration.mp3",
+    ) -> dict[str, Any]: ...
+
 
 class UrllibTransport:
     """POSTs form-encoded requests to ``https://api.telegram.org/bot<token>``."""
@@ -252,6 +266,43 @@ class UrllibTransport:
         )
         raw = self._read("sendPhoto", request)
         return self._decode("sendPhoto", raw)
+
+    def send_audio(
+        self,
+        chat_id: int,
+        audio: bytes,
+        *,
+        media_type: str,
+        filename: str = AUDIO_FILENAME,
+    ) -> dict[str, Any]:
+        """Upload ``audio`` to ``sendAudio`` as ``multipart/form-data``.
+
+        The body is built by the pure :func:`_multipart` helper (file field
+        ``audio``) and sent through the same :meth:`_read`/:meth:`_decode`
+        normalisation as :meth:`send_photo`, so failures and token redaction
+        behave identically.
+        """
+        boundary = secrets.token_hex(16)
+        fields: dict[str, str] = {"chat_id": str(chat_id)}
+        body = _multipart(
+            boundary=boundary,
+            fields=fields,
+            file_field="audio",
+            filename=filename,
+            content_type=media_type,
+            content=audio,
+        )
+        url = f"{self._base_url}/bot{self._token}/sendAudio"
+        request = urllib_request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            },
+            method="POST",
+        )
+        raw = self._read("sendAudio", request)
+        return self._decode("sendAudio", raw)
 
     def _read(self, method: str, request: urllib_request.Request) -> bytes:
         """Run a request and normalise every failure into ``TelegramApiError``.

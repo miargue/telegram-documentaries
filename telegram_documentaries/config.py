@@ -17,6 +17,9 @@ from telegram_documentaries.defaults import (
     DEFAULT_CONVERTER_MODEL,
     DEFAULT_CONVERTER_TIMEOUT,
     DEFAULT_INTERVIEW_MODEL,
+    DEFAULT_NARRATOR_MODEL,
+    DEFAULT_NARRATOR_TIMEOUT,
+    DEFAULT_NARRATOR_VOICE,
     DEFAULT_SCRIPT_MODEL,
     DEFAULT_VISION_MODEL,
 )
@@ -30,6 +33,9 @@ _INTERVIEW_MODEL_KEY = "GEMINI_INTERVIEW_MODEL"
 _CONVERTER_MODEL_KEY = "GEMINI_CONVERTER_MODEL"
 _CONVERTER_TIMEOUT_KEY = "GEMINI_CONVERTER_TIMEOUT"
 _SCRIPT_MODEL_KEY = "GEMINI_SCRIPT_MODEL"
+_NARRATOR_MODEL_KEY = "GEMINI_NARRATOR_MODEL"
+_NARRATOR_VOICE_KEY = "GEMINI_NARRATOR_VOICE"
+_NARRATOR_TIMEOUT_KEY = "GEMINI_NARRATOR_TIMEOUT"
 
 
 class ConfigError(Exception):
@@ -241,6 +247,81 @@ def get_converter_timeout(
     if not math.isfinite(timeout) or timeout <= 0:
         raise ConfigError(
             f"{_CONVERTER_TIMEOUT_KEY} must be a positive number of seconds, "
+            f"got {raw!r}"
+        )
+    return timeout
+
+
+def get_narrator_model(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> str:
+    """Resolve the Gemini TTS model used by the Narrator.
+
+    An optional ``GEMINI_NARRATOR_MODEL`` override follows the same
+    env-beats-file precedence as the other models; a blank override falls back
+    to :data:`DEFAULT_NARRATOR_MODEL`.
+    """
+    env = os.environ if environ is None else environ
+    model = env.get(_NARRATOR_MODEL_KEY, "").strip()
+    if model:
+        return model
+
+    model = load_env_file(env_file).get(_NARRATOR_MODEL_KEY, "").strip()
+    return model or DEFAULT_NARRATOR_MODEL
+
+
+def get_narrator_voice(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> str:
+    """Resolve the prebuilt voice id passed to the Narrator TTS call.
+
+    An optional ``GEMINI_NARRATOR_VOICE`` override follows the same
+    env-beats-file precedence as the models; a blank override falls back to
+    :data:`DEFAULT_NARRATOR_VOICE` (the built-in documentary narrator voice id),
+    so the user can pick another prebuilt voice without editing code.
+    """
+    env = os.environ if environ is None else environ
+    voice = env.get(_NARRATOR_VOICE_KEY, "").strip()
+    if voice:
+        return voice
+
+    voice = load_env_file(env_file).get(_NARRATOR_VOICE_KEY, "").strip()
+    return voice or DEFAULT_NARRATOR_VOICE
+
+
+def get_narrator_timeout(
+    *,
+    environ: Mapping[str, str] | None = None,
+    env_file: Path | None = DEFAULT_ENV_FILE,
+) -> float:
+    """Resolve the Narrator timeout (seconds), defaulting to 90.
+
+    An optional ``GEMINI_NARRATOR_TIMEOUT`` override follows the same
+    env-beats-file precedence as the models; a blank override falls back to
+    :data:`DEFAULT_NARRATOR_TIMEOUT`. A present but unparsable value is a hard
+    ``ConfigError`` rather than a silent fallback, mirroring the Converter: a
+    value that parses but cannot be a real timeout — non-finite
+    (``nan``/``inf``) or non-positive — is likewise rejected loudly.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(_NARRATOR_TIMEOUT_KEY, "").strip()
+    if not raw:
+        raw = load_env_file(env_file).get(_NARRATOR_TIMEOUT_KEY, "").strip()
+    if not raw:
+        return DEFAULT_NARRATOR_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        raise ConfigError(
+            f"{_NARRATOR_TIMEOUT_KEY} must be a number of seconds, got {raw!r}"
+        ) from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ConfigError(
+            f"{_NARRATOR_TIMEOUT_KEY} must be a positive number of seconds, "
             f"got {raw!r}"
         )
     return timeout

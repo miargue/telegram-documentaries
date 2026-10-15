@@ -12,8 +12,15 @@ output: :meth:`GeminiJsonClient.generate_image` posts the request through the
 identical transport/normalisation/redaction path and decodes the candidate's
 first ``inlineData`` part instead of parsing JSON text.
 
+The Narrator (``narrator.py`` + ``GeminiNarrator``) uses a *different* endpoint
+for *audio* output: :meth:`GeminiJsonClient.generate_interaction_audio` POSTs
+to the newer Gemini **Interactions API** (``POST /v1beta/interactions``) — the
+model travels in the request body, not the URL — and decodes the first block of
+the first step's content whose ``type`` is ``"audio"``. It shares the same
+POST/normalisation/redaction machinery as the ``generateContent`` methods.
+
 Every failure — network, HTTP, Telegram-style error payload, malformed or
-schema-invalid model output, or a missing/undecodable image part — is
+schema-invalid model output, or a missing/undecodable image or audio part — is
 normalised to :class:`GeminiError`, and the API key is redacted from any
 raised message or log line.
 
@@ -23,7 +30,7 @@ chained cause/context — ever contains the API key. The key travels in
 :meth:`GeminiJsonClient._redact` and raises with ``from None`` to keep the raw,
 key-bearing cause out of a formatted traceback. Adapters wrap ``GeminiError``
 into their own domain error the same way (``VisionError``, ``InterviewError``,
-``ConverterError``).
+``ConverterError``, ``NarratorError``).
 """
 
 from __future__ import annotations
@@ -71,12 +78,28 @@ class InlineImagePayload(BaseModel):
     mime_type: str
 
 
+class AudioPayload(BaseModel):
+    """A model audio payload, base64-decoded out of a Gemini response.
+
+    The Phase 6 Narrator asks the Interactions API for audio output
+    (``response_format: {type: audio, mime_type: audio/mp3}``) and reads the
+    first block of the first step's content whose ``type`` is ``"audio"``:
+    ``data`` is the decoded audio (never logged) and ``mime_type`` is the
+    model-declared value, e.g. ``audio/mp3; rate=24000; channels=1``.
+    """
+
+    data: bytes
+    mime_type: str
+
+
 class GeminiJsonClient:
-    """POSTs a ``generateContent`` request and returns the parsed candidate.
+    """POSTs a Gemini request and returns the parsed response.
 
     ``generate_json`` validates the candidate's JSON text against a schema;
-    ``generate_image`` decodes its first inline image part. Both share the same
-    POST, failure normalisation and API-key redaction implementation.
+    ``generate_image`` decodes its first inline image part (both on the
+    ``generateContent`` endpoint). ``generate_interaction_audio`` posts to the
+    Interactions API and decodes its audio block. All share the same POST,
+    failure normalisation and API-key redaction implementation.
 
     ``urlopen`` is injectable so tests never contact Gemini. The API key
     travels in the request URL (as Gemini requires) and is redacted from every
@@ -136,15 +159,40 @@ class GeminiJsonClient:
             self._candidates(self._load(self._post(request_body)))[0]
         )
 
-    def _post(self, request_body: dict[str, Any]) -> bytes:
-        """POST the JSON body and return the raw response bytes.
+    def generate_interaction_audio(
+        self, request_body: dict[str, Any]
+    ) -> AudioPayload:
+        """POST ``request_body`` to the Interactions API and decode its audio.
 
-        The single place any request-level failure is normalised; both
-        ``generate_json`` and ``generate_image`` go through it.
+        Unlike the ``generateContent`` methods, the model travels **in the
+        request body** and the endpoint is ``<base>/v1beta/interactions``. The
+        response carries a ``steps`` list; the audio is the first block of the
+        first step's ``content`` whose ``type`` is ``"audio"``. Identical
+        transport, normalisation and redaction path as :meth:`generate_json`
+        (only the endpoint/extraction differ); a response with no steps, no
+        content, no audio block, or an empty/undecodable payload is a
+        normalised redacted :class:`GeminiError`.
+        """
+        return self._audio_block(
+            self._steps(
+                self._load(self._post_to(self._interactions_endpoint(), request_body))
+            )
+        )
+
+    def _post(self, request_body: dict[str, Any]) -> bytes:
+        """POST the JSON body to ``generateContent`` and return the raw bytes."""
+        return self._post_to(self._generate_content_endpoint(), request_body)
+
+    def _post_to(self, endpoint: str, request_body: dict[str, Any]) -> bytes:
+        """POST the JSON body to ``endpoint`` and return the raw response bytes.
+
+        The single place any request-level failure is normalised; every method
+        (``generate_json``, ``generate_image``, ``generate_interaction_audio``)
+        goes through it, so the redaction guarantee is literally shared code.
         """
         try:
             request = urllib_request.Request(
-                self._endpoint(),
+                endpoint,
                 data=json.dumps(request_body).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -174,11 +222,14 @@ class GeminiJsonClient:
                 "unexpected error", f"{type(exc).__name__}: {exc}"
             ) from None
 
-    def _endpoint(self) -> str:
+    def _generate_content_endpoint(self) -> str:
         return (
             f"{self._base_url}/v1beta/models/{self._model}:generateContent"
             f"?key={self._api_key}"
         )
+
+    def _interactions_endpoint(self) -> str:
+        return f"{self._base_url}/v1beta/interactions?key={self._api_key}"
 
     def _load(self, raw: bytes) -> dict[str, Any]:
         """Decode a response body into the payload object or fail."""
@@ -255,28 +306,72 @@ class GeminiJsonClient:
             inline = part.get("inlineData")
             if not isinstance(inline, dict):
                 continue
-            return self._decode_image(inline)
+            mime_type, data = self._decode_base64_part(
+                inline, label="candidate image part", mime_key="mimeType"
+            )
+            return InlineImagePayload(data=data, mime_type=mime_type)
         raise self._fail("candidate has no inlineData image part") from None
 
-    def _decode_image(self, inline: dict[str, Any]) -> InlineImagePayload:
-        mime_type = inline.get("mimeType")
+    def _steps(self, payload: dict[str, Any]) -> list[Any]:
+        """Return the Interactions response's non-empty ``steps`` list or fail."""
+        steps = payload.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise self._fail("response has no steps") from None
+        return steps
+
+    def _audio_block(self, steps: list[Any]) -> AudioPayload:
+        """Decode the first ``type == "audio"`` block of the first step.
+
+        Only the first step is considered (the response is a single unary
+        turn); non-dict blocks and blocks of another ``type`` are skipped, so a
+        model that narrates alongside the audio still yields the audio. A first
+        step with no content list, or no audio block at all, fails loudly.
+        """
+        first = steps[0]
+        content = first.get("content") if isinstance(first, dict) else None
+        if not isinstance(content, list):
+            raise self._fail("first step has no content") from None
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "audio":
+                mime_type, data = self._decode_base64_part(
+                    block, label="audio block", mime_key="mime_type"
+                )
+                return AudioPayload(data=data, mime_type=mime_type)
+        raise self._fail("response has no audio block") from None
+
+    def _decode_base64_part(
+        self,
+        source: dict[str, Any],
+        *,
+        label: str,
+        mime_key: str,
+    ) -> tuple[str, bytes]:
+        """Decode the base64 ``data`` and mime type shared by image and audio.
+
+        Both the Converter's ``inlineData`` image part and the Narrator's
+        Interactions audio block carry a model-declared mime under a
+        (differently spelled) key and base64-encoded ``data``; ``label`` and
+        ``mime_key`` let each caller keep its own redacted error wording.
+        ``validate=True`` rejects characters outside the base64 alphabet
+        instead of silently discarding them (e.g. ``"AAAA!"``), so a corrupted
+        payload surfaces as a failure rather than bad bytes, and the
+        model-declared mime is passed through verbatim.
+        """
+        mime_type = source.get(mime_key)
         if not isinstance(mime_type, str) or not mime_type:
-            raise self._fail("candidate image part has no mimeType") from None
-        data = inline.get("data")
+            raise self._fail(f"{label} has no {mime_key}") from None
+        data = source.get("data")
         if not isinstance(data, str):
-            raise self._fail("candidate image part has no data") from None
+            raise self._fail(f"{label} has no data") from None
         try:
-            # ``validate=True`` rejects characters outside the base64 alphabet
-            # instead of silently discarding them (e.g. ``"AAAA!"``), so a
-            # corrupted image surfaces as a failure rather than bad bytes.
             decoded = base64.b64decode(data, validate=True)
         except ValueError:  # binascii.Error is a ValueError subclass
-            raise self._fail(
-                "candidate image data is not valid base64"
-            ) from None
+            raise self._fail(f"{label} data is not valid base64") from None
         if not decoded:
-            raise self._fail("candidate image data is empty") from None
-        return InlineImagePayload(data=decoded, mime_type=mime_type)
+            raise self._fail(f"{label} data is empty") from None
+        return mime_type, decoded
 
     def _http_detail(self, exc: urllib_error.HTTPError) -> str:
         raw = self._read_error_body(exc)

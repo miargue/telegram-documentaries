@@ -114,11 +114,44 @@ deferred — see `SPECS/TECH.md`).
 
 ## 6. The Narrator
 
-- Script routed directly to Gemini TTS (`gemini-3.1-flash-tts-preview`).
-- Render to a Telegram-compatible audio format (OGG/MP3) and send to chat.
+- Script routed directly to Gemini TTS via the **Interactions API**
+  (`gemini-3.8-flash-lite-tts`; prebuilt voice `en-gb-storyteller-4`).
+- Render to a Telegram-compatible audio format (**MP3**) and send to chat as an
+  audio message.
 
-**Acceptance:** a playable voice note arrives in chat after the portrait,
+**Acceptance:** a playable audio message arrives in chat after the portrait,
 speaking the Scripter's words. *Serves: the final narrated deliverable.*
+
+**Status: complete (verified 2026-10-15, Revision R1, branch
+`feature/2026-10-12-narrator`).** Delivered: typed `NarratorLLM` port +
+`GeminiNarrator` Interactions-API TTS adapter over the shared
+`GeminiJsonClient` (new `generate_interaction_audio`: `POST /v1beta/interactions`
+with the model in the body, one `user_input` text content holding the raw script
+**verbatim**, the fixed delivery style as a `speech_metadata` annotation — never
+prepended — and the voice in `generation_config.speech_config`; response is
+`{"type": "audio", "mime_type": "audio/mp3"}` decoded from `steps[0].content[]`;
+the payload is validated mechanically — non-empty, `audio/mp3*`/`audio/mpeg*`,
+≤ `MAX_NARRATION_BYTES` (5 MiB)); multipart `sendAudio` in the transport (pure
+`_multipart` helper, file field `audio`, filename `narration.mp3`, shared token
+redaction); `SESSION_VERSION` 5 with the stored `narration` bytes and the
+`narrator_sent` flag; the Bouncer runs the Narrator in the **same update** after
+the script lands (fresh completion and retried path), re-sends the stored audio
+LLM-free on a failed delivery, and keeps the light reply after `narrator_sent`;
+optional `GEMINI_NARRATOR_MODEL` / `GEMINI_NARRATOR_VOICE` /
+`GEMINI_NARRATOR_TIMEOUT` (90 s default). `scripts/test` (**697 passed**, up from
+560) and `scripts/hooks` green; no test touches the network (full suite re-run
+with every socket entry point patched to raise, patch sanity-checked). Live
+Gemini smoke: **PASS** — `audio/mp3; rate=24000; channels=1`, 339235 bytes,
+valid ID3v2 header, written to `/tmp/opencode/narration_smoke.mp3` (key never
+printed). Full evidence in `SPECS/2026-10-12-narrator/validation.md`.
+
+**Revision R1 (2026-10-14).** The original pre-revision design (OGG/Opus via
+`gemini-3.1-flash-tts-preview` + `sendVoice`) was proven **impossible against
+the live API** — no Gemini TTS endpoint returns OGG/Opus without an encoder —
+and was replaced by the MP3/`sendAudio` design above. The `generateContent`
+audio path and `sendVoice` are gone. Framework note: the shipped integration is
+a typed port over stdlib `urllib`, **not** Google ADK (still deferred — see
+`SPECS/TECH.md`).
 
 ## 7. Resilience
 
