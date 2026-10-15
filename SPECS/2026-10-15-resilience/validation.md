@@ -21,9 +21,13 @@ run by the verifier agent; all others by the implementer.
 - [ ] `reset_chat(session, chat_id, *, update_id, log) -> PurgeReport` is the
       single named routine used by **both** the start-command path and the gate
       rejection path.
-- [ ] A `session_reset` INFO record is emitted on every reset, carrying the
-      report fields; the log line contains **no** photo/audio bytes and no user
-      text (grep the captured record's `__dict__`).
+- [ ] A `session_reset` INFO record is emitted on every `reset_chat` call,
+      carrying the report fields; the log line contains **no** photo/audio bytes
+      and no user text (grep the captured record's `__dict__`). The three
+      invariant-break `purge` calls in converter/scripter/narrator log their own
+      `*_failed` ERROR (they cannot import `bouncer.reset_chat` without a cycle),
+      and the `reset_chat` docstring says "every `reset_chat` call" — not "every
+      reset".
 - [ ] Manually confirm the three named actions:
   1. **Cancel Active Sessions** — a mid-interview chat returns to
      `awaiting_photo`; a `/start` during an interview resets (atomic, no
@@ -76,7 +80,13 @@ run by the verifier agent; all others by the implementer.
       and one injected `sleep` per failure.
 - [ ] Backoff delays follow `1.0, 2.0, 4.0, …` and are capped at
       `RETRY_MAX_DELAY` (30.0).
-- [ ] `OSError` is retried identically; `KeyboardInterrupt` propagates.
+- [ ] **Transient** classification retried: `OSError`; `TelegramApiError` with no
+      code, code `429`, or code `>= 500`.
+- [ ] **Permanent** classification propagated (not retried): `TelegramApiError`
+      with code `400`/`401`/`403`/`404`/`409` — it escapes `poll_once`.
+- [ ] `KeyboardInterrupt` propagates.
+- [ ] `run_polling` accepts/forwards `sleep` so the retry path is testable
+      end-to-end without waiting.
 - [ ] The replaced test no longer asserts propagation; all other polling tests
       (malformed/poison/non-dict/messageless/offset) are green.
 

@@ -86,9 +86,10 @@ behaviour and that nothing raises:
 - phases: `awaiting_photo`, `gate_passed`, `interviewing`, `done`
   (plus `done` variants: `!portrait_sent`, `portrait_sent && !script_sent`,
   `script_sent && !narrator_sent`, all-sent).
-- contents: text, command (case/@botname/caption variants), photo, photo album
-  sibling, photo with non-command caption, empty text, unsupported
-  (sticker/voice/document via `document_update`), messageless update.
+- contents: text, command (case/@botname/caption variants, asserted at **every**
+  phase — not just `gate_passed`), photo, photo album sibling, photo with
+  non-command caption, empty text, unsupported (**sticker, voice and document**
+  — assert all three), messageless update.
 - expected outcomes asserted narrowly: which reply text (prompt / re-ask /
   light completion / retry path) or a benign skip, and that the session is left
   in the documented state.
@@ -110,7 +111,11 @@ Red (`tests/unit/test_polling.py`):
   failure with `offset`, `attempt` and `delay`.
 - Backoff is capped: the recorded delays follow `1.0, 2.0, 4.0, …` and never
   exceed `RETRY_MAX_DELAY` (use enough consecutive failures to reach the cap).
-- `OSError` is retried the same as `TelegramApiError`.
+- Transient classification: `OSError` is retried; a `TelegramApiError` with
+  **no code** (network-normalised), code `429`, or code `>= 500` is retried.
+- Permanent classification: a `TelegramApiError` with a coded 4xx other than
+  `429` (`401`, `403`, `404`, `409`, `400`) is **not** retried — it propagates
+  out of `poll_once` (so the CLI exits `1`).
 - `KeyboardInterrupt` from the transport propagates (not retried).
 - **Replace** `test_get_updates_transport_failure_propagates_loudly` with a test
   asserting the new contract (retry, then success). The malformed/poison/
@@ -119,11 +124,16 @@ Red (`tests/unit/test_polling.py`):
 Green:
 - Add constants `RETRY_BASE_DELAY`, `RETRY_FACTOR`, `RETRY_MAX_DELAY` and
   `_get_updates(transport, offset, *, log, sleep=time.sleep)`; `poll_once`
-  fetches through it. Retry forever; only `KeyboardInterrupt`/`SystemExit` (and
-  non-transport errors) escape. Update the module docstring: transient
-  `getUpdates` failures are now retried, not propagated.
+  fetches through it. Retry **transient** failures forever (an `OSError`, or a
+  `TelegramApiError` with no code, `429` or `>= 500`) and let a **permanent**
+  coded `TelegramApiError` propagate; only `KeyboardInterrupt`/`SystemExit`
+  (and non-transport errors) also escape. Add a small `_is_transient(exc)`
+  helper. Update the module docstring: transient `getUpdates` failures are now
+  retried; permanent coded errors still surface. Also thread `sleep` through
+  `run_polling` so the retry path is testable end-to-end.
 - Note in the docstring that slow stage calls are bounded by their configured
-  timeouts and run synchronously (single-threaded by decision).
+  timeouts and run synchronously (single-threaded by decision) — replace the
+  stale "resilience/off-loop handling is Phase 7 scope" comment.
 
 Run `scripts/test` + `scripts/hooks`.
 

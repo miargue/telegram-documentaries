@@ -179,7 +179,11 @@ a typed port over stdlib `urllib`, **not** Google ADK (still deferred — see
   polling loop; every stage call is bounded by its own timeout instead of moving
   work off-loop.
 - **Transient `getUpdates` failures retry with capped exponential backoff and
-  the bot stays alive** (the startup `getMe` probe still surfaces a bad token).
+  the bot stays alive; permanent coded errors surface.** An `OSError` or a
+  transient `TelegramApiError` (no code, `429` or `>= 500`) is retried forever;
+  a permanent coded 4xx (e.g. `401` revoked token, `409` duplicate poller)
+  propagates so the process exits `1`. The startup `getMe` probe still surfaces
+  a bad token.
 
 **Acceptance:** reset mid-interview clears everything; misplaced photos/text at
 any stage are re-prompted; Gemini/TTS failures never kill the conversation.

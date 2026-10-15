@@ -80,10 +80,15 @@ So the three named actions map onto this architecture as:
    the transport) and make `getUpdates` survive transient failures. A
    slow-but-bounded conversion briefly pauses polling — acceptable for a
    single-user bot, and far simpler than introducing concurrency.
-5. **Transient `getUpdates` failures retry with backoff, stay alive.** A
-   momentary `TelegramApiError`/`OSError` from `getUpdates` must never kill the
-   bot; log loudly and retry with capped exponential backoff indefinitely. The
-   startup `getMe` probe still surfaces a bad token.
+5. **Transient `getUpdates` failures retry with backoff, stay alive — permanent
+   ones surface.** A momentary network fault (`OSError`) or a *transient*
+   `TelegramApiError` (HTTP/Telegram code `429` or `>= 500`, or a
+   network-normalised error with no code) must never kill the bot: log loudly
+   and retry with capped exponential backoff indefinitely. A **permanent**
+   `TelegramApiError` (a coded 4xx other than `429` — e.g. `401` revoked token,
+   `403`, `404`, `409` duplicate poller) is **not** retried; it propagates so
+   `cli.py` exits `1` and the fault surfaces. The startup `getMe` probe still
+   surfaces a bad token.
 6. **Rename `reset` → `purge`, returning a typed report.** No back-compat
    alias (repo convention). The report feeds the `session_reset` structured
    log.
@@ -106,7 +111,7 @@ dying.
 | G1 | `/start` recognition is **case-sensitive** (`/Start`, `/RESTART` ignored) | `bouncer._is_start_command` compares exactly | lowercase the command token |
 | G2 | A command sent as a **photo caption** does not reset (`/start` with a photo → gated as a portrait) | `bouncer.handle_update` reads only `message.text`; `Message.caption` exists but is unused for routing | extract the command from `text` **or** `caption` |
 | G3 | The reset is **not logged as a discrete event** and discards nothing observable | `session.reset` returns a bare `SessionState`; `bouncer` logs no purge details | add `PurgeReport` + a `session_reset` log from the routine |
-| G4 | A transient `getUpdates` failure **kills the bot** | `poll_once` calls `transport.call("getUpdates", …)` unguarded; `polling.py` docstring says "transient-failure resilience is Phase 7"; `cli.main` catches `(TelegramApiError, OSError)` and returns `1` | retry with capped exponential backoff (`_get_updates`) |
+| G4 | A transient `getUpdates` failure **kills the bot** | `poll_once` calls `transport.call("getUpdates", …)` unguarded; `polling.py` docstring says "transient-failure resilience is Phase 7"; `cli.main` catches `(TelegramApiError, OSError)` and returns `1` | retry transient failures with capped exponential backoff (`_get_updates`); propagate permanent coded errors |
 | G5 | The wrong-payload guards exist but are **not proven across the full phase × content matrix** | tests cover individual cases, not the matrix | parametrized matrix test |
 
 ## Scope (in)
@@ -128,12 +133,15 @@ dying.
   lowercases it; `_is_start_command(message)` compares against
   `{"/start", "/restart"}`.
 - **`polling.py`** — `_get_updates(transport, offset, *, log, sleep=time.sleep)`
-  retries `transport.call("getUpdates", …)` forever on `TelegramApiError` /
-  `OSError` with capped exponential backoff (`RETRY_BASE_DELAY = 1.0`,
+  retries `transport.call("getUpdates", …)` on **transient** failures — an
+  `OSError`, or a `TelegramApiError` whose code is absent, `429` or `>= 500` —
+  forever with capped exponential backoff (`RETRY_BASE_DELAY = 1.0`,
   `RETRY_FACTOR = 2.0`, `RETRY_MAX_DELAY = 30.0`), logging a structured
   `get_updates_retry` event per attempt (`offset`, `attempt`, `delay`, redacted
-  error). `poll_once` uses it. `KeyboardInterrupt` / `SystemExit` still
-  propagate. The malformed/poison-update handling is unchanged.
+  error). A **permanent** coded `TelegramApiError` (any other 4xx) propagates
+  unhandled, so the CLI exits `1`. `poll_once` uses it. `KeyboardInterrupt` /
+  `SystemExit` still propagate. The malformed/poison-update handling is
+  unchanged.
 - **Tests** — `test_session.py` (`purge` report, per-chat isolation),
   `test_bouncer.py` (the routine + command matrix: case, `@botname`, caption,
   each phase), `test_polling.py` (retry-then-success, backoff capping, the
@@ -163,7 +171,7 @@ dying.
 | --- | --- | --- |
 | Command text/caption | `str | None` from `Message` | unrecognised → normal phase routing; a start command always resets |
 | `SessionStore.purge` | `chat_id: int` → `PurgeReport` | unknown chat → fresh default, report reflects an empty outgoing state |
-| `getUpdates` transport call | `TelegramApiError` / `OSError` | log `get_updates_retry`, sleep with capped backoff, retry forever (never crash) |
+| `getUpdates` transport call | `TelegramApiError` / `OSError` | transient (no code / `429` / `>= 500`): log `get_updates_retry`, sleep with capped backoff, retry forever; permanent coded 4xx: propagate (CLI exits `1`) |
 | Stage calls (vision/interview/converter/scripter/narrator/transport) | bounded by their configured timeout | failure degrades as today (apology / retry next update) — never raises into the loop |
 
 `chat_id` stays `int` end-to-end. `PurgeReport` contains no media bytes.
@@ -176,8 +184,14 @@ dying.
 - **Reset is total** — after `purge`, the chat is exactly a fresh default
   (`awaiting_photo`, empty log, no photo/script/narration/dossier, no flags, no
   media-group dedupe).
-- **The bot never dies on a transient network blip** — `getUpdates` retries with
-  backoff; only the startup `getMe` probe (bad token) causes exit `1`.
+- **The bot never dies on a transient network blip** — `getUpdates` retries
+  transient failures (`OSError`, or a `TelegramApiError` with no code, `429` or
+  `>= 500`) with backoff; a permanent coded error propagates and the process
+  exits `1` (as does the startup `getMe` probe on a bad token).
+- **Every reset is auditable** — each `reset_chat` call emits one
+  `session_reset` event; the stage modules' invariant-break `purge` calls log
+  their own `*_failed` ERROR (they cannot import `bouncer.reset_chat` without a
+  cycle).
 - **No test contacts Telegram or Gemini** — fakes + injectable `sleep` only.
 - **No new runtime dependency** — `pydantic` remains the only runtime dep.
 
@@ -195,9 +209,11 @@ dying.
    mid-interview, an album sibling, unsupported content (sticker/voice/
    document), empty text, and a messageless update — is re-prompted or skipped
    as appropriate at every phase, never crashing and never wedging.
-4. A **transient `getUpdates` failure** is logged loudly and retried with capped
+4. A **transient `getUpdates` failure** (`OSError`, or a `TelegramApiError` with
+   no code, `429`, or `>= 500`) is logged loudly and retried with capped
    exponential backoff; the loop stays alive and resumes acking when the
-   transport recovers.
+   transport recovers. A **permanent** coded `TelegramApiError` propagates so
+   the process exits `1` instead of looping forever.
 5. `scripts/test` and `scripts/hooks` are green, including all 697 pre-existing
    tests (adjusted only where this spec changes a signature/behaviour).
 
