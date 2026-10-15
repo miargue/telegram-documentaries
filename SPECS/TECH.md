@@ -8,8 +8,10 @@ agent and every review is judged against it.
 - **Language:** Python 3.
 - **Transport:** Telegram Bot API over **long polling** (`getUpdates`). No
   webhooks, no public URL.
-- **Framework:** **No vendor agent framework as of Phase 6.** Each pipeline
-  stage is a discrete module behind a narrow typed port. The Bouncer exposes a
+- **Framework:** **Google Agent Development Kit (ADK) orchestrates the live
+  pipeline as of Phase 8** (a thin layer of custom `google.adk.agents.BaseAgent`
+  subclasses over the existing ports — see §Google ADK Orchestration (Phase 8)).
+  Each pipeline stage is a discrete module behind a narrow typed port. The Bouncer exposes a
   typed `VisionGate` port, the Interviewer a typed `InterviewLLM` port
   (`next_question` / `summarize`), the Converter a typed `ConverterLLM`
   port (`hybridize(photo, dossier) -> GeneratedImage`), the Scripter a
@@ -31,8 +33,9 @@ agent and every review is judged against it.
   (`transport.py`) for delivering the generated portrait and a multipart
   `sendAudio` for delivering the MP3 audio message (file field `audio`,
   filename `narration.mp3`).
-  **Google Agent Development Kit (ADK) is deferred**; if a later phase adopts
-  it, it will wrap these same ports.
+  Phase 8's ADK layer wraps these same ports; it does **not** replace the single
+  Gemini REST implementation (redaction, schemas, timeouts all stay in
+  `gemini.py`).
 - **Models:**
   - The Bouncer — vision gate — **Gemini 3.1 Flash Lite**.
   - The Interviewer — sequential Q&A + orchestrator — **Gemini 3.1 Flash Lite**.
@@ -65,9 +68,13 @@ agent and every review is judged against it.
   `InterviewLLM.next_question(...) -> str` / `summarize(...) -> Dossier`, the
   Converter is `ConverterLLM.hybridize(photo, dossier) -> GeneratedImage`, the
   Scripter is `ScripterLLM.write_script(dossier) -> str`, and the Narrator is
-  `NarratorLLM.synthesize(script) -> AudioPayload`, so the Gemini
-  REST adapters can later be swapped for ADK agents without touching the
-  routing code. The Interviewer owns its own turn-taking (the
+  `NarratorLLM.synthesize(script) -> AudioPayload`. Since Phase 8 the live
+  routing is executed by a **genuine ADK `Runner`**: `bouncer.handle_update`
+  builds an `AdkPipeline` and delegates to a root `DocumentaryOrchestrator`
+  agent whose four sub-agents wrap these same ports — the typed-port boundary is
+  exactly what let ADK be adopted without touching the Gemini REST adapters or
+  the stage functions (see §Google ADK Orchestration (Phase 8) and
+  `SPECS/ARCHITECTURE.md`). The Interviewer owns its own turn-taking (the
   phase machine, the exactly-5 cap and the one-question-per-message rule);
   `InterviewLLM` merely supplies one validated question or the final dossier at
   a time, the Converter's routing owns its teaser, validation guards and
@@ -150,6 +157,77 @@ agent and every review is judged against it.
   poll window (`polling.LONG_POLL_TIMEOUT = 10 s`), so a long poll is never
   cut short by the client mid-window (asserted in
   `tests/unit/test_transport.py`).
+
+## Google ADK Orchestration (Phase 8)
+
+- **Genuine, thin ADK layer.** The live pipeline is driven by a real
+  `google.adk` `Runner` over a custom root agent. Every pipeline stage is a
+  custom `google.adk.agents.BaseAgent` subclass whose `_run_async_impl` delegates
+  to the existing, already-tested stage function behind its typed port — no
+  Gemini or transport logic is re-implemented (`telegram_documentaries/
+  adk_orchestration.py`).
+- **Four agents + one orchestrator (maps the five stages).**
+
+  | ADK agent | Wraps | Port |
+  | --- | --- | --- |
+  | `BouncerAgent` | messageless / start / album / `awaiting_photo` gate + prompts (`_handle_photo`, `_prompt`, `reset_chat`) | `VisionGate` |
+  | `InterviewerAgent` | interview turn-taking (`handle_interview_update`) | `InterviewLLM` |
+  | `ConverterAgent` | hybrid-portrait conversion (`handle_conversion`) | `ConverterLLM` |
+  | `NarratorAgent` | **folds** scripting then narration (`handle_scripting` → `handle_narrating`) | `ScripterLLM`, `NarratorLLM` |
+  | `DocumentaryOrchestrator` | root router; mirrors `bouncer.handle_update` pre-routing and `bouncer._route_after_gate` | — |
+
+- **Live wiring.** `bouncer.handle_update` keeps its signature and `bool |
+  Skipped` contract but now constructs an `AdkPipeline` from its injected
+  dependencies and returns `pipeline.handle(update, chat_id=...)` — there is no
+  dual path. `AdkPipeline` holds the `Runner`, an `InMemorySessionService` and
+  the orchestrator, created once per construction; one ADK session is created
+  and reused per `chat_id`.
+- **Agent graph.** `DocumentaryOrchestrator` is the root; the four stage agents
+  are its `sub_agents`. The orchestrator is a *router*, not a sequencer: it
+  decides messageless/command/album/phase routing and delegates the stage work.
+
+  ```mermaid
+  flowchart TD
+      O["DocumentaryOrchestrator (root BaseAgent)"] --> B[BouncerAgent]
+      O --> I[InterviewerAgent]
+      O --> C[ConverterAgent]
+      O --> N["NarratorAgent (script + audio)"]
+      B --> VG[VisionGate]
+      I --> IL[InterviewLLM]
+      C --> CL[ConverterLLM]
+      N --> SL[ScripterLLM]
+      N --> NL[NarratorLLM]
+      VG --> REST[["Gemini REST / Interactions API"]]
+      IL --> REST
+      CL --> REST
+      SL --> REST
+      NL --> REST
+  ```
+
+  See `SPECS/ARCHITECTURE.md` for the full system overview and the generation
+  handoff sequence diagram.
+- **State contract.** `SessionStore` remains the **single source of truth** for
+  all conversation state (photo, interview, dossier, script, narration, flags,
+  phase). ADK session state carries only the **ephemeral per-update inputs**:
+  `chat_id` (int), `update` (`Update.model_dump(mode="json")`, a JSON-safe
+  dict) and the encoded `result`. Injected dependencies (`session`, `transport`,
+  `gate`, `llm`, `converter`, `scripter`, `narrator`, `log`) are process-side
+  objects passed to the agents at construction and are never serialised. Because
+  the ADK session is copied on the way out of the runner, the `SKIPPED`
+  sentinel's identity does not survive the round-trip: a deliberate skip is
+  encoded as the string `"skipped"` and decoded back to the `SKIPPED` singleton
+  before `handle` returns, preserving the type contract. A missing result
+  decodes to the default `False`.
+- **Async model.** The gateway stays synchronous and single-threaded;
+  `AdkPipeline.handle` runs the async path with `asyncio.run` **once per
+  update**, and agents call the existing blocking stage functions inside
+  `_run_async_impl` (briefly blocking the loop, bounded by each stage's own
+  timeout — the same bounded-synchronous model as before). The polling loop is
+  unchanged.
+- **Dependency.** `google-adk==2.12.0` is a runtime dependency
+  (`requirements.txt`); `google-genai` arrives transitively. The package still
+  imports cleanly and no test touches the network (the suite passes with every
+  socket entry point patched to raise).
 
 ## Session state
 

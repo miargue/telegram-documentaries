@@ -25,6 +25,12 @@ MP3 audio message describing their "natural habitat."
 
 - The five-stage pipeline above, in English, driven over Telegram **long
   polling** with in-memory session state keyed by `chat_id`.
+- **Google ADK orchestration** of that live pipeline (Phase 8): a genuine ADK
+  `Runner` over a root `DocumentaryOrchestrator` agent whose four custom
+  `BaseAgent` sub-agents (Bouncer, Interviewer, Converter, Narrator — which
+  folds scripting) wrap the existing typed ports. The ADK layer is thin and does
+  not replace the single Gemini REST implementation; `SessionStore` stays the
+  single source of truth. See `SPECS/ARCHITECTURE.md` and `SPECS/TECH.md`.
 - `/start` and `/restart`: run an **explicit reset routine** without
   restarting the process. It performs three named actions — (1) **cancel
   active sessions**: the requesting chat's session returns to the greeting

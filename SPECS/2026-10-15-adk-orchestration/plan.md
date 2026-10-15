@@ -157,6 +157,6 @@ Green (verifier steps):
 
 - Phase 8 delivered as specified: 4 custom BaseAgents + DocumentaryOrchestrator +
   AdkPipeline; bouncer delegates to ADK live path; SessionStore remains
-  canonical; Mermaidor diagrams added; google-adk added to requirements.txt.
+  canonical; Mermaid diagrams added; google-adk added to requirements.txt.
 - All existing tests pass; new module typechecks (mypy); ruff clean.
 - No test touches network; offline suite green.

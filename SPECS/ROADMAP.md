@@ -242,3 +242,52 @@ new tests, and 12 pre-existing tests deliberately renamed/replaced for the
 touches the network (full suite re-run with every socket entry point patched
 to raise, patch sanity-checked). Full evidence, including the deviations
 list, in `SPECS/2026-10-15-resilience/validation.md`.
+
+## 8. ADK Orchestration
+
+- Express the live pipeline as a **genuine Google ADK multi-agent layer**:
+  custom `google.adk.agents.BaseAgent` subclasses that wrap the existing, tested
+  stage functions and typed ports, with a root `DocumentaryOrchestrator` router.
+- Drive the live gateway through it: `bouncer.handle_update` delegates to a
+  `Runner`-based `AdkPipeline` (no dual path); `SessionStore` stays canonical.
+- Add Mermaid architecture diagrams and reconcile the docs (MISSION / TECH /
+  ROADMAP / README); add `google-adk` as a runtime dependency.
+
+**Decisions locked with the user (2026-10-15):**
+
+- **ADK drives the live pipeline.** An ADK `Runner` + orchestrator becomes the
+  actual driver after a photo passes the gate; Telegram long polling stays the
+  transport.
+- **Custom BaseAgents over existing ports.** Each agent's `_run_async_impl`
+  delegates to the existing typed ports / stage callables, so there is still
+  **one** Gemini REST implementation (redaction, schemas, timeouts) and the
+  suite stays fully offline.
+- **Four agents** — `BouncerAgent`, `InterviewerAgent`, `ConverterAgent`,
+  `NarratorAgent` — with the Narrator folding scripting, so all four agents plus
+  the root orchestrator cover the five stages.
+
+**Acceptance:** the live pipeline is ADK-driven; all existing behaviour is
+preserved (same routing, state transitions, logging and return values); no test
+touches the network; Mermaid diagrams exist; docs reconciled.
+*Serves: the architectural-blueprint rubric (all 4 agents + ADK orchestration +
+diagrams).*
+
+**Status: complete (verified 2026-10-15, branch
+`feature/2026-10-15-adk-orchestration`; spec
+`SPECS/2026-10-15-adk-orchestration/`, diagrams in `SPECS/ARCHITECTURE.md`).**
+Delivered: `telegram_documentaries/adk_orchestration.py` — four custom
+`BaseAgent` subclasses (`BouncerAgent`, `InterviewerAgent`, `ConverterAgent`,
+`NarratorAgent`, which folds `handle_scripting` → `handle_narrating`) plus the
+root `DocumentaryOrchestrator` router and the `AdkPipeline` driver (`Runner` +
+`InMemorySessionService`, one ADK session per `chat_id`, `asyncio.run` per
+update, `bool | Skipped` result via a JSON-safe `"skipped"` encoding);
+`bouncer.handle_update` now builds the pipeline from its injected dependencies
+and delegates to it, keeping its signature and behaviour; `google-adk==2.12.0`
+added to `requirements.txt`; Mermaid diagrams in `SPECS/ARCHITECTURE.md` (system
+overview, agent graph, generation-handoff sequence) and `SPECS/TECH.md`. New
+tests: `tests/unit/test_adk_orchestration.py` and `tests/unit/test_adk_pipeline.py`
+(19). Verification: `scripts/test` — **821 passed** (up from 802; all
+pre-existing tests unchanged and still green) — and `scripts/hooks` green; no
+test touches the network (full suite re-run with every socket entry point
+patched to raise). Behaviour parity is proven by the 802 pre-existing unit and
+component tests, which now run through the ADK path unchanged.
