@@ -155,11 +155,40 @@ a typed port over stdlib `urllib`, **not** Google ADK (still deferred — see
 
 ## 7. Resilience
 
-- `/start` and `/restart`: purge session state **and** temporary media without
-  restarting the process.
-- Wrong-payload-at-wrong-stage guards across all phases.
-- API timeout / transient-failure fallbacks that degrade gracefully.
+- `/start` and `/restart`: run an **explicit reset routine** that performs three
+  named actions — (1) **cancel active sessions** for the requesting `chat_id`,
+  (2) **purge ephemeral assets**, and (3) **re-initialize agent memory** back to
+  the greeting stage — without restarting the process. It must fire in any case,
+  with or without an `@botname` suffix, and whether the command arrives as a
+  message or a **photo caption**. The routine logs exactly what it discarded.
+- Wrong-payload-at-wrong-stage guards across **all** phases (a phase ×
+  content-type matrix), not just the reported case.
+- API timeout / transient-failure fallbacks that degrade gracefully: a transient
+  `getUpdates` failure must never kill the bot.
+
+**Decisions locked with the user (2026-10-15):**
+
+- **"Purge ephemeral assets" = clear the in-memory buffers.** All media (the
+  photo and the MP3 narration) lives in memory only — there is no temp media on
+  disk (see `MISSION.md` "No long-term storage"). The reset drops those buffers;
+  it does not add on-disk files.
+- **"Cancel active sessions" = reset the per-chat state.** The gateway is one
+  synchronous long-polling loop with no per-chat threads, so a `/start` is
+  handled atomically and no in-flight interview turn survives it.
+- **Keep the gateway single-threaded.** The slow Converter (~120 s) stays on the
+  polling loop; every stage call is bounded by its own timeout instead of moving
+  work off-loop.
+- **Transient `getUpdates` failures retry with capped exponential backoff and
+  the bot stays alive** (the startup `getMe` probe still surfaces a bad token).
 
 **Acceptance:** reset mid-interview clears everything; misplaced photos/text at
 any stage are re-prompted; Gemini/TTS failures never kill the conversation.
 *Serves: the reset and graceful-handling rubric criteria.*
+
+**Status: in progress (branch `feature/2026-10-15-resilience`; spec
+`SPECS/2026-10-15-resilience/`).** No new behaviour was found to be needed for
+most of this phase — the existing design already purges on reset and degrades on
+every stage failure — so the work is a formalize/harden/verify pass. It adds the
+named `reset_chat` routine + `PurgeReport` logging, case/caption command
+recognition, a phase × content-type guard matrix, and `getUpdates` retry with
+backoff.
