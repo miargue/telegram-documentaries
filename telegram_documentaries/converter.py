@@ -315,7 +315,7 @@ def handle_conversion(
             "ValueError: done chat is missing its photo or dossier",
             log,
         )
-        session.reset(chat_id)
+        session.purge(chat_id)
         _send_message(transport, chat_id, RESET_REPLY, log)
         return False
 

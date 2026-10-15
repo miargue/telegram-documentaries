@@ -12,10 +12,12 @@ raw script stays ready for Phase 6 audio synthesis. The schema is versioned
 and explicit so later phases extend it instead of inferring state (see
 ``SPECS/TECH.md`` §Session state).
 
-This module is the **single owner** of conversation read/write/reset. State is
+This module is the **single owner** of conversation read/write/purge. State is
 in-memory only (per ``SPECS/MISSION.md`` — no long-term storage); every chat's
 state is keyed by an ``int`` ``chat_id`` so one user's data can never leak into
-another's.
+another's. A purge snapshots the outgoing state into a :class:`PurgeReport`
+(booleans and counts only — never media bytes or user text) so callers can log
+exactly what was discarded.
 """
 
 from __future__ import annotations
@@ -59,6 +61,24 @@ class Dossier(BaseModel):
     animal_reason: str | None = None
 
 
+class PurgeReport(BaseModel):
+    """What a purge discarded for one chat — structured observability only.
+
+    Carries flags, counts and the outgoing media-group id — never media bytes
+    or user-derived text — so an ``INFO`` ``session_reset`` log line can prove
+    exactly which ephemeral assets were dropped without leaking content.
+    """
+
+    chat_id: int
+    previous_phase: Phase
+    discarded_photo: bool = False
+    discarded_narration: bool = False
+    discarded_script: bool = False
+    discarded_interview_answers: int = 0
+    discarded_dossier: bool = False
+    previous_media_group_id: str | None = None
+
+
 class SessionState(BaseModel):
     """Everything the gateway remembers about one chat."""
 
@@ -94,10 +114,10 @@ class SessionState(BaseModel):
 class SessionStore:
     """In-memory, per-``chat_id`` session state.
 
-    ``get`` never fails: an unknown chat starts from a clean default. ``reset``
-    always produces a fresh default (purging any retained photo, interview log,
-    dossier, portrait flag, script and script flag, narration and narrator flag);
-    ``record_pass`` retains the accepted portrait for later pipeline stages; the
+    ``get`` never fails: an unknown chat starts from a clean default. ``purge``
+    always produces a fresh default (reporting what it discarded via
+    :class:`PurgeReport`); ``record_pass`` retains the accepted portrait for
+    later pipeline stages; the
     interview methods are the only writers of the question/answer log, the pending
     question and the final ``Dossier``; ``mark_portrait_sent`` is the only writer of
     the Phase 4 portrait flag; ``store_script``/``mark_script_sent`` are the only
@@ -117,17 +137,32 @@ class SessionStore:
             self._sessions[chat_id] = state
         return state
 
-    def reset(self, chat_id: int) -> SessionState:
+    def purge(self, chat_id: int) -> PurgeReport:
         """Replace this chat's state with a fresh default and purge its data.
 
         A fresh default clears everything the previous subject left behind —
         photo, interview log, dossier, media-group dedupe, the
         ``portrait_sent`` flag, the Phase 5 ``script``/``script_sent`` and the
-        Phase 6 ``narration``/``narrator_sent``.
+        Phase 6 ``narration``/``narrator_sent``. The returned
+        :class:`PurgeReport` describes the *outgoing* state (flags and counts
+        only — never bytes or user text) for structured logging. An unseen
+        chat reports an empty purge.
         """
-        state = SessionState()
-        self._sessions[chat_id] = state
-        return state
+        previous = self._sessions.get(chat_id)
+        if previous is None:
+            previous = SessionState()
+        report = PurgeReport(
+            chat_id=chat_id,
+            previous_phase=previous.phase,
+            discarded_photo=previous.photo is not None,
+            discarded_narration=previous.narration is not None,
+            discarded_script=previous.script is not None,
+            discarded_interview_answers=len(previous.interview),
+            discarded_dossier=previous.dossier is not None,
+            previous_media_group_id=previous.last_media_group_id,
+        )
+        self._sessions[chat_id] = SessionState()
+        return report
 
     def record_pass(self, chat_id: int, photo: bytes) -> SessionState:
         """Retain ``photo`` and advance this chat to ``gate_passed``."""
@@ -141,8 +176,8 @@ class SessionStore:
         """Remember the album this chat is currently being gated for.
 
         Called *after* a verdict is recorded: mutating the current state (rather
-        than replacing it) means the dedupe survives the ``reset``/``record_pass``
-        that just happened, so the rest of an album is ignored. ``reset`` builds
+        than replacing it) means the dedupe survives the ``purge``/``record_pass``
+        that just happened, so the rest of an album is ignored. ``purge`` builds
         a fresh default, which is how ``/start`` clears the dedupe.
         """
         state = self.get(chat_id)

@@ -2,7 +2,11 @@
 
 Routes each incoming Telegram message:
 
-- ``/start`` / ``/restart`` → reset the session and ask for a portrait.
+- ``/start`` / ``/restart`` → reset the session and ask for a portrait. The
+  command is recognised in any case, with or without an ``@botname`` suffix,
+  with trailing text, and whether it arrives as a message or a **photo
+  caption** (Phase 7 hardening); the reset itself runs through
+  :func:`reset_chat` so it is logged as one structured ``session_reset`` event.
 - ``awaiting_photo``: plain text or any non-photo content re-prompts (never
   crash, never lose the session); a photo is downloaded at its largest
   resolution and the :class:`VisionGate` decides whether a human is present.
@@ -45,7 +49,7 @@ from telegram_documentaries.media import fetch_photo, largest_photo
 from telegram_documentaries.models import Message, Update
 from telegram_documentaries.narrator import NarratorLLM, handle_narrating
 from telegram_documentaries.scripter import ScripterLLM, handle_scripting
-from telegram_documentaries.session import Phase, SessionStore
+from telegram_documentaries.session import Phase, PurgeReport, SessionStore
 from telegram_documentaries.transport import Transport, truncate_message
 from telegram_documentaries.vision import VisionGate
 
@@ -68,6 +72,35 @@ APOLOGY_REPLY = (
 )
 
 _START_COMMANDS = frozenset({"/start", "/restart"})
+
+
+def reset_chat(
+    session: SessionStore,
+    chat_id: int,
+    *,
+    update_id: int,
+    log: logging.Logger,
+) -> PurgeReport:
+    """Cancel a chat's session, purge its media and re-initialize its memory.
+
+    The single reset routine (``SPECS/2026-10-15-resilience``): a ``/start`` or
+    ``/restart`` command and a failed vision gate both call it. It purges the
+    in-memory store via :meth:`SessionStore.purge` and emits exactly one
+    structured ``session_reset`` INFO event carrying the report's flags and
+    counts — never media bytes or user-derived text — so every
+    ``reset_chat`` call is auditable. Returns the :class:`PurgeReport` for
+    the caller/tests.
+    """
+    report = session.purge(chat_id)
+    log.info(
+        "session reset",
+        extra={
+            "event": "session_reset",
+            "update_id": update_id,
+            **report.model_dump(mode="json"),
+        },
+    )
+    return report
 
 
 @log_lifecycle(LOGGER, "handle_update")
@@ -113,8 +146,8 @@ def handle_update(
     chat_id = message.chat.id
     text = (message.text or "").strip()
 
-    if _is_start_command(text):
-        session.reset(chat_id)
+    if _is_start_command(message):
+        reset_chat(session, chat_id, update_id=update.update_id, log=log)
         return _prompt(transport, chat_id, update, log, reason="command")
 
     if _is_album_follow_up(session, chat_id, message):
@@ -268,11 +301,22 @@ def _is_album_follow_up(
     )
 
 
-def _is_start_command(text: str) -> bool:
+def _command(message: Message) -> str:
+    """Return the normalised leading command of ``message``, or ``""``.
+
+    Reads ``text`` first, then ``caption`` (a command may arrive as a photo
+    caption), takes the first whitespace-delimited token, strips an ``@botname``
+    suffix and lowercases it — so ``/Start@MiargueBot now`` → ``/start``.
+    Content that does not start with ``/`` (or has none at all) yields ``""``.
+    """
+    text = (message.text or message.caption or "").strip()
     if not text.startswith("/"):
-        return False
-    command = text.split(maxsplit=1)[0].split("@", 1)[0]
-    return command in _START_COMMANDS
+        return ""
+    return text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+
+
+def _is_start_command(message: Message) -> bool:
+    return _command(message) in _START_COMMANDS
 
 
 def _handle_photo(
@@ -402,7 +446,7 @@ def _process_photo(
             transport, chat_id, session=session, llm=llm, logger=log
         )
 
-    session.reset(chat_id)
+    reset_chat(session, chat_id, update_id=update.update_id, log=log)
     log.info(
         "portrait rejected and session reset",
         extra={

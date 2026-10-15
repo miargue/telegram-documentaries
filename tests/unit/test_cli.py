@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from conftest import (
     text_update,
 )
 
-from telegram_documentaries import defaults
+from telegram_documentaries import defaults, polling
 from telegram_documentaries.bouncer import PROMPT_PHOTO, SUCCESS_REPLY
 from telegram_documentaries.cli import main, positive_int
 from telegram_documentaries.converter import ConverterLLM
@@ -38,6 +39,27 @@ from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict, VisionGate
 
 API_KEY = "test-gemini-key"
+
+
+class _FlakyGetUpdatesTransport(FakeTransport):
+    """Fails ``getUpdates`` once, then serves batches.
+
+    Proves the CLI rides out a *transient* network blip instead of exiting (the
+    polling loop retries with backoff; only a bad-token ``getMe`` probe exits).
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.attempts = 0
+
+    def call(
+        self, method: str, params: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if method == "getUpdates":
+            self.attempts += 1
+            if self.attempts == 1:
+                raise TelegramApiError("getUpdates", "network down")
+        return super().call(method, params)
 
 
 def _refuse_transport(token: str) -> Any:
@@ -432,24 +454,27 @@ def test_main_turns_keyboard_interrupt_during_the_probe_into_a_clean_stop(
     assert transport.calls_for("getUpdates") == []
 
 
-def test_main_logs_get_updates_failure_and_exits_non_zero(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_main_rides_out_a_transient_get_updates_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    transport = FakeTransport(
-        fail_on={"getUpdates": TelegramApiError("getUpdates", "network down")}
+    # Phase 7: a momentary getUpdates failure no longer kills the gateway — the
+    # poll loop retries with backoff and the run completes. Only the startup
+    # getMe probe (a bad token) exits non-zero.
+    monkeypatch.setattr(polling, "RETRY_BASE_DELAY", 0.0)
+    transport = _FlakyGetUpdatesTransport(batches=[[text_update(1, chat_id=5)]])
+
+    exit_code = main(
+        ["--max-polls", "1"],
+        environ={"TELEGRAM_BOT_TOKEN": "t", "GEMINI_API_KEY": API_KEY},
+        env_file=tmp_path / "absent.env",
+        transport_factory=lambda token: transport,
+        gate_factory=lambda api_key, model: FakeGate(),
     )
 
-    with caplog.at_level(logging.ERROR, logger="telegram_documentaries.cli"):
-        exit_code = main(
-            ["--max-polls", "1"],
-            environ={"TELEGRAM_BOT_TOKEN": "t", "GEMINI_API_KEY": API_KEY},
-            env_file=tmp_path / "absent.env",
-            transport_factory=lambda token: transport,
-            gate_factory=lambda api_key, model: FakeGate(),
-        )
-
-    assert exit_code == 1
-    assert any(record.levelno >= logging.ERROR for record in caplog.records)
+    assert exit_code == 0
+    # One failed attempt, one retry that succeeded and was handled normally.
+    assert transport.attempts == 2
+    assert [m["text"] for m in transport.calls_for("sendMessage")] == [PROMPT_PHOTO]
 
 
 def test_main_builds_the_converter_from_the_api_key_model_and_timeout(

@@ -101,6 +101,56 @@ agent and every review is judged against it.
   flow.
 - No `except: pass`, no swallowed exceptions, no un-logged fallbacks.
 
+## Resilience (Phase 7)
+
+- **Command recognition.** `_command(message)` reads `message.text` first, then
+  `message.caption`, takes the first whitespace-delimited token, strips an
+  `@botname` suffix and lowercases it — so `/start`, `/restart`, `/Start`,
+  `/START`, `/ReStart`, `/start@MiargueBot`, `/restart now` and a **photo
+  captioned** `/start` are all the same command. `_is_start_command` compares
+  against `{"/start", "/restart"}`. A matched command always resets (through
+  `reset_chat`) and re-prompts, at **every** phase, before any gate, album or
+  phase routing — a captioned command's photo is never gated. A non-command
+  caption is still a photo; a non-command slash text (e.g. `/help`) just
+  re-prompts.
+- **Wrong-payload guard matrix.** The phase × content contract is locked by
+  parametrized tests (`tests/unit/test_bouncer.py::test_guard_matrix_*`):
+  text, empty text and unsupported content (sticker / voice / document)
+  re-prompt at `awaiting_photo` and re-ask the stored pending question
+  mid-interview without advancing it; album siblings and messageless updates
+  are benign skips (`SKIPPED`, no reply, still acked by the loop); the `done`
+  variants route to the documented retry path (Converter / Scripter /
+  Narrator) or the light-completion reply; a command resets at every phase.
+  Nothing raises out of `handle_update`.
+- **`getUpdates` retry policy.** `_get_updates(transport, offset, *, log,
+  sleep=time.sleep)` retries **only transient** failures — forever, with capped
+  exponential backoff (`RETRY_BASE_DELAY = 1.0`, `RETRY_FACTOR = 2.0`,
+  `RETRY_MAX_DELAY = 30.0`, i.e. delays `1.0, 2.0, 4.0, … → 30.0`), emitting
+  one structured `get_updates_retry` ERROR per attempt (`offset`, `attempt`,
+  `delay`, redacted error) and one `sleep(delay)`. *Transient* = a raw
+  `OSError`, or a `TelegramApiError` with no code (the transport's
+  network/protocol normalisation), code `429`, or code `>= 500` —
+  `status_code` takes precedence over `error_code` when both are set.
+  *Permanent* = any other coded error (`400`, `401`, `403`, `404`, `409`, …):
+  it is **not** retried — it propagates out of `poll_once`, `cli.main` catches
+  it (`gateway_failed`) and the process exits `1`. `KeyboardInterrupt` /
+  `SystemExit` and non-transport errors (programming bugs) also escape
+  untouched. The startup `getMe` probe still surfaces a bad token before
+  polling starts, and `run_polling` accepts/forwards `sleep` so the retry path
+  is testable end-to-end without waiting.
+- **Single-threaded by decision.** No worker threads, queues or per-chat
+  loops: slow stage calls (the Converter, up to ~120 s) run synchronously on
+  the polling loop, each bounded by its own configured timeout
+  (`GEMINI_CONVERTER_TIMEOUT` 120 s default, `GEMINI_NARRATOR_TIMEOUT` 90 s,
+  the shared 30 s client timeout elsewhere). A bounded synchronous call briefly
+  pauses polling — acceptable for a single-user bot — and it is what makes a
+  `/start` atomic.
+- **Timeout invariant.** The transport client timeout
+  (`transport.DEFAULT_TIMEOUT = 30.0 s`) strictly exceeds the server-side long
+  poll window (`polling.LONG_POLL_TIMEOUT = 10 s`), so a long poll is never
+  cut short by the client mid-window (asserted in
+  `tests/unit/test_transport.py`).
+
 ## Session state
 
 - Versioned, per-`chat_id` schema with an explicit phase field. **Version 2**
@@ -125,11 +175,34 @@ agent and every review is judged against it.
   is "script delivered, audio message pending" — the Narrator retries (or
   re-sends the stored audio) on the next update; `portrait_sent`, `script_sent`
   and `narrator_sent` are stored, never inferred.
-- One shared state driver (single module owns read/write/reset).
-- Reset semantics: `/start` and `/restart` clear state, the interview log, the
-  pending question, the dossier, the `portrait_sent`, `script_sent` and
-  `narrator_sent` flags, the stored `script` and `narration`, and temp media
-  without restarting the process.
+- One shared state driver (single module owns read/write/purge).
+- **Reset semantics (Phase 7).** `/start` and `/restart` run one explicit
+  routine — `bouncer.reset_chat(session, chat_id, *, update_id, log) ->
+  PurgeReport` — that performs the three named actions without restarting the
+  process:
+  1. **Cancel active sessions.** The chat's state is replaced with a fresh
+     default (`awaiting_photo`). The gateway is single-threaded, so the
+     command is handled atomically and no interview turn can be in flight.
+  2. **Purge ephemeral assets.** The in-memory `photo` and `narration` byte
+     buffers are dropped (all media lives in memory only — there is no temp
+     media on disk).
+  3. **Re-initialize agent memory.** The interview log, `pending_question`,
+     `dossier`, stored `script`, the `portrait_sent`/`script_sent`/
+     `narrator_sent` flags and the media-group dedupe are cleared.
+
+  The store method is `SessionStore.purge(chat_id) -> PurgeReport` (renamed
+  from `reset`; no compatibility alias). `PurgeReport` is a pydantic model of
+  flags and counts only — `chat_id`, `previous_phase`, `discarded_photo`,
+  `discarded_narration`, `discarded_script`, `discarded_interview_answers`,
+  `discarded_dossier`, `previous_media_group_id` — never media bytes or user
+  text. Every `reset_chat` call emits exactly one `session_reset` INFO record
+  built from the report (event + `update_id` + report fields), so every reset
+  is auditable; the three stage modules' invariant-break `purge` calls (a
+  `done` chat missing its artifacts) log their own `conversion_failed` /
+  `script_failed` / `narrator_failed` ERROR instead, because they cannot
+  import `bouncer.reset_chat` without an import cycle. Both reset sites — the
+  start-command path and the gate-rejection path — call `reset_chat`; nothing
+  else resets a chat.
 
 ## Testing
 

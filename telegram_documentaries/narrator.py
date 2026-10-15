@@ -277,7 +277,7 @@ def handle_narrating(
             "ValueError: done chat is missing its script",
             log,
         )
-        session.reset(chat_id)
+        session.purge(chat_id)
         _send(transport, chat_id, NARRATION_RESET_REPLY, log)
         return False
 

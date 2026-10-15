@@ -7,8 +7,6 @@ gate is ``FakeGate``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -19,7 +17,7 @@ from conftest import (
     FakeNarrator,
     FakeScripter,
     FakeTransport,
-    _RecordingHandler,
+    _capture,
     document_update,
     messageless_update,
     photo_update,
@@ -31,17 +29,25 @@ from telegram_documentaries.bouncer import (
     PROMPT_PHOTO,
     REJECTION_REPLY,
     SUCCESS_REPLY,
+    _command,
     _send,
     handle_update,
+    reset_chat,
 )
 from telegram_documentaries.converter import TEASER_REPLY, ConverterError
 from telegram_documentaries.gemini import AudioPayload
 from telegram_documentaries.interviewer import OBSERVATION_COMPLETE_REPLY
 from telegram_documentaries.logging_config import SKIPPED
-from telegram_documentaries.models import Update
+from telegram_documentaries.models import Message, Update
 from telegram_documentaries.narrator import NARRATION_APOLOGY_REPLY, NarratorError
 from telegram_documentaries.scripter import SCRIPT_APOLOGY_REPLY, ScriptError
-from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
+from telegram_documentaries.session import (
+    Dossier,
+    Phase,
+    PurgeReport,
+    QaPair,
+    SessionStore,
+)
 from telegram_documentaries.transport import (
     MAX_MESSAGE_LENGTH,
     TelegramApiError,
@@ -52,6 +58,12 @@ from telegram_documentaries.vision import HumanVerdict, VisionError
 
 def _update(payload: dict[str, Any]) -> Update:
     return Update.model_validate(payload)
+
+
+def _message(payload: dict[str, Any]) -> Message:
+    message = _update(payload).message
+    assert message is not None
+    return message
 
 
 def _size(
@@ -70,23 +82,6 @@ def _size(
 
 def _photo_transport() -> FakeTransport:
     return FakeTransport(files={"abc123": ("photos/a.jpg", b"PORTRAIT-BYTES")})
-
-
-@contextmanager
-def _capture(
-    logger_name: str,
-) -> Iterator[tuple[logging.Logger, list[logging.LogRecord]]]:
-    records: list[logging.LogRecord] = []
-    logger = logging.getLogger(logger_name)
-    handler = _RecordingHandler(records)
-    old_level = logger.level
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    try:
-        yield logger, records
-    finally:
-        logger.removeHandler(handler)
-        logger.setLevel(old_level)
 
 
 def _events(records: list[logging.LogRecord]) -> list[str]:
@@ -1654,3 +1649,642 @@ def test_start_clears_the_narration_and_the_narrator_sent_flag() -> None:
     assert state.phase is Phase.awaiting_photo
     assert state.narration is None
     assert state.narrator_sent is False
+
+
+# --- Phase 7: explicit reset routine + command recognition ------------------
+#
+# The reset is a named routine (``reset_chat``) rather than an inline call so
+# the three MISSION guarantees — cancel the session, purge in-memory media and
+# re-initialize agent memory — happen in one place and are logged as one
+# structured ``session_reset`` event describing exactly what was discarded.
+
+
+def test_reset_chat_returns_a_report_and_logs_one_session_reset_record() -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=90, photo=b"PORTRAIT-BYTES")
+    store.start_interview(90, question="Q1")
+    store.record_interview_answer(90, "Q1", "a1")
+    store.store_script(90, script="A dramatic narration.")
+    store.mark_script_sent(90)
+    store.store_narration(90, audio=b"OggS\x00narration-bytes")
+    store.remember_media_group(90, media_group_id="album-9")
+
+    with _capture("telegram_documentaries.bouncer") as (logger, records):
+        report = reset_chat(store, 90, update_id=555, log=logger)
+
+    assert isinstance(report, PurgeReport)
+    assert report.chat_id == 90
+    assert report.previous_phase is Phase.interviewing
+    assert report.discarded_photo is True
+    assert report.discarded_script is True
+    assert report.discarded_narration is True
+    assert report.discarded_interview_answers == 1
+    assert report.previous_media_group_id == "album-9"
+
+    resets = [r for r in records if getattr(r, "event", "") == "session_reset"]
+    assert len(resets) == 1
+    record = resets[0]
+    assert record.levelno == logging.INFO
+    assert getattr(record, "chat_id") == 90
+    assert getattr(record, "update_id") == 555
+    assert getattr(record, "previous_phase") == "interviewing"
+    assert getattr(record, "discarded_photo") is True
+    assert getattr(record, "discarded_script") is True
+    assert getattr(record, "discarded_narration") is True
+    assert getattr(record, "discarded_interview_answers") == 1
+    assert getattr(record, "discarded_dossier") is False
+    assert getattr(record, "previous_media_group_id") == "album-9"
+    # Reset observability must never carry media bytes or user-derived text.
+    snapshot = str(record.__dict__)
+    assert "PORTRAIT-BYTES" not in snapshot
+    assert "OggS" not in snapshot
+    assert "A dramatic narration." not in snapshot
+    # And the chat is genuinely purged, not just described.
+    state = store.get(90)
+    assert state.phase is Phase.awaiting_photo
+    assert state.photo is None
+    assert state.narration is None
+    assert state.script is None
+    assert state.interview == []
+    assert state.last_media_group_id is None
+
+
+def test_reset_chat_on_a_fresh_chat_reports_an_empty_purge() -> None:
+    store = SessionStore()
+
+    with _capture("telegram_documentaries.bouncer") as (logger, records):
+        report = reset_chat(store, 91, update_id=1, log=logger)
+
+    assert report.chat_id == 91
+    assert report.previous_phase is Phase.awaiting_photo
+    assert report.discarded_photo is False
+    assert report.discarded_script is False
+    assert report.discarded_narration is False
+    assert report.discarded_interview_answers == 0
+    assert report.discarded_dossier is False
+    assert report.previous_media_group_id is None
+    assert [getattr(r, "event", "") for r in records].count("session_reset") == 1
+
+
+def test_command_extraction_reads_text_then_caption_case_insensitively() -> None:
+    assert _command(_message(text_update(1, chat_id=1, text="/Stop@SomeBot now"))) == (
+        "/stop"
+    )
+    assert _command(
+        _message(photo_update(2, chat_id=1, caption="/ReStart@SomeBot"))
+    ) == "/restart"
+    assert _command(_message(photo_update(3, chat_id=1, caption="my cat"))) == ""
+    assert _command(_message(document_update(4, chat_id=1))) == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/start",
+        "/restart",
+        "/Start",
+        "/START",
+        "/ReStart",
+        "/start@MiargueBot",
+        "/restart@somebot",
+        "/restart now",
+        "/start ",
+    ],
+)
+def test_start_command_variants_reset_and_prompt_for_a_photo(text: str) -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=92, photo=b"OLD-PORTRAIT")
+    gate = FakeGate()
+    transport = FakeTransport()
+
+    with _capture("telegram_documentaries.bouncer") as (logger, records):
+        sent = handle_update(
+            _update(text_update(1, chat_id=92, text=text)),
+            transport,
+            session=store,
+            gate=gate,
+            converter=FakeConverter(),
+            scripter=FakeScripter(),
+            llm=FakeLLM(),
+            logger=logger,
+        )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage") == [
+        {"chat_id": 92, "text": PROMPT_PHOTO}
+    ]
+    assert gate.calls == 0
+    state = store.get(92)
+    assert state.phase is Phase.awaiting_photo
+    assert state.photo is None
+    events = _events(records)
+    assert "session_reset" in events
+    prompted = [r for r in records if getattr(r, "event", "") == "bouncer_prompted"]
+    assert getattr(prompted[-1], "reason") == "command"
+
+
+def test_photo_captioned_start_resets_and_is_not_gated() -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=93, photo=b"PREVIOUS")
+    gate = FakeGate([HumanVerdict(is_human=True, reason="a face")])
+    transport = _photo_transport()
+
+    sent = handle_update(
+        _update(photo_update(5, chat_id=93, caption="/start@MiargueBot")),
+        transport,
+        session=store,
+        gate=gate,
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        llm=FakeLLM(),
+    )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage") == [
+        {"chat_id": 93, "text": PROMPT_PHOTO}
+    ]
+    # A command caption is a reset, not a portrait: the photo is never fetched
+    # and the gate never sees it.
+    assert gate.calls == 0
+    assert transport.calls_for("getFile") == []
+    state = store.get(93)
+    assert state.phase is Phase.awaiting_photo
+    assert state.photo is None
+
+
+def test_photo_with_a_non_command_caption_is_gated_as_normal() -> None:
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=True, reason="a face")])
+    transport = _photo_transport()
+
+    sent = handle_update(
+        _update(photo_update(6, chat_id=94, caption="my cat")),
+        transport,
+        session=store,
+        gate=gate,
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        llm=FakeLLM(),
+    )
+
+    assert sent is True
+    assert gate.calls == 1
+    assert gate.images == [b"PORTRAIT-BYTES"]
+    assert transport.calls_for("sendMessage")[0]["text"] == SUCCESS_REPLY
+    assert store.get(94).phase is Phase.interviewing
+
+
+def test_slash_non_command_text_re_prompts_without_crashing() -> None:
+    store = SessionStore()
+    gate = FakeGate()
+    transport = FakeTransport()
+
+    sent = handle_update(
+        _update(text_update(7, chat_id=95, text="/help")),
+        transport,
+        session=store,
+        gate=gate,
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        llm=FakeLLM(),
+    )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage")[0]["text"] == PROMPT_PHOTO
+    assert gate.calls == 0
+    assert store.get(95).phase is Phase.awaiting_photo
+
+
+def test_gate_rejection_uses_the_reset_routine_and_logs_session_reset() -> None:
+    store = SessionStore()
+    gate = FakeGate([HumanVerdict(is_human=False, reason="a dog")])
+    transport = _photo_transport()
+
+    with _capture("telegram_documentaries.bouncer") as (logger, records):
+        sent = handle_update(
+            _update(photo_update(8, chat_id=96)),
+            transport,
+            session=store,
+            gate=gate,
+            converter=FakeConverter(),
+            scripter=FakeScripter(),
+            llm=FakeLLM(),
+            logger=logger,
+        )
+
+    assert sent is True
+    events = _events(records)
+    # The reset is logged discretely, and before the rejection it accompanies.
+    assert "session_reset" in events
+    assert events.index("session_reset") < events.index("bouncer_rejected")
+    record = next(r for r in records if getattr(r, "event", "") == "session_reset")
+    assert record.levelno == logging.INFO
+    assert getattr(record, "chat_id") == 96
+    # The rejected photo was never retained (only a *human* verdict stores it),
+    # so the routine truthfully reports an empty outgoing state.
+    assert getattr(record, "previous_phase") == "awaiting_photo"
+    assert getattr(record, "discarded_photo") is False
+    assert transport.calls_for("sendMessage")[0]["text"] == REJECTION_REPLY
+    assert store.get(96).photo is None
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [Phase.awaiting_photo, Phase.gate_passed, Phase.interviewing, Phase.done],
+)
+@pytest.mark.parametrize(
+    "as_caption",
+    [False, True],
+    ids=["text_command", "command_as_photo_caption"],
+)
+def test_start_command_resets_at_every_phase(phase: Phase, as_caption: bool) -> None:
+    store = SessionStore()
+    if phase is not Phase.awaiting_photo:
+        store.record_pass(chat_id=97, photo=b"PORTRAIT")
+    if phase in (Phase.interviewing, Phase.done):
+        store.start_interview(97, question="Q1")
+    if phase is Phase.done:
+        store.appoint_dossier(
+            97, Dossier(summary="S", suggested_animal="Capybara")
+        )
+        store.mark_portrait_sent(97)
+        store.mark_script_sent(97)
+    gate = FakeGate()
+    transport = FakeTransport()
+    # A ``/start`` reset works whether the command arrives as message text or
+    # as a photo caption — at every phase, not just the first.
+    payload = (
+        photo_update(9, chat_id=97, caption="/start")
+        if as_caption
+        else text_update(9, chat_id=97, text="/restart")
+    )
+
+    sent = handle_update(
+        _update(payload),
+        transport,
+        session=store,
+        gate=gate,
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        llm=FakeLLM(),
+        narrator=FakeNarrator(),
+    )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage") == [
+        {"chat_id": 97, "text": PROMPT_PHOTO}
+    ]
+    assert gate.calls == 0
+    state = store.get(97)
+    assert state.phase is Phase.awaiting_photo
+    assert state.photo is None
+    assert state.interview == []
+    assert state.dossier is None
+    assert state.portrait_sent is False
+    assert state.script is None
+    assert state.script_sent is False
+    assert state.narration is None
+    assert state.narrator_sent is False
+
+
+# --- Phase 7: phase × content guard matrix ----------------------------------
+#
+# A wrong payload at any stage must never raise into the polling loop: it is
+# either answered with the stage's documented reply, a benign skip, or a
+# deduplicated album drop — and the session is always left in a coherent state.
+
+_MATRIX_CHAT = 300
+_ALBUM_ID = "album-x"
+
+
+def _matrix_payload(kind: str, update_id: int) -> dict[str, Any]:
+    chat_id = _MATRIX_CHAT
+    if kind == "text":
+        return text_update(update_id, chat_id=chat_id, text="an answer")
+    if kind == "empty_text":
+        return text_update(update_id, chat_id=chat_id, text="   ")
+    if kind == "photo":
+        return photo_update(update_id, chat_id=chat_id)
+    if kind == "photo_caption":
+        return photo_update(update_id, chat_id=chat_id, caption="my cat")
+    if kind.startswith("unsupported"):
+        return document_update(
+            update_id, chat_id=chat_id, kind=kind.partition("_")[2]
+        )
+    if kind == "messageless":
+        return messageless_update(update_id)
+    if kind == "album_sibling":
+        return photo_update(update_id, chat_id=chat_id, media_group_id=_ALBUM_ID)
+    if kind == "command":
+        return text_update(update_id, chat_id=chat_id, text="/restart")
+    if kind == "command_caption":
+        return photo_update(update_id, chat_id=chat_id, caption="/start")
+    raise AssertionError(f"unknown content kind: {kind}")
+
+
+def _matrix_store(phase: Phase, *, variant: str = "") -> SessionStore:
+    """Build the session a chat is in for one matrix cell."""
+    store = SessionStore()
+    if phase is Phase.awaiting_photo:
+        return store
+    store.record_pass(_MATRIX_CHAT, photo=b"PORTRAIT")
+    if phase is Phase.gate_passed:
+        return store
+    store.start_interview(_MATRIX_CHAT, question="Q1")
+    if phase is Phase.interviewing:
+        return store
+    store.appoint_dossier(
+        _MATRIX_CHAT, Dossier(summary="S", suggested_animal="Capybara")
+    )
+    # phase is Phase.done — the variant selects which terminal flags are set.
+    if variant == "incomplete_portrait":
+        return store  # neither portrait nor script delivered
+    store.mark_portrait_sent(_MATRIX_CHAT)
+    if variant == "missing_script":
+        return store
+    store.store_script(_MATRIX_CHAT, script="A dramatic narration.")
+    store.mark_script_sent(_MATRIX_CHAT)
+    if variant == "missing_audio":
+        return store
+    store.store_narration(_MATRIX_CHAT, audio=b"OggS\x00audio")
+    store.mark_narrator_sent(_MATRIX_CHAT)
+    return store  # variant == "complete"
+
+
+def _run_matrix(
+    kind: str,
+    *,
+    store: SessionStore,
+    update_id: int = 1,
+    narrator: FakeNarrator | None = None,
+) -> tuple[Any, FakeTransport, FakeGate, FakeLLM, FakeConverter, FakeScripter, list]:
+    """Drive one matrix cell; returns the outcome and every collaborator."""
+    transport = _photo_transport()
+    gate = FakeGate()
+    llm = FakeLLM()
+    converter = FakeConverter()
+    scripter = FakeScripter()
+    with _capture("telegram_documentaries.bouncer") as (logger, records):
+        sent = handle_update(
+            _update(_matrix_payload(kind, update_id)),
+            transport,
+            session=store,
+            gate=gate,
+            converter=converter,
+            scripter=scripter,
+            llm=llm,
+            narrator=narrator,
+            logger=logger,
+        )
+    return sent, transport, gate, llm, converter, scripter, records
+
+
+_UNSUPPORTED = ["unsupported_sticker", "unsupported_voice", "unsupported_document"]
+
+_AWAITING_PHOTO = {
+    "text": (PROMPT_PHOTO, False),
+    "empty_text": (PROMPT_PHOTO, False),
+    "unsupported_sticker": (PROMPT_PHOTO, False),
+    "unsupported_voice": (PROMPT_PHOTO, False),
+    "unsupported_document": (PROMPT_PHOTO, False),
+    "photo": (None, False),  # gated instead of answered
+    "photo_caption": (None, False),  # a non-command caption is still a photo
+    "messageless": (None, True),
+    "album_sibling": (None, True),
+    "command": (PROMPT_PHOTO, False),
+    "command_caption": (PROMPT_PHOTO, False),
+}
+
+
+@pytest.mark.parametrize("kind", list(_AWAITING_PHOTO))
+def test_guard_matrix_awaiting_photo(kind: str) -> None:
+    expected_reply, skipped = _AWAITING_PHOTO[kind]
+    store = _matrix_store(Phase.awaiting_photo)
+    if kind == "album_sibling":
+        store.remember_media_group(_MATRIX_CHAT, _ALBUM_ID)
+
+    sent, transport, gate, *_ = _run_matrix(kind, store=store)
+
+    if skipped:
+        assert sent is SKIPPED
+        assert transport.calls_for("sendMessage") == []
+    else:
+        assert sent is True
+    if expected_reply is not None:
+        assert transport.calls_for("sendMessage")[-1]["text"] == expected_reply
+    if kind in ("photo", "photo_caption"):
+        assert gate.calls == 1
+        assert store.get(_MATRIX_CHAT).phase is Phase.interviewing
+    else:
+        assert gate.calls == 0
+        assert store.get(_MATRIX_CHAT).phase is Phase.awaiting_photo
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["text", "empty_text", *_UNSUPPORTED, "photo", "photo_caption"],
+)
+def test_guard_matrix_gate_passed_retries_the_start(kind: str) -> None:
+    # A chat left in ``gate_passed`` (degraded start) is retried by the
+    # Interviewer for *any* content: no re-gating, no lost session.
+    store = _matrix_store(Phase.gate_passed)
+
+    sent, transport, gate, llm, *_ = _run_matrix(kind, store=store)
+
+    assert sent is True
+    assert transport.calls_for("sendMessage")[-1]["text"] == "Q1"
+    assert gate.calls == 0
+    assert llm.next_calls == [[]]
+    assert store.get(_MATRIX_CHAT).phase is Phase.interviewing
+
+
+@pytest.mark.parametrize("kind", ["messageless", "album_sibling"])
+def test_guard_matrix_gate_passed_benign_skips(kind: str) -> None:
+    store = _matrix_store(Phase.gate_passed)
+    if kind == "album_sibling":
+        store.remember_media_group(_MATRIX_CHAT, _ALBUM_ID)
+
+    sent, transport, gate, *_ = _run_matrix(kind, store=store)
+
+    assert sent is SKIPPED
+    assert transport.calls_for("sendMessage") == []
+    assert gate.calls == 0
+    assert store.get(_MATRIX_CHAT).phase is Phase.gate_passed
+
+
+_INTERVIEWING = {
+    "text": "Q2",  # a real answer draws the next question
+    "empty_text": "Q1",  # anything else re-asks the stored pending question
+    "photo": "Q1",
+    "photo_caption": "Q1",
+    "unsupported_sticker": "Q1",
+    "unsupported_voice": "Q1",
+    "unsupported_document": "Q1",
+}
+
+
+@pytest.mark.parametrize("kind", list(_INTERVIEWING))
+def test_guard_matrix_interviewing(kind: str) -> None:
+    store = _matrix_store(Phase.interviewing)
+
+    sent, transport, gate, llm, *_ = _run_matrix(kind, store=store)
+
+    assert sent is True
+    assert transport.calls_for("sendMessage")[-1]["text"] == _INTERVIEWING[kind]
+    assert gate.calls == 0
+    state = store.get(_MATRIX_CHAT)
+    assert state.phase is Phase.interviewing
+    if kind == "text":
+        assert state.interview == [QaPair(question="Q1", answer="an answer")]
+        assert state.pending_question == "Q2"
+        assert llm.next_calls == [
+            [QaPair(question="Q1", answer="an answer")]
+        ]
+    else:
+        # A non-answer advances nothing and keeps the same outstanding question.
+        assert state.interview == []
+        assert state.pending_question == "Q1"
+        assert llm.next_calls == []
+
+
+@pytest.mark.parametrize("kind", ["messageless", "album_sibling"])
+def test_guard_matrix_interviewing_benign_skips(kind: str) -> None:
+    store = _matrix_store(Phase.interviewing)
+    if kind == "album_sibling":
+        store.remember_media_group(_MATRIX_CHAT, _ALBUM_ID)
+
+    sent, transport, *_ = _run_matrix(kind, store=store)
+
+    assert sent is SKIPPED
+    assert transport.calls_for("sendMessage") == []
+    assert store.get(_MATRIX_CHAT).interview == []
+    assert store.get(_MATRIX_CHAT).pending_question == "Q1"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["text", "empty_text", *_UNSUPPORTED, "photo", "photo_caption"],
+)
+def test_guard_matrix_done_incomplete_portrait_retries_conversion(
+    kind: str,
+) -> None:
+    store = _matrix_store(Phase.done, variant="incomplete_portrait")
+
+    sent, transport, gate, _, converter, scripter, _ = _run_matrix(
+        kind, store=store
+    )
+
+    assert sent is True
+    assert gate.calls == 0
+    assert len(converter.calls) == 1
+    assert len(scripter.calls) == 1
+    assert len(transport.photos) == 1
+    state = store.get(_MATRIX_CHAT)
+    assert state.portrait_sent is True
+    assert state.script_sent is True
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["text", "empty_text", *_UNSUPPORTED, "photo", "photo_caption"],
+)
+def test_guard_matrix_done_missing_script_retries_scripting(kind: str) -> None:
+    store = _matrix_store(Phase.done, variant="missing_script")
+
+    sent, transport, gate, _, converter, scripter, _ = _run_matrix(
+        kind, store=store
+    )
+
+    assert sent is True
+    assert gate.calls == 0
+    assert converter.calls == []  # the portrait already landed
+    assert len(scripter.calls) == 1
+    assert transport.photos == []
+    assert store.get(_MATRIX_CHAT).script_sent is True
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["text", "empty_text", *_UNSUPPORTED, "photo", "photo_caption"],
+)
+def test_guard_matrix_done_missing_audio_synthesises(kind: str) -> None:
+    store = _matrix_store(Phase.done, variant="missing_audio")
+    narrator = FakeNarrator()
+
+    sent, transport, gate, _, converter, scripter, _ = _run_matrix(
+        kind, store=store, narrator=narrator
+    )
+
+    assert sent is True
+    assert gate.calls == 0
+    assert converter.calls == []
+    assert scripter.calls == []
+    assert len(transport.audios) == 1
+    assert narrator.calls == ["A dramatic narration."]
+    assert store.get(_MATRIX_CHAT).narrator_sent is True
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["text", "empty_text", *_UNSUPPORTED, "photo", "photo_caption"],
+)
+def test_guard_matrix_done_complete_replies_lightly(kind: str) -> None:
+    store = _matrix_store(Phase.done, variant="complete")
+    narrator = FakeNarrator()
+
+    sent, transport, gate, _, converter, scripter, _ = _run_matrix(
+        kind, store=store, narrator=narrator
+    )
+
+    assert sent is True
+    assert transport.calls_for("sendMessage")[-1]["text"] == (
+        OBSERVATION_COMPLETE_REPLY
+    )
+    assert gate.calls == 0
+    assert converter.calls == []
+    assert scripter.calls == []
+    assert transport.audios == []
+
+
+@pytest.mark.parametrize(
+    "kind,expected_reply,skipped",
+    [
+        ("command", PROMPT_PHOTO, False),
+        ("command_caption", PROMPT_PHOTO, False),
+        ("messageless", None, True),
+        ("album_sibling", None, True),
+    ],
+)
+def test_guard_matrix_done_terminal_contents(
+    kind: str, expected_reply: str | None, skipped: bool
+) -> None:
+    store = _matrix_store(Phase.done, variant="complete")
+    if kind == "album_sibling":
+        store.remember_media_group(_MATRIX_CHAT, _ALBUM_ID)
+
+    sent, transport, *_ = _run_matrix(kind, store=store)
+
+    if skipped:
+        assert sent is SKIPPED
+        assert transport.calls_for("sendMessage") == []
+    else:
+        assert sent is True
+        assert transport.calls_for("sendMessage")[-1]["text"] == expected_reply
+        # A command resets a fully-complete chat, not just re-prompts.
+        state = store.get(_MATRIX_CHAT)
+        assert state.phase is Phase.awaiting_photo
+        assert state.portrait_sent is False
+
+
+def test_a_reset_logs_session_reset_and_a_normal_update_does_not() -> None:
+    # The log record is the observable proof a reset happened: a reset emits
+    # exactly one; an ordinary prompt/re-ask emits none.
+    reset_store = _matrix_store(Phase.done, variant="complete")
+    _, _, _, _, _, _, reset_records = _run_matrix("command", store=reset_store)
+    assert _events(reset_records).count("session_reset") == 1
+
+    normal_store = _matrix_store(Phase.awaiting_photo)
+    _, _, _, _, _, _, normal_records = _run_matrix("text", store=normal_store)
+    assert "session_reset" not in _events(normal_records)
+
+

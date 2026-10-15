@@ -168,4 +168,47 @@ Finish: `scripts/test` + `scripts/hooks` green; commit; push; open the PR.
 
 ## Verification notes (filled at verification)
 
-_(to be completed by the verifier agent)_
+Verified 2026-10-15 (verifier agent), walking `validation.md` item by item —
+full evidence in `validation.md`. Every plan task group shipped as specified:
+
+- **§1 Session purge + report** — done as planned: `PurgeReport` with the
+  eight declared fields; `reset` renamed to `purge` with no alias; module/class
+  docstrings updated (the "single owner" and reset-semantics wording).
+- **§2 Reset routine + command recognition** — done: `reset_chat` replaces both
+  `session.reset(...)` call sites; `_command()` reads text then caption,
+  strips `@botname`, lowercases; `_START_COMMANDS` kept as planned.
+- **§3 Guard matrix** — done: 61 parametrized cells across `awaiting_photo`,
+  `gate_passed`, `interviewing` and the four `done` variants, including
+  sticker/voice/document, empty text, messageless and album siblings; the
+  `_RecordingHandler`-based "reset logs `session_reset`, normal update does
+  not" assertion was added as planned (`test_a_reset_logs_session_reset_and_a_normal_update_does_not`).
+  No additional guard was needed beyond §2's G1/G2 fixes.
+- **§4 Transient `getUpdates`** — done: constants + `_get_updates` +
+  `_is_transient` + docstring rewrite + `sleep` threaded through `run_polling`;
+  `test_get_updates_transport_failure_propagates_loudly` was **replaced** (not
+  merely edited) by `test_transient_get_updates_failure_is_retried_then_succeeds`,
+  as the plan required; malformed/poison/non-dict/messageless/offset tests
+  stayed green unchanged.
+- **§5 Component flow** — done: the new two-chat test walks the full chain
+  (photo → interview → portrait → script → audio) over the real
+  `UrllibTransport` + scripted `urlopen`, `/restart`s chat 2 mid-interview
+  (purge + re-prompt) with chat 1 untouched, and rides out a transient
+  `getUpdates` `OSError` via the injected fake `sleep`.
+- **§6 Docs** — done at verification (ROADMAP/TECH/MISSION/README updated).
+
+Verification results: `scripts/test` = **802 passed**; `scripts/hooks` green
+(compileall, smoke import, ruff, mypy — "no issues found in 42 source files");
+full suite re-run with `socket.socket.connect`, `connect_ex`,
+`socket.create_connection` and `socket.getaddrinfo` patched to raise = **802
+passed**, patch sanity-checked (4/4 entry points raise). Baseline re-confirmed
+on a worktree at `1d182e4` = 697 passed (green hooks too).
+
+Deviations (non-blocking, full list in `validation.md`): (1) the CLI test
+`test_main_logs_get_updates_failure_and_exits_non_zero` was rewritten into
+`test_main_rides_out_a_transient_get_updates_failure` (exit `0`) — a necessary
+consequence of the approved retry-only-transient decision; there is no
+CLI-level test for a *permanent* coded `getUpdates` failure (the exit-1 path
+is verified by `test_permanent_coded_errors_propagate_unretried` + code
+inspection of `cli.main`); (2) the committed timeout-invariant test predates
+this phase and asserts `DEFAULT_TIMEOUT >= LONG_POLL_TIMEOUT` — the strict
+`30.0 > 10` assertion was performed at verification and holds.

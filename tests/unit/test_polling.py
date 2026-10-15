@@ -11,6 +11,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+import pytest
 from conftest import (
     FakeConverter,
     FakeGate,
@@ -18,13 +19,21 @@ from conftest import (
     FakeNarrator,
     FakeScripter,
     FakeTransport,
+    _capture,
     _RecordingHandler,
     messageless_update,
     photo_update,
     text_update,
 )
 
-from telegram_documentaries.polling import LONG_POLL_TIMEOUT, poll_once, run_polling
+from telegram_documentaries.polling import (
+    LONG_POLL_TIMEOUT,
+    RETRY_BASE_DELAY,
+    RETRY_FACTOR,
+    RETRY_MAX_DELAY,
+    poll_once,
+    run_polling,
+)
 from telegram_documentaries.session import Dossier, Phase, QaPair, SessionStore
 from telegram_documentaries.transport import TelegramApiError
 from telegram_documentaries.vision import HumanVerdict
@@ -60,6 +69,46 @@ class _NonDictTransport:
         filename: str = "narration.mp3",
     ) -> Any:
         return {"ok": True}
+
+
+class _FlakyGetUpdates(FakeTransport):
+    """A transport whose ``getUpdates`` fails ``failures`` times, then works.
+
+    Every other method delegates to the real :class:`FakeTransport`, so a test
+    can prove the loop rides out a transient outage and then processes the
+    batch normally.
+    """
+
+    def __init__(
+        self,
+        *,
+        failures: int,
+        error: BaseException | None = None,
+        batches: list[list[Any]] | None = None,
+        files: dict[str, tuple[str | None, bytes]] | None = None,
+    ) -> None:
+        super().__init__(batches=batches, files=files)
+        self.remaining_failures = failures
+        self.error: BaseException = (
+            TelegramApiError("getUpdates", "network down")
+            if error is None
+            else error
+        )
+        self.get_updates_attempts = 0
+
+    def call(
+        self, method: str, params: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if method == "getUpdates":
+            self.get_updates_attempts += 1
+            if self.remaining_failures > 0:
+                self.remaining_failures -= 1
+                raise self.error
+        return super().call(method, params)
+
+
+def _retry_records(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    return [r for r in records if getattr(r, "event", "") == "get_updates_retry"]
 
 
 def _store() -> SessionStore:
@@ -312,12 +361,44 @@ def test_send_failure_is_logged_and_the_loop_keeps_acking() -> None:
     assert any(r.levelno >= logging.ERROR for r in records)
 
 
-def test_get_updates_transport_failure_propagates_loudly() -> None:
-    transport = FakeTransport(
-        fail_on={"getUpdates": TelegramApiError("getUpdates", "network down")}
+def test_transient_get_updates_failure_is_retried_then_succeeds() -> None:
+    # A transient getUpdates outage must be ridden out, not propagated: the
+    # long-poll loop retries with backoff and processes the batch once the
+    # transport recovers.
+    transport = _FlakyGetUpdates(
+        failures=2, batches=[[text_update(70, chat_id=1)], []]
     )
+    slept: list[float] = []
 
-    try:
+    with _capture("polling.retry") as (logger, records):
+        offset = poll_once(
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
+            scripter=FakeScripter(),
+            logger=logger,
+            sleep=slept.append,
+        )
+
+    assert offset == 71
+    assert transport.get_updates_attempts == 3  # two failures + one success
+    assert slept == [RETRY_BASE_DELAY, RETRY_BASE_DELAY * RETRY_FACTOR]
+    retries = _retry_records(records)
+    assert [getattr(r, "attempt") for r in retries] == [1, 2]
+    assert [getattr(r, "delay") for r in retries] == slept
+    assert all(getattr(r, "offset") == 0 for r in retries)
+    assert all(r.levelno >= logging.ERROR for r in retries)
+    assert len(transport.calls_for("sendMessage")) == 1  # batch was handled
+
+
+def test_get_updates_backoff_grows_exponentially_and_is_capped() -> None:
+    transport = _FlakyGetUpdates(failures=8, batches=[[]])
+    slept: list[float] = []
+
+    with _capture("polling.backoff") as (logger, records):
         poll_once(
             transport,
             offset=0,
@@ -326,11 +407,186 @@ def test_get_updates_transport_failure_propagates_loudly() -> None:
             llm=FakeLLM(),
             converter=FakeConverter(),
             scripter=FakeScripter(),
+            logger=logger,
+            sleep=slept.append,
         )
-    except TelegramApiError:
-        pass
-    else:  # pragma: no cover - fail loudly is the contract
-        raise AssertionError("poll_once swallowed a getUpdates failure")
+
+    assert slept == [
+        RETRY_BASE_DELAY,
+        RETRY_BASE_DELAY * RETRY_FACTOR,
+        RETRY_BASE_DELAY * RETRY_FACTOR**2,
+        RETRY_BASE_DELAY * RETRY_FACTOR**3,
+        RETRY_BASE_DELAY * RETRY_FACTOR**4,
+        RETRY_MAX_DELAY,
+        RETRY_MAX_DELAY,
+        RETRY_MAX_DELAY,
+    ]
+    assert max(slept) == RETRY_MAX_DELAY
+    delays = [getattr(r, "delay") for r in _retry_records(records)]
+    assert delays == slept
+    assert all(isinstance(d, float) and d <= RETRY_MAX_DELAY for d in delays)
+
+
+def test_oserror_on_get_updates_is_retried_like_a_transport_error() -> None:
+    # The real transport normalises network faults into TelegramApiError, but a
+    # raw OSError must be treated the same way (they share the retry contract).
+    transport = _FlakyGetUpdates(
+        failures=1, error=OSError("connection reset"), batches=[[]]
+    )
+    slept: list[float] = []
+
+    with _capture("polling.oserror") as (logger, records):
+        offset = poll_once(
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
+            scripter=FakeScripter(),
+            logger=logger,
+            sleep=slept.append,
+        )
+
+    assert offset == 0
+    assert slept == [RETRY_BASE_DELAY]
+    retries = _retry_records(records)
+    assert len(retries) == 1
+    assert "OSError" in str(getattr(retries[0], "error"))
+
+
+@pytest.mark.parametrize("code", [429, 500])
+def test_transient_telegram_codes_are_retried(code: int) -> None:
+    # Rate limiting (429) and server faults (>= 500) are transient: the loop
+    # must ride them out with backoff, never propagate them.
+    error = TelegramApiError("getUpdates", "transient", error_code=code)
+    transport = _FlakyGetUpdates(failures=1, error=error, batches=[[]])
+    slept: list[float] = []
+
+    offset = poll_once(
+        transport,
+        offset=0,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        sleep=slept.append,
+    )
+
+    assert offset == 0
+    assert transport.get_updates_attempts == 2
+    assert slept == [RETRY_BASE_DELAY]
+
+
+def test_http_status_code_takes_precedence_over_the_error_code() -> None:
+    # HTTPError normalisation sets both codes; the HTTP status is authoritative.
+    error = TelegramApiError(
+        "getUpdates", "http 503", status_code=503, error_code=400
+    )
+    transport = _FlakyGetUpdates(failures=1, error=error, batches=[[]])
+    slept: list[float] = []
+
+    offset = poll_once(
+        transport,
+        offset=0,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        sleep=slept.append,
+    )
+
+    assert offset == 0
+    assert slept == [RETRY_BASE_DELAY]
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404, 409])
+def test_permanent_coded_errors_propagate_unretried(code: int) -> None:
+    # A permanent 4xx (revoked token, duplicate poller, bad request, ...) must
+    # escape poll_once unhandled so the CLI exits 1 — never loop forever.
+    error = TelegramApiError("getUpdates", "permanent", error_code=code)
+    transport = _FlakyGetUpdates(failures=1, error=error, batches=[[]])
+    slept: list[float] = []
+
+    with pytest.raises(TelegramApiError) as exc_info:
+        poll_once(
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
+            scripter=FakeScripter(),
+            sleep=slept.append,
+        )
+
+    assert exc_info.value is error
+    assert transport.get_updates_attempts == 1  # failed once, never retried
+    assert slept == []
+
+
+def test_run_polling_forwards_the_injected_sleep_to_the_retry_path() -> None:
+    # run_polling must thread sleep down to poll_once/_get_updates so the
+    # retry path is testable end-to-end without waiting.
+    transport = _FlakyGetUpdates(failures=1, batches=[[]])
+    slept: list[float] = []
+
+    run_polling(
+        transport,
+        session=_store(),
+        gate=FakeGate(),
+        llm=FakeLLM(),
+        converter=FakeConverter(),
+        scripter=FakeScripter(),
+        max_polls=1,
+        sleep=slept.append,
+    )
+
+    assert slept == [RETRY_BASE_DELAY]
+    assert transport.get_updates_attempts == 2
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
+def test_process_control_signals_are_not_retried(signal: type[BaseException]) -> None:
+    transport = _FlakyGetUpdates(failures=1, error=signal(), batches=[[]])
+    slept: list[float] = []
+
+    with pytest.raises(signal):
+        poll_once(
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
+            scripter=FakeScripter(),
+            sleep=slept.append,
+        )
+
+    assert slept == []
+
+
+def test_non_transport_error_from_get_updates_propagates() -> None:
+    # Only transport-level faults are transient; a programming error must be
+    # surfaced, not silently retried forever.
+    transport = _FlakyGetUpdates(failures=1, error=RuntimeError("bug"), batches=[[]])
+    slept: list[float] = []
+
+    with pytest.raises(RuntimeError):
+        poll_once(
+            transport,
+            offset=0,
+            session=_store(),
+            gate=FakeGate(),
+            llm=FakeLLM(),
+            converter=FakeConverter(),
+            scripter=FakeScripter(),
+            sleep=slept.append,
+        )
+
+    assert slept == []
 
 
 def test_poll_once_threads_the_injected_session_and_gate_to_the_handler() -> None:

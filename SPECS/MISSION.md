@@ -25,8 +25,17 @@ MP3 audio message describing their "natural habitat."
 
 - The five-stage pipeline above, in English, driven over Telegram **long
   polling** with in-memory session state keyed by `chat_id`.
-- `/start` and `/restart`: purge session state and temporary media without
-  restarting the process.
+- `/start` and `/restart`: run an **explicit reset routine** without
+  restarting the process. It performs three named actions — (1) **cancel
+  active sessions**: the requesting chat's session returns to the greeting
+  stage (`awaiting_photo`), handled atomically so no interview turn survives
+  it; (2) **purge ephemeral assets**: drop the in-memory portrait photo and
+  MP3 narration buffers (all media is memory-only — there is no temp media on
+  disk); (3) **re-initialize agent memory**: clear the interview log, the
+  pending question, the dossier, the stored script, the deliver flags and the
+  album dedupe. The routine logs exactly what it discarded (flags and counts
+  only — never media bytes or user text). The command fires in any case, with
+  or without an `@botname` suffix, as a message or as a photo caption.
 - Graceful handling of out-of-order input (e.g. text while waiting for a
   photo, a second photo mid-interview) — the bot re-prompts instead of
   crashing or losing the session.
@@ -46,7 +55,9 @@ MP3 audio message describing their "natural habitat."
 
 - Happy path: photo → interview → hybrid portrait → narrated MP3 audio
   message, all delivered as Telegram messages.
-- `/restart` (and `/start`) resets state and clears temporary media correctly.
+- `/restart` (and `/start`) runs the reset routine correctly: the session is
+  cancelled, in-memory media is purged and agent memory is re-initialized,
+  with nothing left over and no other chat affected.
 - Out-of-order text/media at any stage is handled without a crash or a leaked
   session.
 
