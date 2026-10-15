@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 
+from telegram_documentaries.adk_orchestration import AdkPipeline
 from telegram_documentaries.converter import ConverterLLM, handle_conversion
 from telegram_documentaries.interviewer import (
     InterviewLLM,
@@ -44,7 +45,7 @@ from telegram_documentaries.interviewer import (
 from telegram_documentaries.interviewer import (
     handle_update as handle_interview_update,
 )
-from telegram_documentaries.logging_config import SKIPPED, Skipped, log_lifecycle
+from telegram_documentaries.logging_config import Skipped, log_lifecycle
 from telegram_documentaries.media import fetch_photo, largest_photo
 from telegram_documentaries.models import Message, Update
 from telegram_documentaries.narrator import NarratorLLM, handle_narrating
@@ -118,78 +119,37 @@ def handle_update(
 ) -> bool | Skipped:
     """Route one update; return whether a reply was sent.
 
-    ``session``, ``gate``, ``llm``, ``converter``, ``scripter`` and ``narrator``
-    are injected so the caller owns their lifetime (the CLI builds one store and
-    one adapter per process). A ``/start`` command always resets, whatever the
-    phase. Once a portrait has passed, the chat is delegated to the Interviewer
-    for every other update — except a ``done`` chat whose hybrid portrait was
-    never delivered, which is routed to the Converter (the retry path); a
-    ``done`` chat whose portrait arrived but whose narration script was never
-    delivered, which is routed to the Scripter; and, when a ``narrator`` is
-    injected, a ``done`` chat with a delivered script but no audio message,
-    which is routed to the Narrator. When an Interviewer turn *completes* the
-    interview, the Converter, Scripter and Narrator run in the same update so
-    the dossier report, hybrid portrait, narration script and audio message all
-    follow in a single pass. A deliberate, benign no-op returns
-    :data:`SKIPPED` (so ``log_lifecycle`` logs it as ``skipped`` rather than a
-    false ``degraded`` warning); a genuine reply failure returns ``False``.
+    Since Phase 8 the routing is executed by the Google ADK
+    :class:`~telegram_documentaries.adk_orchestration.AdkPipeline`: a real
+    ``Runner`` drives a root :class:`DocumentaryOrchestrator` agent whose
+    sub-agents (Bouncer, Interviewer, Converter, Narrator) each delegate to the
+    same injected stage functions this module exposes. ``session``, ``gate``,
+    ``llm``, ``converter``, ``scripter`` and ``narrator`` are injected so the
+    caller owns their lifetime (the CLI builds one store and one adapter per
+    process). The signature and the ``bool | Skipped`` return contract are
+    unchanged. A deliberate, benign no-op returns :data:`SKIPPED` (so
+    ``log_lifecycle`` logs it as ``skipped`` rather than a false ``degraded``
+    warning); a genuine reply failure returns ``False``.
     """
     log = LOGGER if logger is None else logger
     message = update.message
-    if message is None:
-        log.info(
-            "update without message ignored",
-            extra={"event": "update_skipped", "update_id": update.update_id},
-        )
-        return SKIPPED
-
-    chat_id = message.chat.id
-    text = (message.text or "").strip()
-
-    if _is_start_command(message):
-        reset_chat(session, chat_id, update_id=update.update_id, log=log)
-        return _prompt(transport, chat_id, update, log, reason="command")
-
-    if _is_album_follow_up(session, chat_id, message):
-        log.info(
-            "album follow-up ignored",
-            extra={
-                "event": "bouncer_album_skipped",
-                "update_id": update.update_id,
-                "chat_id": chat_id,
-                "media_group_id": message.media_group_id,
-            },
-        )
-        return SKIPPED
-
-    if session.get(chat_id).phase is not Phase.awaiting_photo:
-        # The portrait has passed (or a degraded handoff left the chat in
-        # ``gate_passed``): the Interviewer owns every remaining update.
-        # Remember the album id for *any* grouped photo here too — otherwise a
-        # (photo) album sent mid-interview or after completion would reach the
-        # Interviewer once per member and send one identical re-ask per photo.
-        if message.media_group_id is not None and message.photo:
-            session.remember_media_group(chat_id, message.media_group_id)
-        return _route_after_gate(
-            update,
-            transport,
-            chat_id=chat_id,
-            session=session,
-            llm=llm,
-            converter=converter,
-            scripter=scripter,
-            narrator=narrator,
-            log=log,
-        )
-
-    if text:
-        return _prompt(transport, chat_id, update, log, reason="text")
-    if message.photo:
-        return _handle_photo(
-            message, transport, chat_id=chat_id, update=update,
-            session=session, gate=gate, llm=llm, log=log,
-        )
-    return _prompt(transport, chat_id, update, log, reason="unsupported_content")
+    chat_id = message.chat.id if message is not None else 0
+    pipeline = AdkPipeline(
+        session=session,
+        transport=transport,
+        gate=gate,
+        llm=llm,
+        converter=converter,
+        scripter=scripter,
+        narrator=narrator,
+        log=log,
+        is_start_command=_is_start_command,
+        is_album_follow_up=_is_album_follow_up,
+        reset_chat=reset_chat,
+        prompt=_prompt,
+        handle_photo=_handle_photo,
+    )
+    return pipeline.handle(update, chat_id=chat_id)
 
 
 def _route_after_gate(

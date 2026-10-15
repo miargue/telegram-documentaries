@@ -3,7 +3,7 @@
 A Telegram bot that turns a portrait photo into a narrated, comedy-wildlife
 documentary about the person in it (see `SPECS/MISSION.md`).
 
-**Status: Phase 7 — Resilience.** The bot long-polls the Telegram Bot API,
+**Status: Phase 8 — ADK Orchestration.** The bot long-polls the Telegram Bot API,
 gates incoming portraits with a Gemini vision check, takes a passing portrait
 straight into a one-question-at-a-time behavioural interview, and — as soon as
 the interview finishes — fuses the original photo with the behavioural dossier
@@ -22,6 +22,16 @@ as a photo caption, at every phase; every wrong payload at every stage is
 re-prompted or benignly skipped by a phase × content guard matrix; and a
 transient `getUpdates` failure is retried with capped backoff instead of
 killing the process.
+
+Phase 8 expresses that live pipeline as a **genuine, thin Google Agent
+Development Kit (ADK) layer**: a real ADK `Runner` drives a root
+`DocumentaryOrchestrator` agent whose four custom `BaseAgent` sub-agents
+(Bouncer, Interviewer, Converter, Narrator — the Narrator folds scripting) wrap
+the existing typed ports and tested stage functions. `bouncer.handle_update`
+delegates to the ADK pipeline (no dual path), `SessionStore` remains the single
+source of truth, and the Gemini REST implementation (redaction, schemas,
+timeouts) is unchanged. See `SPECS/ARCHITECTURE.md` for the system overview,
+agent graph and generation-handoff sequence diagrams.
 
 ## What the bot does (the Bouncer + the Interviewer + the Converter + the Scripter + the Narrator)
 
@@ -194,11 +204,12 @@ pip install -r requirements-dev.txt   # runtime + test/lint/type deps
 
 Runtime-only install: `pip install -r requirements.txt`.
 
-> `pydantic` is the only runtime dependency — for Phases 1–7.
-> The Telegram transport *and* the Gemini adapters speak plain stdlib
-> `urllib`, so no third-party HTTP client library is pinned. Phase 6's audio
-> message needs no audio encoder: the Gemini **Interactions API** TTS returns
-> **MP3** directly for `gemini-3.8-flash-lite-tts`, a format Telegram's
+> Runtime dependencies are `pydantic` (typed boundary models) and, since
+> Phase 8, `google-adk` (the orchestration layer; pulls `google-genai`
+> transitively). The Telegram transport *and* the Gemini adapters still speak
+> plain stdlib `urllib`, so no third-party HTTP client library is pinned. Phase
+> 6's audio message needs no audio encoder: the Gemini **Interactions API** TTS
+> returns **MP3** directly for `gemini-3.8-flash-lite-tts`, a format Telegram's
 > `sendAudio` accepts natively.
 
 ## Configure
@@ -325,7 +336,12 @@ role alternation) without a socket. New in Phase 7: the `reset_chat` /
 `PurgeReport` cases (`test_session.py`, `test_bouncer.py`), the command
 recognition and phase × content guard matrix (`test_bouncer.py`), and the
 transient `getUpdates` retry / backoff / permanent-error cases
-(`test_polling.py`, `test_cli.py`) — suite total 802. New in Phase 6: `test_narrator.py` (58) and
+(`test_polling.py`, `test_cli.py`). New in Phase 8: `test_adk_orchestration.py`
+and `test_adk_pipeline.py` (19) — the four custom `BaseAgent` sub-agents and the
+root orchestrator (driven through a real `Runner` + `InMemorySessionService`
+with the conftest fakes), and the `AdkPipeline` driver (session-per-`chat_id`
+reuse, skip encoding, and the full photo → interview → portrait → script → audio
+chain). Suite total **821**. New in Phase 6: `test_narrator.py` (58) and
 the component `test_narrator_flow.py` (4), plus narrator cases across
 `test_gemini.py`, `test_transport.py`, `test_session.py`, `test_bouncer.py`,
 `test_config.py`, `test_cli.py` and `test_polling.py` — the shared client's
@@ -352,6 +368,7 @@ Both ruff and mypy read their configuration from `pyproject.toml`.
 ```
 telegram_documentaries/
   __main__.py         # python -m entrypoint
+  adk_orchestration.py# Google ADK layer: 4 BaseAgents + DocumentaryOrchestrator + AdkPipeline
   bouncer.py          # router across stages: /start, gate, interview, handoff
   cli.py              # argparse wiring, exit codes
   config.py           # minimal .env loader + secret resolution + model defaults
@@ -376,19 +393,20 @@ scripts/
   test                # run the test suite
   hooks               # pre-commit checks
 pyproject.toml         # ruff + mypy configuration
-SPECS/                # MISSION.md, TECH.md, ROADMAP.md (the contract)
+SPECS/                # MISSION.md, TECH.md, ROADMAP.md, ARCHITECTURE.md (the contract)
 ```
 
 ## Roadmap
 
-Phase 7 of `SPECS/ROADMAP.md` (Resilience) is implemented on branch
-`feature/2026-10-15-resilience` and verified: the explicit `reset_chat`
-routine (+ `PurgeReport` audit logging), case/`@botname`/caption command
-recognition, the phase × content guard matrix, and transient `getUpdates`
-retry with capped backoff. Phase 6 (the Narrator) — `feature/2026-10-12-narrator`
-— and Phases 1–5 (gateway, Bouncer, Interviewer, Converter, Scripter) are on
-`main`. The five-stage pipeline is complete: a playable **MP3 audio message**
-follows the narration script in the same update, speaking the Scripter's
-words. Revision R1 (2026-10-14) replaced the impossible OGG/`sendVoice` design
-(no Gemini endpoint produces OGG/Opus without an encoder) with an MP3 audio
-file via `sendAudio`, synthesised through the Gemini Interactions API.
+Phase 8 of `SPECS/ROADMAP.md` (ADK Orchestration) is implemented on branch
+`feature/2026-10-15-adk-orchestration` and verified: the live pipeline is driven
+by a genuine Google ADK `Runner` over a root `DocumentaryOrchestrator` and four
+custom `BaseAgent` sub-agents that wrap the existing typed ports, with
+`bouncer.handle_update` delegating to the `AdkPipeline`. Phase 7 (Resilience) —
+`feature/2026-10-15-resilience` — and Phases 1–6 (gateway, Bouncer, Interviewer,
+Converter, Scripter, Narrator) are on `main`. The five-stage pipeline is
+complete: a playable **MP3 audio message** follows the narration script in the
+same update, speaking the Scripter's words. Revision R1 (2026-10-14) replaced
+the impossible OGG/`sendVoice` design (no Gemini endpoint produces OGG/Opus
+without an encoder) with an MP3 audio file via `sendAudio`, synthesised through
+the Gemini Interactions API.
