@@ -371,7 +371,7 @@ def handle_scripting(
             "ValueError: done chat is missing its dossier",
             log,
         )
-        session.reset(chat_id)
+        session.purge(chat_id)
         _send(transport, chat_id, SCRIPT_RESET_REPLY, log)
         return False
 

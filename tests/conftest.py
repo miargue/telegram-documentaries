@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import http.client
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from telegram_documentaries.converter import GeneratedImage
@@ -49,6 +50,29 @@ class _RecordingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
+
+
+@contextmanager
+def _capture(
+    logger_name: str,
+) -> Iterator[tuple[logging.Logger, list[logging.LogRecord]]]:
+    """Capture the records emitted by ``logger_name`` at INFO and above.
+
+    Yields the (temporarily raised-level) logger and the live records list,
+    so a test can drive code through the real logger and assert on what was
+    emitted; the handler and level are always restored on exit.
+    """
+    records: list[logging.LogRecord] = []
+    logger = logging.getLogger(logger_name)
+    handler = _RecordingHandler(records)
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield logger, records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
 
 
 def text_update(

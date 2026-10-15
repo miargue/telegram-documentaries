@@ -1,6 +1,6 @@
 """Behaviour of the per-``chat_id`` session state driver.
 
-The driver is the single owner of every read/write/reset of conversation
+The driver is the single owner of every read/write/purge of conversation
 state. It must isolate chats (one user's photo must never leak to another) and
 start every unknown chat at a clean ``awaiting_photo`` phase.
 """
@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from telegram_documentaries.session import (
     Dossier,
     Phase,
+    PurgeReport,
     QaPair,
     SessionState,
     SessionStore,
@@ -55,16 +56,19 @@ def test_record_pass_retains_the_photo_and_advances_the_phase() -> None:
     assert store.get(chat_id=7).photo == image
 
 
-def test_reset_purges_the_photo_and_returns_to_awaiting_photo() -> None:
+def test_purge_purges_the_photo_and_returns_to_awaiting_photo() -> None:
     store = SessionStore()
     store.record_pass(chat_id=7, photo=b"image")
 
-    state = store.reset(chat_id=7)
+    report = store.purge(chat_id=7)
 
+    assert isinstance(report, PurgeReport)
+    assert report.chat_id == 7
+    assert report.previous_phase is Phase.gate_passed
+    assert report.discarded_photo is True
+    state = store.get(chat_id=7)
     assert state.phase is Phase.awaiting_photo
     assert state.photo is None
-    assert store.get(chat_id=7).phase is Phase.awaiting_photo
-    assert store.get(chat_id=7).photo is None
 
 
 def test_sessions_are_isolated_per_chat_id() -> None:
@@ -79,24 +83,128 @@ def test_sessions_are_isolated_per_chat_id() -> None:
     assert store.get(chat_id=1).photo == b"one"
 
 
-def test_resetting_one_chat_leaves_another_untouched() -> None:
+def test_purging_one_chat_leaves_another_untouched() -> None:
     store = SessionStore()
     store.record_pass(chat_id=1, photo=b"one")
     store.record_pass(chat_id=2, photo=b"two")
 
-    store.reset(chat_id=1)
+    store.purge(chat_id=1)
 
     assert store.get(chat_id=1).phase is Phase.awaiting_photo
+    assert store.get(chat_id=1).photo is None
     assert store.get(chat_id=2).photo == b"two"
 
 
-def test_reset_on_an_unknown_chat_still_yields_a_clean_default() -> None:
+def test_purge_on_an_unknown_chat_reports_an_empty_outgoing_state() -> None:
     store = SessionStore()
 
-    state = store.reset(chat_id=99)
+    report = store.purge(chat_id=99)
 
+    assert isinstance(report, PurgeReport)
+    assert report.chat_id == 99
+    assert report.previous_phase is Phase.awaiting_photo
+    assert report.discarded_photo is False
+    assert report.discarded_narration is False
+    assert report.discarded_script is False
+    assert report.discarded_interview_answers == 0
+    assert report.discarded_dossier is False
+    assert report.previous_media_group_id is None
+    state = store.get(chat_id=99)
     assert state.phase is Phase.awaiting_photo
     assert state.photo is None
+
+
+def test_purge_report_is_a_pydantic_model_with_exactly_the_declared_fields() -> (
+    None
+):
+    report = PurgeReport(chat_id=7, previous_phase=Phase.interviewing)
+
+    assert set(PurgeReport.model_fields) == {
+        "chat_id",
+        "previous_phase",
+        "discarded_photo",
+        "discarded_narration",
+        "discarded_script",
+        "discarded_interview_answers",
+        "discarded_dossier",
+        "previous_media_group_id",
+    }
+    # Reset observability must never carry media bytes or user-derived text.
+    for field in PurgeReport.model_fields.values():
+        assert "bytes" not in str(field.annotation)
+    assert report.model_dump() == {
+        "chat_id": 7,
+        "previous_phase": Phase.interviewing,
+        "discarded_photo": False,
+        "discarded_narration": False,
+        "discarded_script": False,
+        "discarded_interview_answers": 0,
+        "discarded_dossier": False,
+        "previous_media_group_id": None,
+    }
+
+
+def test_purge_mid_interview_reports_every_discarded_item() -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=7, photo=b"portrait-bytes")
+    store.start_interview(chat_id=7, question="Q1")
+    for number in range(1, 4):
+        store.record_interview_answer(7, f"Q{number}", f"a{number}")
+    # A dossier can sit on an interviewing chat (e.g. a late mutation): the
+    # report must reflect whatever the outgoing state actually held.
+    store.get(chat_id=7).dossier = Dossier(
+        summary="A very dramatic sleeper.", suggested_animal="House cat"
+    )
+    store.store_script(chat_id=7, script="A dramatic narration.")
+    store.mark_script_sent(chat_id=7)
+    store.store_narration(chat_id=7, audio=b"ID3\x03narration-audio")
+    store.mark_narrator_sent(chat_id=7)
+    store.remember_media_group(chat_id=7, media_group_id="album-9")
+
+    report = store.purge(chat_id=7)
+
+    assert report.chat_id == 7
+    assert report.previous_phase is Phase.interviewing
+    assert report.discarded_photo is True
+    assert report.discarded_narration is True
+    assert report.discarded_script is True
+    assert report.discarded_dossier is True
+    assert report.discarded_interview_answers == 3
+    assert report.previous_media_group_id == "album-9"
+    # Reset is total: afterwards the chat is exactly a fresh default.
+    state = store.get(chat_id=7)
+    assert state.phase is Phase.awaiting_photo
+    assert state.photo is None
+    assert state.interview == []
+    assert state.pending_question is None
+    assert state.dossier is None
+    assert state.script is None
+    assert state.script_sent is False
+    assert state.narration is None
+    assert state.narrator_sent is False
+    assert state.portrait_sent is False
+    assert state.last_media_group_id is None
+
+
+def test_purge_is_per_chat_isolated() -> None:
+    store = SessionStore()
+    store.record_pass(chat_id=1, photo=b"one")
+    store.record_pass(chat_id=2, photo=b"two")
+    store.start_interview(chat_id=2, question="Q1")
+
+    report = store.purge(chat_id=1)
+
+    assert report.chat_id == 1
+    assert report.discarded_photo is True
+    other = store.get(chat_id=2)
+    assert other.photo == b"two"
+    assert other.phase is Phase.interviewing
+    assert other.pending_question == "Q1"
+
+
+def test_session_store_has_no_reset_method() -> None:
+    # The reset → purge rename is deliberate, not a compatibility shim.
+    assert hasattr(SessionStore, "reset") is False
 
 
 def test_session_state_is_a_pydantic_model_with_a_stable_version() -> None:
@@ -129,7 +237,7 @@ def test_remember_media_group_stores_the_id_on_the_state() -> None:
     assert store.get(chat_id=7).last_media_group_id == "album-1"
 
 
-def test_remembered_media_group_survives_a_pass_and_a_reset() -> None:
+def test_remembered_media_group_survives_a_pass_and_a_purge() -> None:
     # The Bouncer remembers the album id *after* recording a verdict, so the
     # dedupe must survive whichever state transition just happened.
     passed = SessionStore()
@@ -138,20 +246,20 @@ def test_remembered_media_group_survives_a_pass_and_a_reset() -> None:
     assert passed.get(chat_id=1).last_media_group_id == "album-1"
 
     rejected = SessionStore()
-    rejected.reset(chat_id=1)
+    rejected.purge(chat_id=1)
     rejected.remember_media_group(chat_id=1, media_group_id="album-1")
     assert rejected.get(chat_id=1).last_media_group_id == "album-1"
 
 
-def test_reset_clears_a_remembered_media_group() -> None:
+def test_purge_clears_a_remembered_media_group() -> None:
     # `/start` resets the session, which must also let a reused album id be
     # classified again rather than being silently deduplicated.
     store = SessionStore()
     store.remember_media_group(chat_id=7, media_group_id="album-1")
 
-    state = store.reset(chat_id=7)
+    report = store.purge(chat_id=7)
 
-    assert state.last_media_group_id is None
+    assert report.previous_media_group_id == "album-1"
     assert store.get(chat_id=7).last_media_group_id is None
 
 
@@ -234,13 +342,12 @@ def test_appoint_dossier_clears_the_pending_question() -> None:
     assert state.pending_question is None
 
 
-def test_reset_purges_the_pending_question() -> None:
+def test_purge_clears_the_pending_question() -> None:
     store = SessionStore()
     store.start_interview(chat_id=7, question="Q1")
 
-    state = store.reset(chat_id=7)
+    store.purge(chat_id=7)
 
-    assert state.pending_question is None
     assert store.get(chat_id=7).pending_question is None
 
 
@@ -290,7 +397,7 @@ def test_appoint_dossier_sets_dossier_and_phase_done() -> None:
     assert store.get(chat_id=7).phase is Phase.done
 
 
-def test_reset_purges_photo_interview_and_dossier() -> None:
+def test_purge_purges_photo_interview_and_dossier() -> None:
     store = SessionStore()
     store.record_pass(chat_id=7, photo=b"portrait")
     store.start_interview(chat_id=7)
@@ -305,8 +412,13 @@ def test_reset_purges_photo_interview_and_dossier() -> None:
         ),
     )
 
-    state = store.reset(chat_id=7)
+    report = store.purge(chat_id=7)
 
+    assert report.previous_phase is Phase.done
+    assert report.discarded_photo is True
+    assert report.discarded_dossier is True
+    assert report.discarded_interview_answers == 1
+    state = store.get(chat_id=7)
     assert state.phase is Phase.awaiting_photo
     assert state.photo is None
     assert state.interview == []
@@ -346,15 +458,15 @@ def test_mark_portrait_sent_sets_the_flag_without_touching_the_artifacts() -> (
     assert store.get(7).portrait_sent is True
 
 
-def test_reset_clears_the_portrait_sent_flag() -> None:
+def test_purge_clears_the_portrait_sent_flag() -> None:
     store = _dossier_store(chat_id=7)
     store.mark_portrait_sent(chat_id=7)
 
-    state = store.reset(chat_id=7)
+    store.purge(chat_id=7)
 
+    state = store.get(chat_id=7)
     assert state.portrait_sent is False
-    assert store.get(7).portrait_sent is False
-    # The reset still purges everything else too.
+    # The purge still drops everything else too.
     assert state.photo is None
     assert state.interview == []
     assert state.dossier is None
@@ -407,18 +519,18 @@ def test_mark_script_sent_sets_the_flag_without_touching_the_script() -> None:
     assert store.get(7).script_sent is True
 
 
-def test_reset_clears_the_script_and_the_script_sent_flag() -> None:
+def test_purge_clears_the_script_and_the_script_sent_flag() -> None:
     store = _dossier_store(chat_id=7)
     store.store_script(chat_id=7, script="A dramatic narration.")
     store.mark_script_sent(chat_id=7)
 
-    state = store.reset(chat_id=7)
+    report = store.purge(chat_id=7)
 
+    assert report.discarded_script is True
+    state = store.get(chat_id=7)
     assert state.script is None
     assert state.script_sent is False
-    assert store.get(7).script is None
-    assert store.get(7).script_sent is False
-    # The reset still purges everything else too.
+    # The purge still drops everything else too.
     assert state.photo is None
     assert state.interview == []
     assert state.dossier is None
@@ -487,20 +599,21 @@ def test_mark_narrator_sent_sets_the_flag_without_touching_the_audio() -> None:
     assert store.get(7).narrator_sent is True
 
 
-def test_reset_clears_the_narration_and_the_narrator_sent_flag() -> None:
+def test_purge_clears_the_narration_and_the_narrator_sent_flag() -> None:
     store = _dossier_store(chat_id=7)
     store.store_script(chat_id=7, script="A dramatic narration.")
     store.mark_script_sent(chat_id=7)
     store.store_narration(chat_id=7, audio=b"OggS\x00audio")
     store.mark_narrator_sent(chat_id=7)
 
-    state = store.reset(chat_id=7)
+    report = store.purge(chat_id=7)
 
+    assert report.discarded_narration is True
+    assert report.discarded_script is True
+    state = store.get(chat_id=7)
     assert state.narration is None
     assert state.narrator_sent is False
-    assert store.get(7).narration is None
-    assert store.get(7).narrator_sent is False
-    # The reset still purges everything else too.
+    # The purge still drops everything else too.
     assert state.script is None
     assert state.script_sent is False
     assert state.portrait_sent is False

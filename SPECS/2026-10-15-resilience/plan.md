@@ -1,0 +1,214 @@
+# Plan — Resilience (Phase 7)
+
+Red/Green TDD: every task group writes its failing tests **first**, then the
+code, then `scripts/test` until green, with `scripts/hooks` at the end of the
+group. No test touches Telegram or Gemini. **All 697 pre-existing tests must
+stay green** (adjusted only where this spec deliberately changes a
+signature/behaviour). Keep the gateway **single-threaded** — no threads, no
+queues.
+
+Modified: `session.py`, `bouncer.py`, `polling.py`, `tests/unit/test_session.py`,
+`tests/unit/test_bouncer.py`, `tests/unit/test_polling.py`,
+`tests/conftest.py` (only if a new fake is needed), the component test, README,
+and `SPECS/*`.
+
+---
+
+## 1. Session purge + report (`session.py`)
+
+Red (`tests/unit/test_session.py`):
+- `PurgeReport` is a pydantic model with `chat_id: int`,
+  `previous_phase: Phase`, `discarded_photo: bool`, `discarded_narration: bool`,
+  `discarded_script: bool`, `discarded_interview_answers: int`,
+  `discarded_dossier: bool`, `previous_media_group_id: str | None`; it exposes
+  **no** bytes / user text.
+- `purge(chat_id)` on a **fresh** chat returns a report describing an empty
+  outgoing state (`previous_phase == awaiting_photo`, all `discarded_*` false/0)
+  and leaves `get(chat_id)` as a fresh default.
+- `purge` **mid-interview** (a chat advanced through `record_pass` →
+  `start_interview` → some `record_interview_answer`, with a dossier and a
+  stored script + narration + flags): the report reflects every discarded item
+  (`discarded_photo is True`, `discarded_narration is True`,
+  `discarded_script is True`, `discarded_dossier is True`,
+  `discarded_interview_answers == n`, `previous_phase is Phase.interviewing`),
+  and the state afterwards is a fresh default (`awaiting_photo`, empty
+  `interview`, `pending_question is None`, `dossier is None`, `photo is None`,
+  `narration is None`, `script is None`, all flags `False`,
+  `last_media_group_id is None`).
+- `purge` is **per-chat isolated**: purging chat A leaves chat B's state intact.
+- `reset` no longer exists (`hasattr(SessionStore, "reset") is False`) — the
+  rename is not a compatibility shim.
+
+Green:
+- Add `PurgeReport`; rename `reset` → `purge`, snapshotting the outgoing state
+  into a report before installing `SessionState()`. Update the module/class
+  docstrings (the reset semantics section) accordingly.
+
+Run `scripts/test` + `scripts/hooks`.
+
+## 2. Explicit reset routine + command recognition (`bouncer.py`)
+
+Red (`tests/unit/test_bouncer.py`):
+- `reset_chat(session, chat_id, *, update_id, log)` returns a `PurgeReport` and
+  emits exactly one `session_reset` INFO record carrying the report's fields
+  (and never any media bytes / user text). On a mid-interview chat the report
+  shows the discarded items.
+- Command recognition via `_is_start_command` (or the public behaviour through
+  `handle_update`):
+  - `/start`, `/restart` reset and prompt (`reason="command"`).
+  - `/Start`, `/START`, `/ReStart` reset too (case-insensitive).
+  - `/start@MiargueBot` and `/restart@somebot` reset.
+  - a **photo captioned `/start`** resets (drops the photo) and prompts — the
+    photo is **not** gated.
+  - a photo with a **non-command caption** (e.g. `"my cat"`) is gated as normal.
+  - `/start ` with trailing text (`/restart now`) resets.
+  - a non-command text starting with `/` (`/help`) in `awaiting_photo`
+    re-prompts (never crashes).
+- The gate **rejection** path also calls `reset_chat` (a `session_reset` record
+  is emitted before the rejection reply).
+- `handle_update` resets on a command **at every phase** (`awaiting_photo`,
+  `gate_passed`, `interviewing`, `done`) — asserted for at least
+  `interviewing` and `done`.
+
+Green:
+- Add `reset_chat`; replace both `session.reset(chat_id)` call sites with it
+  (start command and rejection). Add `_command(message)` (reads `message.text`
+  then `message.caption`, strips `@botname`, lowercases) and rework
+  `_is_start_command(message)`. Keep `_START_COMMANDS = frozenset({"/start",
+  "/restart"})`.
+
+Run `scripts/test` + `scripts/hooks`.
+
+## 3. Wrong-payload-at-wrong-stage matrix (`tests/unit/test_bouncer.py`)
+
+Red — a parametrized matrix over **(phase × content)** proving the guard
+behaviour and that nothing raises:
+- phases: `awaiting_photo`, `gate_passed`, `interviewing`, `done`
+  (plus `done` variants: `!portrait_sent`, `portrait_sent && !script_sent`,
+  `script_sent && !narrator_sent`, all-sent).
+- contents: text, command (case/@botname/caption variants, asserted at **every**
+  phase — not just `gate_passed`), photo, photo album sibling, photo with
+  non-command caption, empty text, unsupported (**sticker, voice and document**
+  — assert all three), messageless update.
+- expected outcomes asserted narrowly: which reply text (prompt / re-ask /
+  light completion / retry path) or a benign skip, and that the session is left
+  in the documented state.
+
+Green:
+- Fix any genuine gap the matrix surfaces (the known one is G2/G1, done in §2).
+  No speculative guards: only add code the matrix proves is needed.
+- Add a `_RecordingHandler`-based assertion that a reset produced a
+  `session_reset` record and a normal update did not.
+
+Run `scripts/test` + `scripts/hooks`.
+
+## 4. Transient `getUpdates` resilience (`polling.py`)
+
+Red (`tests/unit/test_polling.py`):
+- A transport that fails `getUpdates` **N times then succeeds**: `poll_once`
+  retries, sleeps once per failure via the injected `sleep`, and returns the
+  normal offset; the structured `get_updates_retry` record is emitted per
+  failure with `offset`, `attempt` and `delay`.
+- Backoff is capped: the recorded delays follow `1.0, 2.0, 4.0, …` and never
+  exceed `RETRY_MAX_DELAY` (use enough consecutive failures to reach the cap).
+- Transient classification: `OSError` is retried; a `TelegramApiError` with
+  **no code** (network-normalised), code `429`, or code `>= 500` is retried.
+- Permanent classification: a `TelegramApiError` with a coded 4xx other than
+  `429` (`401`, `403`, `404`, `409`, `400`) is **not** retried — it propagates
+  out of `poll_once` (so the CLI exits `1`).
+- `KeyboardInterrupt` from the transport propagates (not retried).
+- **Replace** `test_get_updates_transport_failure_propagates_loudly` with a test
+  asserting the new contract (retry, then success). The malformed/poison/
+  non-dict update tests stay green unchanged.
+
+Green:
+- Add constants `RETRY_BASE_DELAY`, `RETRY_FACTOR`, `RETRY_MAX_DELAY` and
+  `_get_updates(transport, offset, *, log, sleep=time.sleep)`; `poll_once`
+  fetches through it. Retry **transient** failures forever (an `OSError`, or a
+  `TelegramApiError` with no code, `429` or `>= 500`) and let a **permanent**
+  coded `TelegramApiError` propagate; only `KeyboardInterrupt`/`SystemExit`
+  (and non-transport errors) also escape. Add a small `_is_transient(exc)`
+  helper. Update the module docstring: transient `getUpdates` failures are now
+  retried; permanent coded errors still surface. Also thread `sleep` through
+  `run_polling` so the retry path is testable end-to-end.
+- Note in the docstring that slow stage calls are bounded by their configured
+  timeouts and run synchronously (single-threaded by decision) — replace the
+  stale "resilience/off-loop handling is Phase 7 scope" comment.
+
+Run `scripts/test` + `scripts/hooks`.
+
+## 5. Component flow (`tests/component/…`)
+
+Red/Green:
+- Extend the full-gateway component test: drive `poll_once` through
+  photo → interview → portrait → script → audio, then send `/restart`
+  mid-interview in a **second** chat and assert the reset routine purged the
+  in-memory photo/narration (the store no longer holds them) and re-prompted;
+  assert the first chat is untouched (isolation). A transient getUpdates failure
+  between batches (fake `sleep`) is ridden out and the run completes. No network.
+
+Run `scripts/test` + `scripts/hooks`.
+
+## 6. Docs + verification
+
+Green (validated at verification):
+- `SPECS/ROADMAP.md`: rewrite Phase 7 to **require** the explicit reset routine
+  (the three named actions mapped to mechanisms), the guard matrix and the
+  transient-failure policy; record the decisions (in-memory purge, single-
+  threaded, retry-with-backoff). Mark the phase complete at verification.
+- `SPECS/TECH.md`: reset semantics (`purge` + `PurgeReport`), command
+  recognition, the `getUpdates` retry policy, the single-threaded decision, and
+  the timeout invariant (client timeout > server long-poll).
+- `SPECS/MISSION.md`: state the reset routine's three actions.
+- `README.md`: `/start`/`/restart` reset-routine behaviour and the resilience
+  notes.
+- Walk `validation.md`.
+
+Finish: `scripts/test` + `scripts/hooks` green; commit; push; open the PR.
+
+## Verification notes (filled at verification)
+
+Verified 2026-10-15 (verifier agent), walking `validation.md` item by item —
+full evidence in `validation.md`. Every plan task group shipped as specified:
+
+- **§1 Session purge + report** — done as planned: `PurgeReport` with the
+  eight declared fields; `reset` renamed to `purge` with no alias; module/class
+  docstrings updated (the "single owner" and reset-semantics wording).
+- **§2 Reset routine + command recognition** — done: `reset_chat` replaces both
+  `session.reset(...)` call sites; `_command()` reads text then caption,
+  strips `@botname`, lowercases; `_START_COMMANDS` kept as planned.
+- **§3 Guard matrix** — done: 61 parametrized cells across `awaiting_photo`,
+  `gate_passed`, `interviewing` and the four `done` variants, including
+  sticker/voice/document, empty text, messageless and album siblings; the
+  `_RecordingHandler`-based "reset logs `session_reset`, normal update does
+  not" assertion was added as planned (`test_a_reset_logs_session_reset_and_a_normal_update_does_not`).
+  No additional guard was needed beyond §2's G1/G2 fixes.
+- **§4 Transient `getUpdates`** — done: constants + `_get_updates` +
+  `_is_transient` + docstring rewrite + `sleep` threaded through `run_polling`;
+  `test_get_updates_transport_failure_propagates_loudly` was **replaced** (not
+  merely edited) by `test_transient_get_updates_failure_is_retried_then_succeeds`,
+  as the plan required; malformed/poison/non-dict/messageless/offset tests
+  stayed green unchanged.
+- **§5 Component flow** — done: the new two-chat test walks the full chain
+  (photo → interview → portrait → script → audio) over the real
+  `UrllibTransport` + scripted `urlopen`, `/restart`s chat 2 mid-interview
+  (purge + re-prompt) with chat 1 untouched, and rides out a transient
+  `getUpdates` `OSError` via the injected fake `sleep`.
+- **§6 Docs** — done at verification (ROADMAP/TECH/MISSION/README updated).
+
+Verification results: `scripts/test` = **802 passed**; `scripts/hooks` green
+(compileall, smoke import, ruff, mypy — "no issues found in 42 source files");
+full suite re-run with `socket.socket.connect`, `connect_ex`,
+`socket.create_connection` and `socket.getaddrinfo` patched to raise = **802
+passed**, patch sanity-checked (4/4 entry points raise). Baseline re-confirmed
+on a worktree at `1d182e4` = 697 passed (green hooks too).
+
+Deviations (non-blocking, full list in `validation.md`): (1) the CLI test
+`test_main_logs_get_updates_failure_and_exits_non_zero` was rewritten into
+`test_main_rides_out_a_transient_get_updates_failure` (exit `0`) — a necessary
+consequence of the approved retry-only-transient decision; there is no
+CLI-level test for a *permanent* coded `getUpdates` failure (the exit-1 path
+is verified by `test_permanent_coded_errors_propagate_unretried` + code
+inspection of `cli.main`); (2) the committed timeout-invariant test predates
+this phase and asserts `DEFAULT_TIMEOUT >= LONG_POLL_TIMEOUT` — the strict
+`30.0 > 10` assertion was performed at verification and holds.

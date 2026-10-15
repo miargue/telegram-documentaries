@@ -155,11 +155,90 @@ a typed port over stdlib `urllib`, **not** Google ADK (still deferred — see
 
 ## 7. Resilience
 
-- `/start` and `/restart`: purge session state **and** temporary media without
-  restarting the process.
-- Wrong-payload-at-wrong-stage guards across all phases.
-- API timeout / transient-failure fallbacks that degrade gracefully.
+- `/start` and `/restart`: run an **explicit reset routine** that performs three
+  named actions — (1) **cancel active sessions** for the requesting `chat_id`,
+  (2) **purge ephemeral assets**, and (3) **re-initialize agent memory** back to
+  the greeting stage — without restarting the process. It must fire in any case,
+  with or without an `@botname` suffix, and whether the command arrives as a
+  message or a **photo caption**. The routine logs exactly what it discarded.
+- Wrong-payload-at-wrong-stage guards across **all** phases (a phase ×
+  content-type matrix), not just the reported case.
+- API timeout / transient-failure fallbacks that degrade gracefully: a transient
+  `getUpdates` failure must never kill the bot.
+
+**Decisions locked with the user (2026-10-15):**
+
+- **"Purge ephemeral assets" = clear the in-memory buffers.** All media (the
+  photo and the MP3 narration) lives in memory only — there is no temp media on
+  disk (see `MISSION.md` "No long-term storage"). The reset drops those buffers;
+  it does not add on-disk files.
+- **"Cancel active sessions" = reset the per-chat state.** The gateway is one
+  synchronous long-polling loop with no per-chat threads, so a `/start` is
+  handled atomically and no in-flight interview turn survives it.
+- **Keep the gateway single-threaded.** The slow Converter (~120 s) stays on the
+  polling loop; every stage call is bounded by its own timeout instead of moving
+  work off-loop.
+- **Transient `getUpdates` failures retry with capped exponential backoff and
+  the bot stays alive; permanent coded errors surface.** An `OSError` or a
+  transient `TelegramApiError` (no code, `429` or `>= 500`) is retried forever;
+  a permanent coded 4xx (e.g. `401` revoked token, `409` duplicate poller)
+  propagates so the process exits `1`. The startup `getMe` probe still surfaces
+  a bad token.
 
 **Acceptance:** reset mid-interview clears everything; misplaced photos/text at
 any stage are re-prompted; Gemini/TTS failures never kill the conversation.
 *Serves: the reset and graceful-handling rubric criteria.*
+
+**Status: complete (verified 2026-10-15, branch
+`feature/2026-10-15-resilience`; spec `SPECS/2026-10-15-resilience/`).
+Most of the surface already existed (the design already purges on reset and
+degrades on every stage failure), so the phase is a formalize/harden/verify
+pass that delivers:
+
+- **The explicit reset routine.** `bouncer.reset_chat(session, chat_id, *,
+  update_id, log) -> PurgeReport` is the single named routine, called by
+  **both** reset sites (the start-command path and the gate-rejection path).
+  The three named actions map onto this architecture as: (1) *cancel active
+  sessions* -> the per-chat state is replaced with a fresh `awaiting_photo`
+  default (single-threaded loop, so the command is handled atomically and no
+  in-flight interview turn survives); (2) *purge ephemeral assets* ->
+  `SessionStore.purge(chat_id)` drops the in-memory `photo` / `narration`
+  byte buffers (there is no temp media on disk); (3) *re-initialize agent
+  memory* -> the interview log, `pending_question`, `dossier`, stored
+  `script`, the `portrait_sent` / `script_sent` / `narrator_sent` flags and
+  the media-group dedupe are cleared. Every call emits exactly one structured
+  `session_reset` INFO event built from the `PurgeReport` (flags and counts
+  only — never media bytes or user text). `SessionStore.reset` was **removed**
+  in favour of `purge(chat_id) -> PurgeReport` (a rename, no compatibility
+  alias); the three invariant-break `purge` calls in converter/scripter/
+  narrator log their own `conversion_failed` / `script_failed` /
+  `narrator_failed` ERROR instead (they cannot import `bouncer.reset_chat`
+  without an import cycle).
+- **Command recognition.** `_command()` reads `text` **or** `caption`, takes
+  the first whitespace-delimited token, strips `@botname` and lowercases — so
+  `/Start`, `/START`, `/ReStart`, `/start@MiargueBot`, `/restart now` and a
+  photo captioned `/start` all reset at **every** phase, and the captioned
+  photo is never gated. A photo with a non-command caption is gated as
+  normal; a non-command slash text (e.g. `/help`) just re-prompts.
+- **A phase × content-type guard matrix** (61 parametrized cells): text /
+  empty text / sticker / voice / document / photo / non-command caption /
+  album sibling / messageless / command / command-caption across
+  `awaiting_photo`, `gate_passed`, `interviewing` and all four `done`
+  variants — each asserting the narrow documented outcome (re-prompt, re-ask
+  the stored question, benign `SKIPPED`, the documented retry path, or the
+  light-completion reply), with no exception ever escaping `handle_update`.
+- **Transient `getUpdates` retry.** `_get_updates()` retries **only
+  transient failures** — an `OSError`, or a `TelegramApiError` with no code,
+  `429` or `>= 500` — forever with capped exponential backoff (`1.0` doubling
+  to a `30.0 s` cap; one `get_updates_retry` record and one injected `sleep`
+  per attempt), while a **permanent** coded 4xx (`400`/`401`/`403`/`404`/
+  `409`) propagates out of `poll_once` so `cli.main` logs `gateway_failed`
+  and exits `1`. `run_polling` forwards the injectable `sleep`, and the CLI
+  now rides a transient blip out (exit `0`) instead of dying.
+
+Verification: `scripts/test` — **802 passed** (up from the 697 baseline; 117
+new tests, and 12 pre-existing tests deliberately renamed/replaced for the
+`reset -> purge` and retry contracts) — and `scripts/hooks` green; no test
+touches the network (full suite re-run with every socket entry point patched
+to raise, patch sanity-checked). Full evidence, including the deviations
+list, in `SPECS/2026-10-15-resilience/validation.md`.

@@ -3,7 +3,7 @@
 A Telegram bot that turns a portrait photo into a narrated, comedy-wildlife
 documentary about the person in it (see `SPECS/MISSION.md`).
 
-**Status: Phase 6 — the Narrator.** The bot long-polls the Telegram Bot API,
+**Status: Phase 7 — Resilience.** The bot long-polls the Telegram Bot API,
 gates incoming portraits with a Gemini vision check, takes a passing portrait
 straight into a one-question-at-a-time behavioural interview, and — as soon as
 the interview finishes — fuses the original photo with the behavioural dossier
@@ -15,14 +15,36 @@ update, with no user input in between. The raw script and raw audio are stored
 on the session, ready for re-delivery. Anything that is not a portrait is
 rejected with a reset. Phase 1's unconditional echo (`hey mate!`) is gone.
 
-## What the bot does (Phase 6: the Bouncer + the Interviewer + the Converter + the Scripter + the Narrator)
+Phase 7 hardens that gateway: `/start` and `/restart` run an explicit reset
+routine (cancel the chat's session, purge its in-memory media, re-initialize
+its memory) that works in any case, with an `@botname` suffix, as a message or
+as a photo caption, at every phase; every wrong payload at every stage is
+re-prompted or benignly skipped by a phase × content guard matrix; and a
+transient `getUpdates` failure is retried with capped backoff instead of
+killing the process.
+
+## What the bot does (the Bouncer + the Interviewer + the Converter + the Scripter + the Narrator)
 
 The gateway routes every incoming message with one rule set:
 
-- **`/start` / `/restart`** → reset the whole session (photo, interview log,
-  pending question, dossier, portrait + script + narrator deliver flags, stored
-  script and narration audio) and ask for a portrait photo. No vision call is
-  made.
+- **`/start` / `/restart`** → run the **explicit reset routine** and ask for a
+  portrait photo — no vision call is made. The command is recognised in **any
+  case** (`/Start`, `/START`, `/ReStart`), with an **`@botname` suffix**
+  (`/start@MiargueBot`), with trailing text (`/restart now`), and whether it
+  arrives as a message or as a **photo caption** (a captioned `/start` is a
+  reset, not a portrait — the photo is dropped and never gated). It works at
+  **every** phase. The routine performs three actions:
+  1. **Cancel active sessions** — the chat returns to `awaiting_photo`; the
+     gateway is a single-threaded loop, so no interview turn can be in flight.
+  2. **Purge ephemeral assets** — the in-memory photo and narration-audio
+     buffers are dropped (all media is memory-only; nothing is written to
+     disk).
+  3. **Re-initialize agent memory** — interview log, pending question,
+     dossier, stored script, portrait/script/narrator deliver flags and the
+     album dedupe are cleared.
+
+  Exactly one structured `session_reset` log records what was discarded (flags
+  and counts only — never media bytes or user text).
 - **A photo** → the largest resolution is downloaded and sent to Gemini's
   vision model with a structured prompt ("is a human clearly present?").
   - Human → a short success message, the photo bytes are kept, and the chat
@@ -134,6 +156,26 @@ cannot wedge the loop. Updates whose `update_id` cannot be parsed as an int
 are skipped and **never acked** (there is no id to ack with), so Telegram
 will redeliver them on the next poll until they can be handled.
 
+The client's HTTP timeout (30 s) deliberately exceeds the 10 s long-poll
+window, so a quiet poll is never cut short by the client before Telegram can
+answer.
+
+**Transient-failure resilience.** A momentary network fault (`OSError`) or a
+transient Telegram error (`429` rate limit, any `5xx`, or a network-normalised
+error with no code) on `getUpdates` never kills the bot: each failure is
+logged as a `get_updates_retry` event (`offset`, `attempt`, `delay`) and
+retried with capped exponential backoff — 1 s doubling to a 30 s cap — until
+the transport recovers, then polling resumes normally. A **permanent** coded
+error (e.g. `401` revoked token, `403`, `404`, `409` duplicate poller) is
+*not* retried: it propagates so the process logs `gateway_failed` and exits
+`1` (as does a failed startup `getMe` probe). `KeyboardInterrupt` still stops
+cleanly with exit `130`.
+
+The gateway is **single-threaded by decision**: slow stage calls (the
+Converter can take ~120 s) run synchronously on the polling loop, each bounded
+by its configured timeout. That briefly pauses polling — acceptable for a
+single-user bot — and it is what makes `/start` handling atomic.
+
 All external input is parsed at the edge into Pydantic models
 (`telegram_documentaries/models.py`); the rest of the code never touches raw
 dicts. Both the Telegram HTTP layer and the Gemini REST adapter are stdlib
@@ -152,7 +194,7 @@ pip install -r requirements-dev.txt   # runtime + test/lint/type deps
 
 Runtime-only install: `pip install -r requirements.txt`.
 
-> `pydantic` is the only runtime dependency — for Phases 1–6.
+> `pydantic` is the only runtime dependency — for Phases 1–7.
 > The Telegram transport *and* the Gemini adapters speak plain stdlib
 > `urllib`, so no third-party HTTP client library is pinned. Phase 6's audio
 > message needs no audio encoder: the Gemini **Interactions API** TTS returns
@@ -225,10 +267,11 @@ bot's username in the `gateway_starting` event. A bad or revoked
 `TELEGRAM_BOT_TOKEN` therefore fails immediately with a `get_me_failed` error
 and exit code `1`, instead of surfacing only on the first `getUpdates`.
 
-Exit codes: `0` clean stop, `1` runtime/transport failure (including a failed
-startup `getMe` probe), `2` configuration problem or invalid command-line
-argument (e.g. missing token, missing `GEMINI_API_KEY`, `--max-polls 0`),
-`130` deliberate Ctrl-C stop.
+Exit codes: `0` clean stop, `1` runtime/transport failure (a failed startup
+`getMe` probe, or a permanent coded Telegram error that the transient-retry
+policy deliberately does not retry), `2` configuration problem or invalid
+command-line argument (e.g. missing token, missing `GEMINI_API_KEY`,
+`--max-polls 0`), `130` deliberate Ctrl-C stop.
 
 Logs are structured: one JSON object per line on stderr, with `ts`, `level`,
 `logger`, `message` plus event fields such as `event`, `chat_id`,
@@ -241,8 +284,11 @@ traceback is carried in an `exc` field:
 
 The Bouncer adds structured events for the gate (`bouncer_verdict`,
 `bouncer_passed`, `bouncer_rejected`, `bouncer_prompted`), failures
-(`photo_fetch_failed`, `vision_failed`, `reply_failed`) and album skips
-(`bouncer_album_skipped`). The Interviewer adds `interview_started`,
+(`photo_fetch_failed`, `vision_failed`, `reply_failed`), album skips
+(`bouncer_album_skipped`) and the reset routine (`session_reset` — one record
+per `reset_chat` call, carrying flags/counts only, never media bytes or user
+text). The polling loop adds `get_updates_retry` (one record per transient
+`getUpdates` failure: `offset`, `attempt`, `delay`, redacted error). The Interviewer adds `interview_started`,
 `question_asked`, `answer_recorded`, `answer_truncated`, `dossier_created`,
 `interview_failed` and `interview_skipped` (a dossier logs only the suggested
 animal, never the user-derived summary). The Converter adds
@@ -275,7 +321,11 @@ every socket entry point patched to raise). The Gemini adapter tests
 `test_scripter`, `test_narrator`) assert on the outgoing request body (base64
 `inline_data`, JSON `responseSchema` / `responseModalities`, the Interactions
 `input` / `response_format` / `generation_config` body, model id, transcript
-role alternation) without a socket. New in Phase 6: `test_narrator.py` (58) and
+role alternation) without a socket. New in Phase 7: the `reset_chat` /
+`PurgeReport` cases (`test_session.py`, `test_bouncer.py`), the command
+recognition and phase × content guard matrix (`test_bouncer.py`), and the
+transient `getUpdates` retry / backoff / permanent-error cases
+(`test_polling.py`, `test_cli.py`) — suite total 802. New in Phase 6: `test_narrator.py` (58) and
 the component `test_narrator_flow.py` (4), plus narrator cases across
 `test_gemini.py`, `test_transport.py`, `test_session.py`, `test_bouncer.py`,
 `test_config.py`, `test_cli.py` and `test_polling.py` — the shared client's
@@ -331,11 +381,14 @@ SPECS/                # MISSION.md, TECH.md, ROADMAP.md (the contract)
 
 ## Roadmap
 
-Phase 6 of `SPECS/ROADMAP.md` (the Narrator) is implemented on branch
-`feature/2026-10-12-narrator` and verified. Phases 1–5 (gateway, Bouncer,
-Interviewer, Converter, Scripter) are on `main`. The five-stage pipeline is
-complete: a playable **MP3 audio message** now follows the narration script in
-the same update, speaking the Scripter's words. Revision R1 (2026-10-14)
-replaced the impossible OGG/`sendVoice` design (no Gemini endpoint produces
-OGG/Opus without an encoder) with an MP3 audio file via `sendAudio`, synthesised
-through the Gemini Interactions API.
+Phase 7 of `SPECS/ROADMAP.md` (Resilience) is implemented on branch
+`feature/2026-10-15-resilience` and verified: the explicit `reset_chat`
+routine (+ `PurgeReport` audit logging), case/`@botname`/caption command
+recognition, the phase × content guard matrix, and transient `getUpdates`
+retry with capped backoff. Phase 6 (the Narrator) — `feature/2026-10-12-narrator`
+— and Phases 1–5 (gateway, Bouncer, Interviewer, Converter, Scripter) are on
+`main`. The five-stage pipeline is complete: a playable **MP3 audio message**
+follows the narration script in the same update, speaking the Scripter's
+words. Revision R1 (2026-10-14) replaced the impossible OGG/`sendVoice` design
+(no Gemini endpoint produces OGG/Opus without an encoder) with an MP3 audio
+file via `sendAudio`, synthesised through the Gemini Interactions API.
